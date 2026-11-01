@@ -100,3 +100,63 @@ Implement `HandLogger` writing one single-line JSON object per completed hand to
 
 \- \*\*Phase 5:\*\* Build the `Dear ImGui` desktop frontend connecting to `GameEngine` via a clean `IGameController` interface.
 
+## 8. Current Status
+
+All five phases are complete, and v1.0.0 has been released. Later work added the hand name, Play GTO, Fold Early, Reveal Bot Hands, bet percentages, and the 25/50/75/Pot sizing ladder. Sections 1-7 are the original specification, except where section 5 was updated for the ladder; the rest of this file records how it was built.
+
+## 9. Build and Test
+
+Uses the "Visual Studio 18 2026" generator, x64, in `build/`:
+
+```powershell
+cmake -S . -B build
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure -j 8
+```
+
+- Finished work must have zero warnings and all tests passing in both Release and Debug. Tests use `gtest_discover_tests` with `PRE_TEST`, so each config runs its own binary.
+- Linking fails with `LNK1104` while `poker_trainer.exe` is open. Don't close a running copy that may be the user's: verify in a temporary short-path folder such as `build/v` and delete it afterward. Long paths, such as the scratchpad, can make configuring fail.
+- Windowless UI tests are in `tests/trainer_ui_test.cpp`. They inject ImGui input at fixed coordinates, so layout changes mean updating those constants.
+- `main.cpp` has developer flags for reaching rare screens: `--seed`, `--log-dir`, `--exit-after-frames`, `--auto-shove`, `--stop-on live-side-pot|side-pot|showdown|flop|bust`, `--reveal`, `--bot-delay MS`.
+- To screenshot the app when other windows may cover it, capture the window itself with Win32 `PrintWindow` (flag 2). `CopyFromScreen` captures whatever is on top.
+- In PowerShell, double quotes inside a `git commit -m` here-string break the argument. Write the message to a file and use `git commit -F`.
+- Restoring a file with `Copy-Item` keeps its old timestamp, so MSBuild may not rebuild it. Touch the file after restoring.
+
+## 10. Architecture Rules
+
+- **Hidden information:** bots and `TrainingAdvisor` receive only `PlayerView` (`src/engine/player_view`), never `GameState`. A CTest check, `no_engine_access_in_players`, enforces this.
+- **Front end:** `TrainerUi` sees only `IGameController` and `TableSnapshot`. The snapshot has hidden information removed already, and new UI data should be added to it. The UI must not reach into engine state.
+- **Shifter:** its active profile appears only in the hand log, as `Shift:<SubProfile>`, never in the snapshot or UI.
+- **Logging:** a change to the UI or advice must not change the JSONL schema unless that's the request. `describe_hand` keeps log text stable; `describe_made_hand` gives UI names.
+
+## 11. Decisions to Preserve
+
+- **Rules:** TDA-style short all-ins (a short all-in doesn't reopen betting for players who have already acted), a moving button with no dead button, and no burn cards.
+- **Pot sizing:** percentages use the pot after calling, in both `quick_bet_to` and `raise_to_for_pot_fraction`. `bet_pot_percent` is the inverse.
+- **Finished pot:** after a hand, the pot shown is what was paid out, excluding returned uncalled chips.
+- **Advisor is heuristic:** it isn't solver output, and the UI and docs must say so. Don't present its numbers as exact.
+- **Advisor sizing:** the EV formula can't choose between sizes, because it collapses to the smallest or largest. Postflop, the model decides whether to bet, and `preferred_size` chooses the size. Preflop stays with charts and EV. See `training_advisor.h`.
+- **`ev` and `base_ev`:** `ev` includes the fit adjustment, so the advice is the highest listed option. `base_ev` is the model alone, and hero mistakes are judged on it, with a 1 BB threshold.
+- **Size rule limits:** fit must never turn a check, call or fold into a bet. All-in is chosen only within 1.5 pots, or when it's the only raise left.
+- **GTO bot:** keeps 33%, 75% and 125% per section 4, so it intentionally differs from the advisor's ladder.
+- **Quick-bet buttons:** each one sets the slider, while the action buttons act. Percentage buttons are capped at what an opponent can match, but the All-In quick button still goes to the full stack.
+- **Fold Early:** the fold happens when action reaches Hero, through the normal action path, so bots can't react to it. A free check cancels it. Bots skip their delay only while armed.
+- **Reveal Bot Hands:** a display option for finished hands only. It doesn't change logs, `shown_hand` or payouts.
+
+## 12. Known Limits
+
+- Real mouse and keyboard input through GLFW has not been tested end to end, only injected ImGui input and developer autoplay.
+- All-in runouts deal the remaining board at once, not street by street.
+- Fold Early has effectively no cancel window, because bots finish acting within a frame of arming it.
+- Advisor equity is against random hands, and fold equity can recommend small bets with weak hands, such as 24% equity on a paired board.
+- The sizing distribution is measured only for heads-up spots with no bet to face.
+- New Session has no confirmation, and quitting mid-hand can make the summary's `hands` count one higher than the logged hands.
+- ThreadSanitizer has not been run on the equity code.
+
+## 13. Working Preferences
+
+- Commit or push only when asked. Plans often say to commit locally and not push.
+- When asked to analyze or plan, don't implement until told to go ahead.
+- Check poker math with real numbers before changing it, and report anything not verified.
+- Release tags should use `vX.Y.Z`. The first release's tag is `v.1.0.0`, with an extra dot, and `project(VERSION)` in `CMakeLists.txt` still says 0.1.0.
+
