@@ -1,0 +1,810 @@
+#include <gtest/gtest.h>
+
+#include <random>
+#include <set>
+#include <stdexcept>
+#include <string>
+
+#include "engine/game_engine.h"
+
+using namespace poker;
+
+namespace {
+
+Card card(const char* text) { return Card::parse(text).value(); }
+
+// A rainbow, unpaired board that gives no straight or flush with the holes below.
+constexpr std::array<const char*, 5> kDryBoard{"2c", "7d", "9h", "Js", "3c"};
+
+std::array<Card, 5> dry_board() {
+    return {card(kDryBoard[0]), card(kDryBoard[1]), card(kDryBoard[2]), card(kDryBoard[3]), card(kDryBoard[4])};
+}
+
+// Hole cards strongest to weakest by index, all pocket pairs over the dry board.
+ScriptedDeal strength_order_deal(std::array<int, kMaxSeats> strength_of_seat) {
+    constexpr std::array<std::array<const char*, 2>, kMaxSeats> pairs{{
+        {"As", "Ad"}, {"Ks", "Kd"}, {"Qs", "Qd"}, {"Th", "Td"}, {"8s", "8d"}, {"6s", "6d"},
+    }};
+    ScriptedDeal deal;
+    deal.board = dry_board();
+    for (int seat = 0; seat < kMaxSeats; ++seat) {
+        const auto& pair = pairs[strength_of_seat[seat]];
+        deal.holes[seat] = std::array<Card, 2>{card(pair[0]), card(pair[1])};
+    }
+    return deal;
+}
+
+GameConfig config_with(std::array<int, kMaxSeats> stacks, int button = 0) {
+    GameConfig config;
+    config.stacks = stacks;
+    config.first_button = button;
+    config.hero_seat = std::nullopt;
+    return config;
+}
+
+void act(GameEngine& engine, int expected_seat, Action action) {
+    ASSERT_TRUE(engine.state().to_act.has_value());
+    ASSERT_EQ(*engine.state().to_act, expected_seat);
+    ASSERT_TRUE(engine.apply_action(action)) << "seat " << expected_seat << " " << to_string(action.type);
+}
+
+void fold(GameEngine& e, int seat) { act(e, seat, {ActionType::Fold}); }
+void check(GameEngine& e, int seat) { act(e, seat, {ActionType::Check}); }
+void call(GameEngine& e, int seat) { act(e, seat, {ActionType::Call}); }
+void bet(GameEngine& e, int seat, int to) { act(e, seat, {ActionType::Bet, to}); }
+void raise_to(GameEngine& e, int seat, int to) { act(e, seat, {ActionType::Raise, to}); }
+void all_in(GameEngine& e, int seat) { act(e, seat, {ActionType::AllIn}); }
+
+int stack_total(const GameEngine& e) {
+    int total = 0;
+    for (const Seat& s : e.state().seats) total += s.stack;
+    return total;
+}
+
+constexpr std::array<int, kMaxSeats> kSixEqual{2000, 2000, 2000, 2000, 2000, 2000};
+constexpr std::array<int, kMaxSeats> kThreeHanded{1000, 1000, 1000, 0, 0, 0};
+
+}  // namespace
+
+// --- Setup and blinds --------------------------------------------------------
+
+TEST(GameEngine, RejectsBadConfigs) {
+    GameConfig bad_blinds;
+    bad_blinds.small_blind = 30;
+    EXPECT_THROW(GameEngine{bad_blinds}, std::invalid_argument);
+
+    GameConfig lonely = config_with({100, 0, 0, 0, 0, 0});
+    EXPECT_THROW(GameEngine{lonely}, std::invalid_argument);
+
+    GameConfig busted_button = config_with({100, 100, 0, 0, 0, 0}, 3);
+    EXPECT_THROW(GameEngine{busted_button}, std::invalid_argument);
+}
+
+TEST(GameEngine, DefaultConfigMatchesSpec) {
+    const GameConfig config;
+    EXPECT_EQ(config.starting_stack, 2000);
+    EXPECT_EQ(config.small_blind, 10);
+    EXPECT_EQ(config.big_blind, 20);
+}
+
+TEST(GameEngine, PostsBlindsAndActionStartsUnderTheGun) {
+    GameEngine e(config_with(kSixEqual, 0));
+    e.start_hand();
+    const GameState& s = e.state();
+
+    EXPECT_EQ(s.hand_number, 1);
+    EXPECT_EQ(s.small_blind_seat, 1);
+    EXPECT_EQ(s.big_blind_seat, 2);
+    EXPECT_EQ(s.seats[1].stack, 1990);
+    EXPECT_EQ(s.seats[2].stack, 1980);
+    EXPECT_EQ(s.total_pot(), 30);
+    EXPECT_EQ(s.to_act, 3);
+    EXPECT_EQ(s.street, Street::Preflop);
+}
+
+TEST(GameEngine, SixMaxPositions) {
+    GameEngine e(config_with(kSixEqual, 2));
+    e.start_hand();
+    const GameState& s = e.state();
+    EXPECT_EQ(s.position_of(2), Position::BTN);
+    EXPECT_EQ(s.position_of(3), Position::SB);
+    EXPECT_EQ(s.position_of(4), Position::BB);
+    EXPECT_EQ(s.position_of(5), Position::UTG);
+    EXPECT_EQ(s.position_of(0), Position::HJ);
+    EXPECT_EQ(s.position_of(1), Position::CO);
+}
+
+TEST(GameEngine, ShortHandedPositionsDropFromTheFront) {
+    GameEngine four(config_with({500, 500, 500, 500, 0, 0}, 0));
+    four.start_hand();
+    EXPECT_EQ(four.state().position_of(3), Position::CO);
+    EXPECT_FALSE(four.state().position_of(4).has_value());
+
+    GameEngine two(config_with({500, 500, 0, 0, 0, 0}, 0));
+    two.start_hand();
+    EXPECT_EQ(two.state().position_of(0), Position::BTN);
+    EXPECT_EQ(two.state().position_of(1), Position::BB);
+}
+
+TEST(GameEngine, DealsDistinctCardsAndSameSeedReproduces) {
+    GameConfig config;
+    config.seed = 99;
+    GameEngine first(config);
+    GameEngine second(config);
+    first.start_hand();
+    second.start_hand();
+
+    std::set<Card> dealt;
+    for (int seat = 0; seat < kMaxSeats; ++seat) {
+        const auto hole = first.state().seats[seat].hole;
+        ASSERT_TRUE(hole);
+        dealt.insert((*hole)[0]);
+        dealt.insert((*hole)[1]);
+        EXPECT_EQ(hole, second.state().seats[seat].hole);
+    }
+    EXPECT_EQ(dealt.size(), 12u);
+    EXPECT_EQ(first.state().button, second.state().button);
+}
+
+TEST(GameEngine, ScriptWithDuplicateCardsIsRejected) {
+    GameEngine e(config_with(kThreeHanded));
+    ScriptedDeal deal = strength_order_deal({0, 1, 2, 3, 4, 5});
+    deal.holes[1] = deal.holes[0];
+    EXPECT_THROW(e.start_hand(deal), std::invalid_argument);
+}
+
+TEST(GameEngine, StartHandDuringHandThrows) {
+    GameEngine e(config_with(kSixEqual));
+    e.start_hand();
+    EXPECT_THROW(e.start_hand(), std::logic_error);
+}
+
+// --- Rotation and heads-up ---------------------------------------------------
+
+TEST(GameEngine, ButtonRotatesClockwise) {
+    GameEngine e(config_with(kSixEqual, 4));
+    e.start_hand();
+    EXPECT_EQ(e.state().button, 4);
+    // Everyone folds to the big blind (seat 0, after SB seat 5). UTG is seat 1.
+    fold(e, 1); fold(e, 2); fold(e, 3); fold(e, 4); fold(e, 5);
+    EXPECT_EQ(e.state().phase, GamePhase::BetweenHands);
+
+    e.start_hand();
+    EXPECT_EQ(e.state().button, 5);
+    EXPECT_EQ(e.state().small_blind_seat, 0);
+    EXPECT_EQ(e.state().big_blind_seat, 1);
+}
+
+TEST(GameEngine, BustedSeatsAreSkippedForButtonAndBlindsAndDeals) {
+    GameEngine e(config_with({1000, 0, 1000, 0, 1000, 0}, 0));
+    e.start_hand();
+    const GameState& s = e.state();
+    EXPECT_EQ(s.small_blind_seat, 2);
+    EXPECT_EQ(s.big_blind_seat, 4);
+    EXPECT_EQ(s.to_act, 0);
+    EXPECT_FALSE(s.seats[1].hole);
+    EXPECT_EQ(s.seats[1].status, SeatStatus::Busted);
+
+    fold(e, 0); fold(e, 2);
+    e.start_hand();
+    EXPECT_EQ(s.button, 2);
+    EXPECT_EQ(s.small_blind_seat, 4);
+    EXPECT_EQ(s.big_blind_seat, 0);
+}
+
+TEST(GameEngine, HeadsUpButtonPostsSmallBlindAndActsFirstPreflopLastPostflop) {
+    GameEngine e(config_with({1000, 0, 0, 1000, 0, 0}, 3));
+    e.start_hand();
+    const GameState& s = e.state();
+    EXPECT_EQ(s.small_blind_seat, 3);
+    EXPECT_EQ(s.big_blind_seat, 0);
+    EXPECT_EQ(s.seats[3].street_bet, 10);
+    EXPECT_EQ(s.seats[0].street_bet, 20);
+
+    call(e, 3);
+    check(e, 0);
+    EXPECT_EQ(s.street, Street::Flop);
+    check(e, 0);  // Big blind first postflop
+    check(e, 3);
+    EXPECT_EQ(s.street, Street::Turn);
+    EXPECT_EQ(s.to_act, 0);
+}
+
+TEST(GameEngine, TransitionFromThreeToHeadsUpUsesHeadsUpBlinds) {
+    // Seat 0 busts on hand one, leaving seats 1 and 2.
+    GameEngine e(config_with({100, 1000, 1000, 0, 0, 0}, 0));
+    e.start_hand(strength_order_deal({5, 0, 1, 2, 3, 4}));
+    all_in(e, 0);
+    call(e, 1);
+    call(e, 2);
+    check(e, 1); check(e, 2);
+    check(e, 1); check(e, 2);
+    check(e, 1); check(e, 2);
+    ASSERT_EQ(e.state().seats[0].status, SeatStatus::Busted);
+
+    e.start_hand();
+    const GameState& s = e.state();
+    EXPECT_EQ(s.button, 1);
+    EXPECT_EQ(s.small_blind_seat, 1);
+    EXPECT_EQ(s.big_blind_seat, 2);
+    EXPECT_EQ(s.to_act, 1);
+}
+
+// --- Legal action masks and raise sizing -------------------------------------
+
+TEST(GameEngine, OpeningLegalActions) {
+    GameEngine e(config_with(kSixEqual));
+    e.start_hand();
+    const LegalActions legal = e.legal_actions();
+    EXPECT_TRUE(legal.allows(ActionType::Fold));
+    EXPECT_TRUE(legal.allows(ActionType::Call));
+    EXPECT_TRUE(legal.allows(ActionType::Raise));
+    EXPECT_TRUE(legal.allows(ActionType::AllIn));
+    EXPECT_FALSE(legal.allows(ActionType::Check));
+    EXPECT_FALSE(legal.allows(ActionType::Bet));
+    EXPECT_EQ(legal.call_amount, 20);
+    EXPECT_EQ(legal.min_raise_to, 40);
+    EXPECT_EQ(legal.max_raise_to, 2000);
+}
+
+TEST(GameEngine, BigBlindHasOptionWhenLimpedTo) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    call(e, 0);
+    call(e, 1);
+    ASSERT_EQ(e.state().to_act, 2);
+    EXPECT_EQ(e.state().street, Street::Preflop);
+
+    const LegalActions legal = e.legal_actions();
+    EXPECT_TRUE(legal.allows(ActionType::Check));
+    EXPECT_TRUE(legal.allows(ActionType::Raise));
+    EXPECT_FALSE(legal.allows(ActionType::Call));
+    EXPECT_EQ(legal.min_raise_to, 40);
+    check(e, 2);
+    EXPECT_EQ(e.state().street, Street::Flop);
+}
+
+TEST(GameEngine, MinimumRaiseFollowsLastRaiseSize) {
+    GameEngine e(config_with(kSixEqual));
+    e.start_hand();
+    raise_to(e, 3, 60);  // Raise of 40
+    EXPECT_EQ(e.legal_actions().min_raise_to, 100);
+    raise_to(e, 4, 200);  // Raise of 140
+    EXPECT_EQ(e.legal_actions().min_raise_to, 340);
+    EXPECT_EQ(e.legal_actions().call_amount, 200);
+}
+
+TEST(GameEngine, IllegalActionsAreRejectedWithoutStateChange) {
+    GameEngine e(config_with(kSixEqual));
+    e.start_hand();
+    const GameState before = e.state();
+
+    EXPECT_FALSE(e.apply_action({ActionType::Check}));
+    EXPECT_FALSE(e.apply_action({ActionType::Bet, 100}));
+    EXPECT_FALSE(e.apply_action({ActionType::Raise, 39}));
+    EXPECT_FALSE(e.apply_action({ActionType::Raise, 2001}));
+
+    EXPECT_EQ(e.state().to_act, before.to_act);
+    EXPECT_EQ(e.state().seats[3].stack, before.seats[3].stack);
+    EXPECT_TRUE(e.state().actions.empty());
+}
+
+TEST(GameEngine, NoActionsOutsideAHand) {
+    GameEngine e(config_with(kSixEqual));
+    EXPECT_EQ(e.legal_actions().mask, 0);
+    EXPECT_FALSE(e.apply_action({ActionType::Fold}));
+}
+
+TEST(GameEngine, PostflopBetSizing) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    call(e, 0); call(e, 1); check(e, 2);
+    ASSERT_EQ(e.state().street, Street::Flop);
+    EXPECT_EQ(e.state().board.size(), 3u);
+    EXPECT_EQ(e.state().to_act, 1);  // Left of the button
+
+    LegalActions legal = e.legal_actions();
+    EXPECT_TRUE(legal.allows(ActionType::Bet));
+    EXPECT_TRUE(legal.allows(ActionType::Check));
+    EXPECT_FALSE(legal.allows(ActionType::Raise));
+    EXPECT_EQ(legal.min_raise_to, 20);
+    EXPECT_FALSE(e.apply_action({ActionType::Bet, 19}));
+
+    bet(e, 1, 50);
+    legal = e.legal_actions();
+    EXPECT_TRUE(legal.allows(ActionType::Raise));
+    EXPECT_EQ(legal.min_raise_to, 100);
+    EXPECT_EQ(legal.call_amount, 50);
+}
+
+TEST(GameEngine, MinimumRaiseResetsEachStreet) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    raise_to(e, 0, 200);
+    call(e, 1);
+    call(e, 2);
+    ASSERT_EQ(e.state().street, Street::Flop);
+    EXPECT_EQ(e.legal_actions().min_raise_to, 20);
+}
+
+TEST(GameEngine, StreetsDealCorrectBoardCountsAndRecordPots) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand(strength_order_deal({0, 1, 2, 3, 4, 5}));
+    const GameState& s = e.state();
+    EXPECT_TRUE(s.board.empty());
+    call(e, 0); call(e, 1); check(e, 2);
+    EXPECT_EQ(s.board.size(), 3u);
+    check(e, 1); check(e, 2); check(e, 0);
+    EXPECT_EQ(s.board.size(), 4u);
+    check(e, 1); check(e, 2); check(e, 0);
+    EXPECT_EQ(s.board.size(), 5u);
+    EXPECT_EQ(s.street, Street::River);
+    EXPECT_EQ(s.board[0], card("2c"));
+    EXPECT_EQ(s.board[4], card("3c"));
+    EXPECT_EQ(s.street_start_pot[0], 30);
+    EXPECT_EQ(s.street_start_pot[1], 60);
+    EXPECT_EQ(s.street_start_pot[3], 60);
+}
+
+// --- Short all-ins and reopening ---------------------------------------------
+
+TEST(GameEngine, ShortAllInRaiseDoesNotReopenBettingForPriorActor) {
+    GameEngine e(config_with({1000, 150, 1000, 0, 0, 0}, 0));
+    e.start_hand();
+    raise_to(e, 0, 100);  // Raise of 80
+    all_in(e, 1);         // To 150: only 50 more, below a full raise
+
+    // Seat 2 has not acted, so can raise, and the minimum is still based on 80.
+    LegalActions legal = e.legal_actions();
+    EXPECT_TRUE(legal.allows(ActionType::Raise));
+    EXPECT_EQ(legal.min_raise_to, 230);
+    call(e, 2);
+
+    // Seat 0 has acted and only faces 50 more: call or fold.
+    legal = e.legal_actions();
+    EXPECT_EQ(e.state().to_act, 0);
+    EXPECT_TRUE(legal.allows(ActionType::Call));
+    EXPECT_TRUE(legal.allows(ActionType::Fold));
+    EXPECT_FALSE(legal.allows(ActionType::Raise));
+    EXPECT_FALSE(legal.allows(ActionType::AllIn));
+    EXPECT_FALSE(e.apply_action({ActionType::Raise, 300}));
+    EXPECT_FALSE(e.apply_action({ActionType::AllIn}));
+}
+
+TEST(GameEngine, ShortAllInBetDoesNotReopenForPlayerWhoChecked) {
+    GameEngine e(config_with({1000, 1000, 35, 0, 0, 0}, 0));
+    e.start_hand();
+    call(e, 0); call(e, 1); check(e, 2);
+    ASSERT_EQ(e.state().street, Street::Flop);
+    check(e, 1);
+    all_in(e, 2);  // Bets 15, below the 20 minimum
+
+    // Seat 0 has not acted: may raise, with the minimum based on the big blind.
+    LegalActions legal = e.legal_actions();
+    EXPECT_TRUE(legal.allows(ActionType::Raise));
+    EXPECT_EQ(legal.min_raise_to, 35);
+    call(e, 0);
+
+    // Seat 1 checked, and a 15 bet is not a full bet: call or fold only.
+    legal = e.legal_actions();
+    EXPECT_EQ(e.state().to_act, 1);
+    EXPECT_FALSE(legal.allows(ActionType::Raise));
+    EXPECT_EQ(legal.call_amount, 15);
+}
+
+TEST(GameEngine, CumulativeShortAllInsReopenBetting) {
+    // Button 0, SB 1, BB 2, UTG 3.
+    GameEngine e(config_with({140, 190, 1000, 1000, 0, 0}, 0));
+    e.start_hand();
+    raise_to(e, 3, 100);  // Raise of 80
+    all_in(e, 0);         // To 140: +40
+    all_in(e, 1);         // To 190: +50, short alone, but +90 in total
+    call(e, 2);
+
+    ASSERT_EQ(e.state().to_act, 3);
+    EXPECT_TRUE(e.legal_actions().allows(ActionType::Raise));
+}
+
+TEST(GameEngine, FullRaiseReopensBetting) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    raise_to(e, 0, 100);
+    raise_to(e, 1, 180);  // A full raise of 80
+    call(e, 2);
+    ASSERT_EQ(e.state().to_act, 0);
+    EXPECT_TRUE(e.legal_actions().allows(ActionType::Raise));
+    EXPECT_EQ(e.legal_actions().min_raise_to, 260);
+}
+
+TEST(GameEngine, ShortCallGoesAllInForLess) {
+    GameEngine e(config_with({1000, 50, 1000, 0, 0, 0}, 0));
+    e.start_hand();
+    raise_to(e, 0, 200);
+
+    const LegalActions legal = e.legal_actions();
+    EXPECT_EQ(legal.call_amount, 40);  // 50 stack less the 10 small blind
+    EXPECT_TRUE(legal.allows(ActionType::Call));
+    EXPECT_TRUE(legal.allows(ActionType::AllIn));
+    EXPECT_FALSE(legal.allows(ActionType::Raise));
+
+    call(e, 1);
+    EXPECT_EQ(e.state().seats[1].status, SeatStatus::AllIn);
+    EXPECT_TRUE(e.state().actions.back().all_in);
+    EXPECT_EQ(e.state().actions.back().type, ActionType::Call);
+    EXPECT_EQ(e.state().current_bet, 200);
+}
+
+TEST(GameEngine, AllInResolvesToBetOrRaiseInActionLog) {
+    GameEngine e(config_with({1000, 1000, 300, 0, 0, 0}, 0));
+    e.start_hand();
+    call(e, 0); call(e, 1); check(e, 2);
+    check(e, 1);
+    all_in(e, 2);
+    EXPECT_EQ(e.state().actions.back().type, ActionType::Bet);
+    EXPECT_TRUE(e.state().actions.back().all_in);
+    all_in(e, 0);
+    EXPECT_EQ(e.state().actions.back().type, ActionType::Raise);
+    EXPECT_EQ(e.state().actions.back().chips_added, 980);
+}
+
+TEST(GameEngine, RaiseEqualToStackIsAnAllIn) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    raise_to(e, 0, 1000);
+    EXPECT_EQ(e.state().seats[0].status, SeatStatus::AllIn);
+    EXPECT_TRUE(e.state().actions.back().all_in);
+}
+
+TEST(GameEngine, CannotRaiseWhenNoOpponentCanRespond) {
+    GameEngine e(config_with({1000, 200, 0, 0, 0, 0}, 0));
+    e.start_hand();  // Heads-up: seat 0 SB/button, seat 1 BB
+    all_in(e, 0);
+    const LegalActions legal = e.legal_actions();
+    EXPECT_EQ(e.state().to_act, 1);
+    EXPECT_FALSE(legal.allows(ActionType::Raise));
+}
+
+// --- Short blinds and automatic runouts --------------------------------------
+
+TEST(GameEngine, ShortBigBlindStillSetsFullCallAmount) {
+    GameEngine e(config_with({1000, 1000, 5, 1000, 0, 0}, 0));
+    e.start_hand(strength_order_deal({1, 2, 0, 3, 4, 5}));
+    const GameState& s = e.state();
+    EXPECT_EQ(s.big_blind_posted, 5);
+    EXPECT_EQ(s.seats[2].status, SeatStatus::AllIn);
+    EXPECT_EQ(s.current_bet, 20);
+    EXPECT_EQ(s.to_act, 3);
+    EXPECT_EQ(e.legal_actions().call_amount, 20);
+    EXPECT_EQ(e.legal_actions().min_raise_to, 40);
+
+    call(e, 3); call(e, 0); call(e, 1);
+    // Big blind is all-in; the others play on. Check down.
+    for (int street = 0; street < 3; ++street) {
+        check(e, 1); check(e, 3); check(e, 0);
+    }
+    // Seat 2 (aces) wins only the main pot of 5 x 4; seat 0 (kings) the side pot.
+    EXPECT_EQ(s.seats[2].stack, 20);
+    EXPECT_EQ(s.seats[0].stack, 980 + 45);
+    EXPECT_EQ(stack_total(e), 3005);
+}
+
+TEST(GameEngine, ShortSmallBlindPostsWhatItHas) {
+    GameEngine e(config_with({1000, 4, 1000, 0, 0, 0}, 0));
+    e.start_hand();
+    EXPECT_EQ(e.state().small_blind_posted, 4);
+    EXPECT_EQ(e.state().seats[1].status, SeatStatus::AllIn);
+    EXPECT_EQ(e.state().to_act, 0);
+}
+
+TEST(GameEngine, BlindAllInWithBigBlindCoveringRunsOutWithoutAction) {
+    // Heads-up: button/SB has only 5; BB covers and owes nothing more.
+    GameEngine e(config_with({5, 100, 0, 0, 0, 0}, 0));
+    e.start_hand(strength_order_deal({0, 1, 2, 3, 4, 5}));
+    const GameState& s = e.state();
+
+    EXPECT_FALSE(s.to_act);
+    ASSERT_TRUE(s.last_result);
+    EXPECT_TRUE(s.last_result->showdown);
+    EXPECT_EQ(s.board.size(), 5u);
+    ASSERT_TRUE(s.last_result->refund);
+    EXPECT_EQ(s.last_result->refund->seat, 1);
+    EXPECT_EQ(s.last_result->refund->amount, 15);
+    EXPECT_EQ(s.seats[0].stack, 10);
+    EXPECT_EQ(s.seats[1].stack, 95);
+}
+
+TEST(GameEngine, ShortBigBlindHeadsUpSmallBlindMustStillDecide) {
+    GameEngine e(config_with({1000, 5, 0, 0, 0, 0}, 0));
+    e.start_hand(strength_order_deal({0, 1, 2, 3, 4, 5}));
+    const GameState& s = e.state();
+
+    ASSERT_EQ(s.to_act, 0);
+    const LegalActions legal = e.legal_actions();
+    EXPECT_TRUE(legal.allows(ActionType::Call));
+    EXPECT_FALSE(legal.allows(ActionType::Raise));
+    call(e, 0);
+
+    EXPECT_EQ(s.board.size(), 5u);
+    EXPECT_EQ(s.seats[0].stack, 1005);
+    EXPECT_EQ(s.seats[1].status, SeatStatus::Busted);
+}
+
+TEST(GameEngine, AllInCallRunsOutRemainingStreets) {
+    GameEngine e(config_with({500, 300, 0, 0, 0, 0}, 0));
+    e.start_hand(strength_order_deal({1, 0, 2, 3, 4, 5}));
+    all_in(e, 0);
+    call(e, 1);
+
+    const GameState& s = e.state();
+    EXPECT_EQ(s.board.size(), 5u);
+    EXPECT_EQ(s.last_result->refund->seat, 0);
+    EXPECT_EQ(s.last_result->refund->amount, 200);
+    EXPECT_EQ(s.seats[1].stack, 600);
+    EXPECT_EQ(s.seats[0].stack, 200);
+    EXPECT_EQ(s.phase, GamePhase::BetweenHands);
+}
+
+TEST(GameEngine, RunoutStopsNoEarlierThanActionLeftOnStreet) {
+    // One player all-in on the flop, two others keep betting into a side pot.
+    GameEngine e(config_with({1000, 100, 1000, 0, 0, 0}, 0));
+    e.start_hand();
+    raise_to(e, 0, 100);
+    all_in(e, 1);
+    call(e, 2);
+    ASSERT_EQ(e.state().street, Street::Flop);
+    EXPECT_EQ(e.state().to_act, 2);  // Seat 1 is all-in and skipped
+    bet(e, 2, 100);
+    call(e, 0);
+    EXPECT_EQ(e.state().street, Street::Turn);
+}
+
+// --- Winning and side pots ---------------------------------------------------
+
+TEST(GameEngine, FoldToWalkGivesBigBlindTheBlindsWithoutShowdown) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    fold(e, 0);
+    fold(e, 1);
+
+    const GameState& s = e.state();
+    ASSERT_TRUE(s.last_result);
+    EXPECT_FALSE(s.last_result->showdown);
+    EXPECT_TRUE(s.board.empty());
+    EXPECT_EQ(s.seats[2].stack, 1010);
+    EXPECT_EQ(s.seats[1].stack, 990);
+    ASSERT_EQ(s.last_result->payouts.size(), 1u);
+    EXPECT_EQ(s.last_result->payouts[0].seat, 2);
+    EXPECT_EQ(s.last_result->payouts[0].amount, 20);
+    EXPECT_EQ(s.last_result->refund->amount, 10);
+}
+
+TEST(GameEngine, FoldOnLaterStreetStopsDealing) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    call(e, 0); call(e, 1); check(e, 2);
+    bet(e, 1, 40);
+    fold(e, 2);
+    fold(e, 0);
+    EXPECT_EQ(e.state().board.size(), 3u);
+    EXPECT_EQ(e.state().seats[1].stack, 1040);
+}
+
+TEST(GameEngine, BestHandWinsAtShowdown) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand(strength_order_deal({2, 0, 1, 3, 4, 5}));
+    call(e, 0); call(e, 1); check(e, 2);
+    for (int street = 0; street < 3; ++street) {
+        check(e, 1); check(e, 2); check(e, 0);
+    }
+    const GameState& s = e.state();
+    EXPECT_EQ(s.street, Street::Showdown);
+    EXPECT_TRUE(s.last_result->showdown);
+    EXPECT_EQ(s.seats[1].stack, 1040);
+    EXPECT_EQ(s.seats[0].stack, 980);
+    EXPECT_EQ(hand_category(*s.last_result->showdown_ranks[1]), HandCategory::OnePair);
+    EXPECT_FALSE(s.last_result->showdown_ranks[3]);
+}
+
+TEST(GameEngine, ThreeWayAllInPaysMainAndSidePotsToDifferentWinners) {
+    GameEngine e(config_with({100, 300, 500, 0, 0, 0}, 0));
+    e.start_hand(strength_order_deal({0, 1, 2, 3, 4, 5}));
+    all_in(e, 0);
+    all_in(e, 1);
+    EXPECT_FALSE(e.apply_action({ActionType::AllIn}));  // Covers both all-ins: nobody left to raise
+    call(e, 2);
+
+    const GameState& s = e.state();
+    ASSERT_TRUE(s.last_result);
+    ASSERT_EQ(s.last_result->pots.size(), 2u);
+    EXPECT_EQ(s.last_result->pots[0].amount, 300);
+    EXPECT_EQ(s.last_result->pots[1].amount, 400);
+    EXPECT_EQ(s.seats[0].stack, 300);  // Aces take the main pot
+    EXPECT_EQ(s.seats[1].stack, 400);  // Kings take the side pot
+    EXPECT_EQ(s.seats[2].stack, 200);  // Queens get the uncalled 200 back
+}
+
+TEST(GameEngine, ShortStackWinningMainPotLeavesSidePotToBestOfRest) {
+    GameEngine e(config_with({1000, 1000, 50, 1000, 0, 0}, 0));
+    e.start_hand(strength_order_deal({2, 1, 0, 3, 4, 5}));
+    raise_to(e, 3, 200);
+    call(e, 0);
+    fold(e, 1);
+    // Seat 2, the big blind, shoves its last 30 for less.
+    all_in(e, 2);
+    const GameState& s = e.state();
+    ASSERT_EQ(s.street, Street::Flop);
+    ASSERT_EQ(s.seats[2].status, SeatStatus::AllIn);
+    // Main pot: 50 x 3 + 10 from the folded small blind = 160.
+    for (int street = 0; street < 3; ++street) {
+        check(e, 3); check(e, 0);
+    }
+    EXPECT_EQ(s.seats[2].stack, 160);
+    // Side pot: 150 x 2 = 300 to queens (seat 0) over tens (seat 3).
+    EXPECT_EQ(s.seats[0].stack, 800 + 300);
+    EXPECT_EQ(s.seats[3].stack, 800);
+    EXPECT_EQ(stack_total(e), 3050);
+}
+
+TEST(GameEngine, TiedHandsSplitPotAndOddChipGoesLeftOfButton) {
+    // Blinds 5/10 with a dead small blind makes the pot odd: 10 + 10 + 5 = 25.
+    GameConfig config = config_with(kThreeHanded);
+    config.small_blind = 5;
+    config.big_blind = 10;
+    GameEngine e(config);
+
+    ScriptedDeal deal;
+    deal.board = {card("As"), card("Ks"), card("Qd"), card("Jc"), card("Th")};  // Broadway plays
+    deal.holes[0] = std::array<Card, 2>{card("2c"), card("3d")};
+    deal.holes[1] = std::array<Card, 2>{card("4h"), card("5c")};
+    deal.holes[2] = std::array<Card, 2>{card("6h"), card("7c")};
+    e.start_hand(deal);
+
+    call(e, 0);
+    fold(e, 1);
+    check(e, 2);
+    for (int street = 0; street < 3; ++street) {
+        check(e, 2); check(e, 0);
+    }
+    const GameState& s = e.state();
+    EXPECT_EQ(s.seats[2].stack, 990 + 13);  // First clockwise from the button
+    EXPECT_EQ(s.seats[0].stack, 990 + 12);
+    EXPECT_EQ(s.seats[1].stack, 995);
+}
+
+TEST(GameEngine, SidePotSplitsWhileMainPotHasSingleWinner) {
+    ScriptedDeal deal;
+    deal.board = {card("2c"), card("7d"), card("9h"), card("Js"), card("3c")};
+    deal.holes[0] = std::array<Card, 2>{card("As"), card("Ad")};  // Short stack, best hand
+    deal.holes[1] = std::array<Card, 2>{card("Ks"), card("Kd")};  // Tied for the side pot
+    deal.holes[2] = std::array<Card, 2>{card("Kh"), card("Kc")};
+
+    GameEngine e(config_with({100, 500, 500, 0, 0, 0}, 0));
+    e.start_hand(deal);
+    all_in(e, 0);
+    all_in(e, 1);
+    call(e, 2);
+
+    const GameState& s = e.state();
+    EXPECT_EQ(s.seats[0].stack, 300);
+    EXPECT_EQ(s.seats[1].stack, 400);
+    EXPECT_EQ(s.seats[2].stack, 400);
+}
+
+// --- Freezeout ---------------------------------------------------------------
+
+TEST(GameEngine, BustedBotStaysOutAndIsRecorded) {
+    GameEngine e(config_with({100, 1000, 1000, 0, 0, 0}, 0));
+    e.start_hand(strength_order_deal({5, 0, 1, 2, 3, 4}));
+    all_in(e, 0);
+    fold(e, 1);
+    call(e, 2);
+
+    const GameState& s = e.state();
+    EXPECT_EQ(s.seats[0].status, SeatStatus::Busted);
+    EXPECT_EQ(s.seats[0].stack, 0);
+    EXPECT_EQ(s.seats[0].busted_on_hand, 1);
+    EXPECT_EQ(s.phase, GamePhase::BetweenHands);
+
+    e.start_hand();
+    EXPECT_FALSE(s.seats[0].hole);
+    EXPECT_EQ(s.seats[0].status, SeatStatus::Busted);
+}
+
+TEST(GameEngine, SessionEndsWhenHeroBusts) {
+    GameConfig config = config_with({100, 1000, 1000, 0, 0, 0}, 0);
+    config.hero_seat = 0;
+    GameEngine e(config);
+    e.start_hand(strength_order_deal({5, 0, 1, 2, 3, 4}));
+    all_in(e, 0);
+    call(e, 1);
+    fold(e, 2);
+
+    EXPECT_EQ(e.state().phase, GamePhase::SessionOver);
+    EXPECT_THROW(e.start_hand(), std::logic_error);
+
+    const SessionSummary summary = e.session_summary();
+    EXPECT_TRUE(summary.hero_busted);
+    EXPECT_FALSE(summary.winner);
+    EXPECT_EQ(summary.hands_played, 1);
+    EXPECT_EQ(summary.busted_on_hand[0], 1);
+}
+
+TEST(GameEngine, SessionEndsWhenHeroBustsAllBots) {
+    GameConfig config = config_with({1000, 100, 100, 0, 0, 0}, 0);
+    config.hero_seat = 0;
+    GameEngine e(config);
+    e.start_hand(strength_order_deal({0, 1, 2, 3, 4, 5}));
+    raise_to(e, 0, 100);
+    all_in(e, 1);
+    all_in(e, 2);
+
+    EXPECT_EQ(e.state().phase, GamePhase::SessionOver);
+    const SessionSummary summary = e.session_summary();
+    EXPECT_FALSE(summary.hero_busted);
+    EXPECT_EQ(summary.winner, 0);
+    EXPECT_EQ(summary.final_stacks[0], 1200);
+}
+
+TEST(GameEngine, NewGameResetsSeatsAndStacks) {
+    GameConfig config = config_with({100, 1000, 1000, 0, 0, 0}, 0);
+    config.hero_seat = 0;
+    GameEngine e(config);
+    e.start_hand(strength_order_deal({5, 0, 1, 2, 3, 4}));
+    all_in(e, 0);
+    call(e, 1);
+    fold(e, 2);
+    ASSERT_EQ(e.state().phase, GamePhase::SessionOver);
+
+    e.new_game();
+    const GameState& s = e.state();
+    EXPECT_EQ(s.phase, GamePhase::BetweenHands);
+    EXPECT_EQ(s.hand_number, 0);
+    EXPECT_EQ(s.seats[0].stack, 100);
+    EXPECT_EQ(s.seats[0].status, SeatStatus::Active);
+    EXPECT_FALSE(s.seats[0].busted_on_hand);
+    EXPECT_EQ(s.seats[3].status, SeatStatus::Busted);
+    EXPECT_NO_THROW(e.start_hand());
+}
+
+TEST(GameEngine, ActionLogRecordsVoluntaryActions) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    raise_to(e, 0, 60);
+    fold(e, 1);
+    call(e, 2);
+    bet(e, 2, 100);
+    fold(e, 0);
+
+    const auto& actions = e.state().actions;
+    ASSERT_EQ(actions.size(), 5u);
+    EXPECT_EQ(actions[0].type, ActionType::Raise);
+    EXPECT_EQ(actions[0].chips_added, 60);
+    EXPECT_EQ(actions[0].street, Street::Preflop);
+    EXPECT_EQ(actions[2].type, ActionType::Call);
+    EXPECT_EQ(actions[2].chips_added, 40);
+    EXPECT_EQ(actions[3].street, Street::Flop);
+    EXPECT_EQ(actions[3].street_total, 100);
+}
+
+TEST(GameEngine, ChipsAreConservedAcrossRandomizedSession) {
+    GameConfig config;
+    config.seed = 5;
+    config.hero_seat = std::nullopt;
+    GameEngine e(config);
+    std::mt19937_64 rng(11);
+
+    for (int hand = 0; hand < 500 && e.state().phase == GamePhase::BetweenHands; ++hand) {
+        e.start_hand();
+        while (e.state().phase == GamePhase::Betting) {
+            const LegalActions legal = e.legal_actions();
+            Action action{ActionType::Fold};
+            if (legal.allows(ActionType::AllIn) && rng() % 8 == 0) action = {ActionType::AllIn};
+            else if (legal.allows(ActionType::Raise) && rng() % 4 == 0) action = {ActionType::Raise, legal.min_raise_to};
+            else if (legal.allows(ActionType::Bet) && rng() % 4 == 0) action = {ActionType::Bet, legal.min_raise_to};
+            else if (legal.allows(ActionType::Check)) action = {ActionType::Check};
+            else if (legal.allows(ActionType::Call)) action = {ActionType::Call};
+            ASSERT_TRUE(e.apply_action(action));
+        }
+        ASSERT_EQ(stack_total(e), 12000);
+    }
+}

@@ -54,10 +54,17 @@ add_library(poker_core STATIC
     src/core/card.cpp
     src/core/deck.cpp
     src/core/hand_evaluator.cpp
+    src/engine/game_engine.cpp
+    src/engine/pots.cpp
 )
 target_include_directories(poker_core PUBLIC src)
 target_link_libraries(poker_core PRIVATE phevaluator_lib)
 target_compile_options(poker_core PRIVATE ${POKER_WARNINGS})
+
+# --- CLI test harness --------------------------------------------------------
+add_executable(poker_cli tools/poker_cli.cpp)
+target_link_libraries(poker_cli PRIVATE poker_core)
+target_compile_options(poker_cli PRIVATE ${POKER_WARNINGS})
 
 # --- Tests -------------------------------------------------------------------
 if(POKER_BUILD_TESTS)
@@ -78,10 +85,14 @@ if(POKER_BUILD_TESTS)
         tests/card_test.cpp
         tests/deck_test.cpp
         tests/hand_evaluator_test.cpp
+        tests/pots_test.cpp
+        tests/game_engine_test.cpp
     )
     target_link_libraries(core_tests PRIVATE poker_core GTest::gtest_main)
     target_compile_options(core_tests PRIVATE ${POKER_WARNINGS})
 
     include(GoogleTest)
     gtest_discover_tests(core_tests)
+
+    add_test(NAME poker_cli_stress COMMAND poker_cli --games 500 --seed 1)
 endif()
