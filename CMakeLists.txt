@@ -49,6 +49,15 @@ else()
     set(POKER_WARNINGS -Wall -Wextra -Wpedantic)
 endif()
 
+# --- JSON --------------------------------------------------------------------
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.12.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # --- Core library (no GUI dependencies) --------------------------------------
 add_library(poker_core STATIC
     src/advisor/training_advisor.cpp
@@ -61,11 +70,12 @@ add_library(poker_core STATIC
     src/engine/player_view.cpp
     src/engine/pots.cpp
     src/equity/equity.cpp
+    src/logging/hand_logger.cpp
     src/strategy/preflop_charts.cpp
 )
 find_package(Threads REQUIRED)
 target_include_directories(poker_core PUBLIC src)
-target_link_libraries(poker_core PRIVATE phevaluator_lib Threads::Threads)
+target_link_libraries(poker_core PRIVATE phevaluator_lib Threads::Threads nlohmann_json::nlohmann_json)
 target_compile_options(poker_core PRIVATE ${POKER_WARNINGS})
 
 # --- CLI test harness --------------------------------------------------------
@@ -100,8 +110,9 @@ if(POKER_BUILD_TESTS)
         tests/preflop_charts_test.cpp
         tests/bots_test.cpp
         tests/training_advisor_test.cpp
+        tests/hand_logger_test.cpp
     )
-    target_link_libraries(core_tests PRIVATE poker_core GTest::gtest_main)
+    target_link_libraries(core_tests PRIVATE poker_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_compile_options(core_tests PRIVATE ${POKER_WARNINGS})
 
     include(GoogleTest)
