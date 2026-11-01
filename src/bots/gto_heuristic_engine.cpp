@@ -163,6 +163,10 @@ BoardTexture classify_board(std::span<const Card> board) {
     // the low ace included: A-5-2 really does make one with a 3-4.
     const bool flush_draw_live = max_suit == 2 && board.size() < 5;
     texture.wet = max_suit >= 3 || flush_draw_live || straight_cards >= 3;
+
+    bool connected = false;
+    for (int start = 0; start + 3 <= 14; ++start) connected = connected || ((positions >> start) & 7u) == 7u;
+    texture.dynamic = board.size() < 5 && ((flush_draw_live && straight_cards >= 3) || connected);
     return texture;
 }
 

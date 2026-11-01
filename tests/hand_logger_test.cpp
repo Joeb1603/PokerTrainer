@@ -303,8 +303,8 @@ TEST(Mistakes, FollowingTheHintIsNotAMistake) {
     GameEngine e(config_with(kThreeHanded));
     const PlayerView view = view_facing_open(e);
     HintRecommendation hint = sample_hint({ActionType::Call}, "CALL 20");
-    hint.ev.fold = 0.0;
-    hint.ev.check_call = 100.0;
+    hint.base_ev.fold = 0.0;
+    hint.base_ev.check_call = 100.0;
     EXPECT_FALSE(assess_hero_decision(view, hint, {ActionType::Call}));
 }
 
@@ -312,12 +312,12 @@ TEST(Mistakes, EvGapAtThresholdCountsAndJustBelowDoesNot) {
     GameEngine e(config_with(kThreeHanded));
     const PlayerView view = view_facing_open(e);
     HintRecommendation hint = sample_hint({ActionType::Call}, "CALL 20");
-    hint.ev.fold = 0.0;
+    hint.base_ev.fold = 0.0;
 
-    hint.ev.check_call = 19.9;  // Big blind is 20
+    hint.base_ev.check_call = 19.9;  // Big blind is 20
     EXPECT_FALSE(assess_hero_decision(view, hint, {ActionType::Fold}));
 
-    hint.ev.check_call = 20.0;
+    hint.base_ev.check_call = 20.0;
     const auto mistake = assess_hero_decision(view, hint, {ActionType::Fold});
     ASSERT_TRUE(mistake);
     EXPECT_DOUBLE_EQ(mistake->ev_loss, 20.0);
@@ -327,8 +327,8 @@ TEST(Mistakes, RecordsEverythingNeededToInspectTheDecision) {
     GameEngine e(config_with(kThreeHanded));
     const PlayerView view = view_facing_open(e);
     HintRecommendation hint = sample_hint({ActionType::Raise, 60}, "RAISE to 60 (75% Pot)");
-    hint.ev.fold = 0.0;
-    hint.ev.raise_75 = 80.0;
+    hint.base_ev.fold = 0.0;
+    hint.base_ev.raise_75 = 80.0;
     hint.raise_75_to = 60;
 
     const auto mistake = assess_hero_decision(view, hint, {ActionType::Fold});
@@ -347,13 +347,13 @@ TEST(Mistakes, SizeDeviationCountsOnlyWhenTheNearestOptionLosesEnough) {
     GameEngine e(config_with(kThreeHanded));
     const PlayerView view = view_facing_open(e);
     HintRecommendation hint = sample_hint({ActionType::Raise, 60}, "RAISE to 60");
-    hint.raise_33_to = 40;
+    hint.raise_25_to = 40;
     hint.raise_75_to = 60;
-    hint.ev.raise_33 = 50.0;
-    hint.ev.raise_75 = 60.0;
-    hint.ev.all_in = -200.0;
+    hint.base_ev.raise_25 = 50.0;
+    hint.base_ev.raise_75 = 60.0;
+    hint.base_ev.all_in = -200.0;
 
-    EXPECT_FALSE(assess_hero_decision(view, hint, {ActionType::Raise, 45}));  // Nearest is 33%: 10 lost
+    EXPECT_FALSE(assess_hero_decision(view, hint, {ActionType::Raise, 45}));  // Nearest is 25%: 10 lost
 
     const auto shove = assess_hero_decision(view, hint, {ActionType::AllIn});
     ASSERT_TRUE(shove);
@@ -365,6 +365,27 @@ TEST(Mistakes, SizeDeviationCountsOnlyWhenTheNearestOptionLosesEnough) {
     EXPECT_EQ(huge->taken, "R900");
 }
 
+TEST(Mistakes, ChoosingAnotherSizeIsFlaggedOnlyOnTheModelsEv) {
+    GameEngine e(config_with(kThreeHanded));
+    const PlayerView view = view_facing_open(e);
+    HintRecommendation hint = sample_hint({ActionType::Raise, 60}, "RAISE to 60 (75% Pot)");
+    hint.raise_50_to = 50;
+    hint.raise_75_to = 60;
+    hint.raise_100_to = 80;
+    hint.base_ev.raise_50 = 90.0;  // The model likes this size more than the advised one
+    hint.base_ev.raise_75 = 60.0;
+    hint.base_ev.raise_100 = 20.0;
+    hint.ev = hint.base_ev;
+    hint.ev.raise_75 = 90.0;  // The fit adjustment lifts the advised size
+
+    EXPECT_FALSE(assess_hero_decision(view, hint, {ActionType::Raise, 50}));
+    EXPECT_FALSE(assess_hero_decision(view, hint, {ActionType::Raise, 60}));
+
+    const auto bad_size = assess_hero_decision(view, hint, {ActionType::Raise, 80});
+    ASSERT_TRUE(bad_size);
+    EXPECT_DOUBLE_EQ(bad_size->ev_loss, 40.0);
+}
+
 TEST(Mistakes, FoldingWhenCheckingIsFreeAlwaysCounts) {
     GameEngine e(config_with(kThreeHanded));
     e.start_hand(three_handed_deal());
@@ -374,8 +395,8 @@ TEST(Mistakes, FoldingWhenCheckingIsFreeAlwaysCounts) {
     ASSERT_TRUE(view.legal.allows(ActionType::Check));
 
     HintRecommendation hint = sample_hint({ActionType::Check}, "CHECK");
-    hint.ev.fold = 0.0;
-    hint.ev.check_call = 1.0;  // Far below the EV threshold
+    hint.base_ev.fold = 0.0;
+    hint.base_ev.check_call = 1.0;  // Far below the EV threshold
     const auto mistake = assess_hero_decision(view, hint, {ActionType::Fold});
     ASSERT_TRUE(mistake);
     EXPECT_EQ(mistake->taken, "F");
@@ -401,12 +422,12 @@ TEST(Mistakes, AllInForLessThanTheCallIsPricedAsACall) {
     ASSERT_FALSE(view.legal.allows(ActionType::Raise));
 
     HintRecommendation hint = sample_hint({ActionType::Call}, "CALL 30");
-    hint.ev.check_call = 40.0;
+    hint.base_ev.check_call = 40.0;
     EXPECT_FALSE(assess_hero_decision(view, hint, {ActionType::AllIn}));
 
     HintRecommendation fold_hint = sample_hint({ActionType::Fold}, "FOLD");
-    fold_hint.ev.fold = 0.0;
-    fold_hint.ev.check_call = -30.0;
+    fold_hint.base_ev.fold = 0.0;
+    fold_hint.base_ev.check_call = -30.0;
     const auto mistake = assess_hero_decision(view, fold_hint, {ActionType::Call});
     ASSERT_TRUE(mistake);
     EXPECT_EQ(mistake->taken, "A50");  // An all-in call logs as A, like the action list
@@ -515,8 +536,8 @@ TEST_F(LoggerFiles, PendingMistakesGoInTheirHandAndAreThenCleared) {
 
     const PlayerView view = view_facing_open(e);
     HintRecommendation hint = sample_hint({ActionType::Call}, "CALL 20");
-    hint.ev.fold = 0.0;
-    hint.ev.check_call = 200.0;
+    hint.base_ev.fold = 0.0;
+    hint.base_ev.check_call = 200.0;
     ASSERT_TRUE(logger.record_hero_decision(view, hint, {ActionType::Fold}));
     act(e, ActionType::Fold);
     act(e, ActionType::Fold);
@@ -549,8 +570,8 @@ TEST_F(LoggerFiles, SeveralMistakesOnOneStreetAreKeptSeparately) {
     GameEngine e(config_with(kThreeHanded));
     const PlayerView view = view_facing_open(e);
     HintRecommendation hint = sample_hint({ActionType::Call}, "CALL 20");
-    hint.ev.fold = 0.0;
-    hint.ev.check_call = 100.0;
+    hint.base_ev.fold = 0.0;
+    hint.base_ev.check_call = 100.0;
     logger.record_hero_decision(view, hint, {ActionType::Fold});
     logger.record_hero_decision(view, hint, {ActionType::Fold});
     act(e, ActionType::Fold);
@@ -605,8 +626,8 @@ TEST_F(LoggerFiles, DiscardedMistakesDoNotReachTheNextHand) {
     GameEngine e(config_with(kThreeHanded));
     const PlayerView view = view_facing_open(e);
     HintRecommendation hint = sample_hint({ActionType::Call}, "CALL 20");
-    hint.ev.fold = 0.0;
-    hint.ev.check_call = 200.0;
+    hint.base_ev.fold = 0.0;
+    hint.base_ev.check_call = 200.0;
     ASSERT_TRUE(logger.record_hero_decision(view, hint, {ActionType::Fold}));
     logger.discard_pending_mistakes();
 

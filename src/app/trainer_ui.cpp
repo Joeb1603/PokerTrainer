@@ -511,13 +511,14 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
         const auto quick = [&](const char* label, double fraction) {
             ImGui::SameLine();
             if (ImGui::Button(label, {u(68.0f), 0.0f})) {
-                raise_to_ = quick_bet_to(legal, s.current_bet, s.pots.total, fraction);
+                raise_to_ = quick_bet_to(legal, s.current_bet, s.pots.total, fraction, s.raise_cap_to);
             }
         };
         ImGui::SameLine();
         if (ImGui::Button("Min", {u(68.0f), 0.0f})) raise_to_ = legal.min_raise_to;
-        quick("50% Pot", 0.5);
-        quick("75% Pot", 0.75);
+        quick("25%", 0.25);
+        quick("50%", 0.5);
+        quick("75%", 0.75);
         quick("Pot", 1.0);
         ImGui::SameLine();
         if (ImGui::Button("All-In", {u(68.0f), 0.0f})) raise_to_ = legal.max_raise_to;
@@ -602,12 +603,14 @@ void TrainerUi::draw_advisor() {
         if (ImGui::BeginTable("##ev", 4, ImGuiTableFlags_SizingStretchSame)) {
             ev_row("Fold", hint.ev.fold);
             ev_row("Chk/Call", hint.ev.check_call);
-            ev_row("Raise 33%", hint.ev.raise_33);
+            ev_row("Raise 25%", hint.ev.raise_25);
+            ev_row("Raise 50%", hint.ev.raise_50);
             ev_row("Raise 75%", hint.ev.raise_75);
+            ev_row("Raise Pot", hint.ev.raise_100);
             ev_row("All-In", hint.ev.all_in);
             ImGui::EndTable();
         }
-        ImGui::TextColored(kMutedText, "EVs are heuristic estimates, not solver output.");
+        ImGui::TextColored(kMutedText, "Heuristic EVs, with a rule for bet size. Not solver output.");
     } else {
         ImGui::TextColored(kMutedText, "Hints appear when it is your turn.");
     }

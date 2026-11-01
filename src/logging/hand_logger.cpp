@@ -55,16 +55,18 @@ bool can_aggress(const LegalActions& legal) {
     return legal.allows(ActionType::Bet) || legal.allows(ActionType::Raise);
 }
 
+// Uses the model's own EVs: preferring another size is advice, not a mistake by itself.
 std::optional<double> ev_of_action(const HintRecommendation& hint, const PlayerView& view, const Action& action) {
     const LegalActions& legal = view.legal;
+    const EvEstimates& ev_table = hint.base_ev;
     switch (action.type) {
         case ActionType::Fold:
-            return hint.ev.fold;
+            return ev_table.fold;
         case ActionType::Check:
         case ActionType::Call:
-            return hint.ev.check_call;
+            return ev_table.check_call;
         case ActionType::AllIn:
-            if (!can_aggress(legal)) return hint.ev.check_call;  // An all-in call
+            if (!can_aggress(legal)) return ev_table.check_call;  // An all-in call
             break;
         case ActionType::Bet:
         case ActionType::Raise:
@@ -82,9 +84,11 @@ std::optional<double> ev_of_action(const HintRecommendation& hint, const PlayerV
             nearest = ev;
         }
     };
-    consider(legal.max_raise_to, hint.ev.all_in);
-    consider(hint.raise_75_to, hint.ev.raise_75);
-    consider(hint.raise_33_to, hint.ev.raise_33);
+    consider(legal.max_raise_to, ev_table.all_in);
+    consider(hint.raise_100_to, ev_table.raise_100);
+    consider(hint.raise_75_to, ev_table.raise_75);
+    consider(hint.raise_50_to, ev_table.raise_50);
+    consider(hint.raise_25_to, ev_table.raise_25);
     return nearest;
 }
 

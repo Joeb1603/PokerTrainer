@@ -22,7 +22,7 @@ The executable isn't code-signed, so Windows SmartScreen may warn you the first 
 - 6-max table with Hero at the bottom center, rendered with Dear ImGui and GLFW
 - 4-color deck, so suits are easy to tell apart at a glance
 - Live main and side pot display, showing who is eligible for each pot
-- Fold, check, call, bet, raise and all-in controls, with a raise slider and quick-bet sizes (Min, 50%, 75%, Pot, All-In), and the bet shown as a percentage of the pot
+- Fold, check, call, bet, raise and all-in controls, with a raise slider and quick-bet sizes (Min, 25%, 50%, 75%, Pot, All-In) that match the advisor's sizes, and the bet shown as a percentage of the pot
 - Your current hand named from the flop onward, such as `Two Pair, Aces and Kings`
 - **Play GTO** button that plays the advisor's recommendation in one click
 - **Fold Early** button that skips the wait: bots act without their delay, and you fold when action reaches you, unless you could check for free
@@ -51,11 +51,11 @@ Bots can't cheat. They decide using a sanitized view of the game that contains n
 ### The training advisor
 A toggleable panel that analyzes every decision you face:
 - **The numbers:** your equity (5,000 Monte Carlo rollouts), pot odds, Minimum Defense Frequency (MDF) and Stack-to-Pot Ratio (SPR)
-- **The options:** estimated EV for folding, checking or calling, and raising
+- **The options:** estimated EV for folding, checking or calling, raising 25%, 50%, 75% or Pot, and all-in
 - **The recommendation:** a best action, such as `RAISE to 150 (75% Pot)`
 - **The reasoning:** a short rationale covering position, preflop range tier, board texture and equity vs. pot odds
 
-The advisor uses heuristics, not a solver. Its EV figures and "GTO" recommendations are training estimates, not true game-theory-optimal solutions.
+The advisor uses heuristics, not a solver. Its EV figures and "GTO" recommendations are training estimates, not true game-theory-optimal solutions. The EV model decides whether to bet, and a rule based on board texture and hand strength chooses the size.
 
 ### Hand history and session logs
 Both logs are JSONL, with one compact JSON object per line, so they're easy to analyze with scripts or paste into an LLM.

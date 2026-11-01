@@ -12,6 +12,7 @@
 
 #include "advisor/training_advisor.h"
 #include "bots/gto_heuristic_engine.h"
+#include "controller/game_controller.h"
 #include "engine/game_engine.h"
 #include "strategy/preflop_charts.h"
 
@@ -113,7 +114,7 @@ bool is_legal(const LegalActions& legal, const Action& a) {
 
 double best_listed_ev(const EvEstimates& ev) {
     double best = -1e18;
-    for (const auto& option : {ev.fold, ev.check_call, ev.raise_33, ev.raise_75, ev.all_in}) {
+    for (const auto& option : {ev.fold, ev.check_call, ev.raise_25, ev.raise_50, ev.raise_75, ev.raise_100, ev.all_in}) {
         if (option) best = std::max(best, *option);
     }
     return best;
@@ -127,8 +128,10 @@ double ev_of_action(const HintRecommendation& hint) {
         case ActionType::AllIn: return hint.ev.all_in.value();
         case ActionType::Bet:
         case ActionType::Raise:
-            if (hint.raise_33_to == hint.action.amount) return hint.ev.raise_33.value();
-            return hint.ev.raise_75.value();
+            if (hint.raise_25_to == hint.action.amount) return hint.ev.raise_25.value();
+            if (hint.raise_50_to == hint.action.amount) return hint.ev.raise_50.value();
+            if (hint.raise_75_to == hint.action.amount) return hint.ev.raise_75.value();
+            return hint.ev.raise_100.value();
     }
     return 0.0;
 }
@@ -164,12 +167,13 @@ TEST(Advisor, EvFormulasMatchTheDocumentedModelForCheckAndCall) {
 
 // The documented raise formula, by hand: heads-up nobody has bet, so the fold model
 // uses the MDF for the size with a 10% call floor, and the exponent is 1 + f + o.
+// The implied term is capped at half the pot once called.
 double unfaced_raise_ev(double equity, double pot, double added, double behind_after) {
     const double s = added / pot;
     const double call = std::max(1.0 / (1.0 + s), 0.10);
     const double fold = 1.0 - call;
     const double called = std::pow(equity, 1.0 + fold + 0.25 * std::max(0.0, s - 1.0));
-    const double implied = std::max(0.0, called - 0.5) * behind_after * 0.5;
+    const double implied = std::min(std::max(0.0, called - 0.5) * behind_after * 0.5, 0.5 * (pot + added + added));
     return fold * pot + call * (called * (pot + added + added) - added + implied);
 }
 
@@ -178,11 +182,15 @@ TEST(Advisor, RaiseEvsMatchTheDocumentedModel) {
     GameEngine engine = heads_up_to_flop(hole("Ac", "Ah"), hole("8c", "8d"), board_of("Kd", "8s", "3c", "2h", "Jd"));
     const HintRecommendation hint = TrainingAdvisor(20, kRollouts).analyze(engine.player_view(1));
     const double e = hint.equity_pct / 100.0;
-    ASSERT_EQ(hint.raise_33_to, 66);
+    ASSERT_EQ(hint.raise_25_to, 50);
+    ASSERT_EQ(hint.raise_50_to, 100);
     ASSERT_EQ(hint.raise_75_to, 150);
-    EXPECT_NEAR(*hint.ev.raise_33, unfaced_raise_ev(e, 200.0, 66.0, 1900.0 - 66.0), 1e-9);
-    EXPECT_NEAR(*hint.ev.raise_75, unfaced_raise_ev(e, 200.0, 150.0, 1900.0 - 150.0), 1e-9);
-    EXPECT_NEAR(*hint.ev.all_in, unfaced_raise_ev(e, 200.0, 1900.0, 0.0), 1e-9);
+    ASSERT_EQ(hint.raise_100_to, 200);
+    for (const auto& [ev, added] : {std::pair{hint.base_ev.raise_25, 50.0}, std::pair{hint.base_ev.raise_50, 100.0},
+                                    std::pair{hint.base_ev.raise_75, 150.0}, std::pair{hint.base_ev.raise_100, 200.0}}) {
+        EXPECT_NEAR(*ev, unfaced_raise_ev(e, 200.0, added, 1900.0 - added), 1e-9);
+    }
+    EXPECT_NEAR(*hint.base_ev.all_in, unfaced_raise_ev(e, 200.0, 1900.0, 0.0), 1e-9);
 }
 
 TEST(Advisor, RiverNutsRaiseEvsAreExact) {
@@ -194,9 +202,9 @@ TEST(Advisor, RiverNutsRaiseEvsAreExact) {
     }
     const HintRecommendation hint = TrainingAdvisor(21, kRollouts).analyze(engine.player_view(1));
     ASSERT_DOUBLE_EQ(hint.equity_pct, 100.0);
-    EXPECT_NEAR(*hint.ev.all_in, 0.9 * 200.0 + 0.1 * (200.0 + 1900.0), 1e-9);  // The 10% call floor
+    EXPECT_NEAR(*hint.base_ev.all_in, 0.9 * 200.0 + 0.1 * (200.0 + 1900.0), 1e-9);  // The 10% call floor
     const double call_75 = 1.0 / 1.75;
-    EXPECT_NEAR(*hint.ev.raise_75, (1.0 - call_75) * 200.0 + call_75 * (200.0 + 150.0), 1e-9);
+    EXPECT_NEAR(*hint.base_ev.raise_75, (1.0 - call_75) * 200.0 + call_75 * (200.0 + 150.0), 1e-9);
 }
 
 TEST(Advisor, DifferentDecisionsGetDifferentRollouts) {
@@ -386,8 +394,10 @@ TEST(Advisor, SizesNeverExceedWhatAnOpponentCanMatch) {
     EXPECT_EQ(hint.action.type, ActionType::Bet) << hint.best_action;
     EXPECT_EQ(hint.action.amount, 100);
     EXPECT_EQ(hint.best_action, "BET 100");
-    EXPECT_EQ(hint.raise_33_to, 100);
-    EXPECT_FALSE(hint.raise_75_to.has_value());  // The same bet as the 33% one, so listed once
+    EXPECT_EQ(hint.raise_25_to, 100);
+    EXPECT_FALSE(hint.raise_50_to.has_value());  // The same bet as the 25% one, so listed once
+    EXPECT_FALSE(hint.raise_75_to.has_value());
+    EXPECT_FALSE(hint.raise_100_to.has_value());
 }
 
 TEST(Advisor, AcesRecommendAggressionPreflop) {
@@ -476,8 +486,10 @@ TEST(Advisor, IllegalOptionsAreAbsent) {
     engine.start_hand(deal);
     ASSERT_TRUE(engine.apply_action({ActionType::AllIn, 0}));
     const HintRecommendation hint = TrainingAdvisor(8, kRollouts).analyze(engine.player_view(1));
-    EXPECT_FALSE(hint.ev.raise_33.has_value());
+    EXPECT_FALSE(hint.ev.raise_25.has_value());
+    EXPECT_FALSE(hint.ev.raise_50.has_value());
     EXPECT_FALSE(hint.ev.raise_75.has_value());
+    EXPECT_FALSE(hint.ev.raise_100.has_value());
     EXPECT_TRUE(hint.ev.check_call.has_value());
     EXPECT_EQ(hint.action.type, ActionType::Call) << hint.best_action;  // AA for a bargain
 }
@@ -509,8 +521,10 @@ TEST(Advisor, HintsIgnoreOpponentCardsAndUndealtBoard) {
     EXPECT_EQ(a.best_action, b.best_action);
     EXPECT_EQ(a.rationale, b.rationale);
     EXPECT_EQ(a.ev.check_call, b.ev.check_call);
-    EXPECT_EQ(a.ev.raise_33, b.ev.raise_33);
+    EXPECT_EQ(a.ev.raise_25, b.ev.raise_25);
+    EXPECT_EQ(a.ev.raise_50, b.ev.raise_50);
     EXPECT_EQ(a.ev.raise_75, b.ev.raise_75);
+    EXPECT_EQ(a.ev.raise_100, b.ev.raise_100);
     EXPECT_EQ(a.ev.all_in, b.ev.all_in);
 }
 
@@ -554,8 +568,10 @@ TEST(Advisor, FieldsInRangeAndBestActionLegalAcrossRandomStates) {
                 EXPECT_DOUBLE_EQ(ev_of_action(hint), best_listed_ev(hint.ev)) << hint.best_action;
 
                 if (!view.legal.allows(ActionType::Bet) && !view.legal.allows(ActionType::Raise)) {
-                    EXPECT_FALSE(hint.ev.raise_33.has_value());
+                    EXPECT_FALSE(hint.ev.raise_25.has_value());
+                    EXPECT_FALSE(hint.ev.raise_50.has_value());
                     EXPECT_FALSE(hint.ev.raise_75.has_value());
+                    EXPECT_FALSE(hint.ev.raise_100.has_value());
                 }
                 if (!view.legal.allows(ActionType::AllIn)) EXPECT_FALSE(hint.ev.all_in.has_value());
 
@@ -602,13 +618,196 @@ TEST(Advisor, DoesNotShoveAirOrTopPairDeep) {
     EXPECT_NE(TrainingAdvisor(15, kRollouts).analyze(top_pair.player_view(0)).action.type, ActionType::AllIn);
 }
 
+// --- Bet sizing ----------------------------------------------------------------
+
+// Heads-up, checked to on the flop: pot 200, 1900 behind each.
+HintRecommendation checked_to_on_flop(const char* a, const char* b, const char* f1, const char* f2, const char* f3) {
+    // The opponent's cards and later streets are invisible to the advisor.
+    std::vector<Card> used{card(a), card(b), card(f1), card(f2), card(f3)};
+    std::vector<Card> spare;
+    for (int id = 0; id < kDeckSize && spare.size() < 4; ++id) {
+        if (std::find(used.begin(), used.end(), Card(id)) == used.end()) spare.push_back(Card(id));
+    }
+    GameEngine engine = heads_up_to_flop({spare[0], spare[1]}, hole(a, b),
+                                         {card(f1), card(f2), card(f3), spare[2], spare[3]});
+    return TrainingAdvisor(40, 4000).analyze(engine.player_view(1));
+}
+
+TEST(AdvisorSizing, EachSizeIsRecommendedInItsSpot) {
+    const auto expect_bet = [](const HintRecommendation& hint, int amount, const char* what) {
+        EXPECT_EQ(hint.action.type, ActionType::Bet) << what << ": " << hint.best_action;
+        EXPECT_EQ(hint.action.amount, amount) << what << ": " << hint.best_action << " | " << hint.rationale;
+    };
+    expect_bet(checked_to_on_flop("As", "3d", "Kd", "8s", "3c"), 50, "thin value, dry");
+    expect_bet(checked_to_on_flop("Ks", "Qh", "Kd", "8s", "3c"), 100, "solid value, dry");
+    expect_bet(checked_to_on_flop("Ks", "Jd", "Jh", "7h", "2c"), 150, "solid value, wet");
+    expect_bet(checked_to_on_flop("Ah", "Kh", "Jh", "7h", "2c"), 150, "flush draw, wet");
+    expect_bet(checked_to_on_flop("Js", "Jc", "Jh", "Th", "9c"), 200, "set, dynamic");
+    expect_bet(checked_to_on_flop("Ah", "7h", "9h", "5h", "2h"), 50, "flush, monotone");
+}
+
+TEST(AdvisorSizing, VeryStrongRiverHandsBetPot) {
+    GameEngine engine = heads_up_to_flop(hole("Ah", "Qd"), hole("8c", "8d"), board_of("Kd", "8s", "3c", "2h", "Jd"));
+    for (int street = 0; street < 2; ++street) {
+        ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+    }
+    const HintRecommendation hint = TrainingAdvisor(41, 4000).analyze(engine.player_view(1));
+    EXPECT_EQ(hint.action.type, ActionType::Bet) << hint.best_action;
+    EXPECT_EQ(hint.action.amount, 200) << hint.best_action;
+    EXPECT_NE(hint.rationale.find("river"), std::string::npos) << hint.rationale;
+}
+
+TEST(AdvisorSizing, ShortStacksCanStillShove) {
+    GameConfig config;
+    config.first_button = 0;
+    config.hero_seat = std::nullopt;
+    config.stacks = std::array<int, kMaxSeats>{300, 300, 0, 0, 0, 0};
+    GameEngine engine(config);
+    ScriptedDeal deal;
+    deal.holes[0] = hole("Qs", "Qd");
+    deal.holes[1] = hole("8c", "8d");
+    deal.board = board_of("Kd", "8s", "3c", "2h", "Jd");
+    engine.start_hand(deal);
+    ASSERT_TRUE(engine.apply_action({ActionType::Raise, 100}));
+    ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));
+    const HintRecommendation hint = TrainingAdvisor(42, 4000).analyze(engine.player_view(1));  // 200 behind, pot 200
+    EXPECT_EQ(hint.action.type, ActionType::AllIn) << hint.best_action << " | " << hint.rationale;
+}
+
+TEST(AdvisorSizing, DynamicBoardsAreClassified) {
+    const auto dynamic = [](std::initializer_list<const char*> cards) {
+        std::vector<Card> board;
+        for (const char* c : cards) board.push_back(card(c));
+        return classify_board(board).dynamic;
+    };
+    EXPECT_TRUE(dynamic({"Jh", "Th", "9c"}));   // Connected with a flush draw
+    EXPECT_TRUE(dynamic({"Jc", "Td", "9s"}));   // Connected alone
+    EXPECT_TRUE(dynamic({"Jh", "9h", "7c"}));   // Flush draw and a straight window
+    EXPECT_TRUE(dynamic({"Ah", "2c", "3d"}));   // The low ace connects
+    EXPECT_FALSE(dynamic({"Kd", "8s", "3c"}));  // Dry
+    EXPECT_FALSE(dynamic({"Jh", "7h", "2c"}));  // A flush draw alone
+    EXPECT_FALSE(dynamic({"Jc", "9d", "7s"}));  // A straight window alone
+    EXPECT_FALSE(dynamic({"Jc", "Td", "9s", "2h", "3d"}));  // No card to come
+}
+
+// Random spots, sampling what the rule really does across hands and boards.
+TEST(AdvisorSizing, EverySizeIsUsedAndAdviceStaysSane) {
+    std::mt19937_64 rng(777);
+    const TrainingAdvisor advisor(43, 300);
+    std::array<int, 5> advised{};
+    std::array<int, 5> by_base_ev{};
+    int spots = 0;
+    int bets = 0;
+
+    for (int i = 0; i < 1500; ++i) {
+        std::array<Card, kDeckSize> deck;
+        for (int id = 0; id < kDeckSize; ++id) deck[static_cast<std::size_t>(id)] = Card(id);
+        std::shuffle(deck.begin(), deck.end(), rng);
+        const std::array<Card, 2> mine{deck[0], deck[1]};
+        const std::array<Card, 5> board{deck[4], deck[5], deck[6], deck[7], deck[8]};
+        GameEngine engine = heads_up_to_flop({deck[2], deck[3]}, mine, board);
+        const int streets = static_cast<int>(rng() % 3);
+        for (int street = 0; street < streets; ++street) {
+            ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+            ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        }
+        const PlayerView view = engine.player_view(1);
+        const HintRecommendation hint = advisor.analyze(view);
+        ++spots;
+        EXPECT_DOUBLE_EQ(ev_of_action(hint), best_listed_ev(hint.ev)) << hint.best_action;
+
+        const std::array<std::optional<int>, 4> sizes{hint.raise_25_to, hint.raise_50_to, hint.raise_75_to, hint.raise_100_to};
+        for (std::size_t a = 0; a < sizes.size(); ++a) {
+            for (std::size_t b = a + 1; b < sizes.size(); ++b) {
+                if (sizes[a] && sizes[b]) EXPECT_NE(*sizes[a], *sizes[b]);
+            }
+        }
+
+        // Fit must not start a bet the model would not make.
+        const std::array<std::optional<double>, 4> base{hint.base_ev.raise_25, hint.base_ev.raise_50, hint.base_ev.raise_75, hint.base_ev.raise_100};
+        double best_base = -1e18;
+        std::size_t best_rung = 0;
+        for (std::size_t r = 0; r < base.size(); ++r) {
+            if (base[r] && *base[r] > best_base) {
+                best_base = *base[r];
+                best_rung = r;
+            }
+        }
+        if (hint.action.type == ActionType::Check) {
+            EXPECT_GE(*hint.base_ev.check_call, best_base);
+            continue;
+        }
+        ASSERT_EQ(hint.action.type, ActionType::Bet) << hint.best_action;
+        EXPECT_GT(best_base, *hint.base_ev.check_call);
+        ++bets;
+        ++by_base_ev[best_rung];
+
+        const auto rung = std::find(sizes.begin(), sizes.end(), std::optional<int>(hint.action.amount));
+        ASSERT_NE(rung, sizes.end());
+        ++advised[static_cast<std::size_t>(rung - sizes.begin())];
+
+        const BoardTexture texture = classify_board(view.board);
+        const HandRead read = read_hand(mine, view.board);
+        if (texture.wet && texture.dynamic && !texture.paired && !texture.monotone && is_nutted(read, view.board) && hint.equity_pct >= 75.0) {
+            EXPECT_NE(rung - sizes.begin(), 0) << hint.best_action;
+        }
+    }
+
+    std::printf("AdvisorSizing over %d spots, %d bets:\n", spots, bets);
+    std::printf("  advised     25%%: %d  50%%: %d  75%%: %d  100%%: %d\n", advised[0], advised[1], advised[2], advised[3]);
+    std::printf("  model alone 25%%: %d  50%%: %d  75%%: %d  100%%: %d\n", by_base_ev[0], by_base_ev[1], by_base_ev[2], by_base_ev[3]);
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_GT(advised[static_cast<std::size_t>(i)], 0) << "rung " << i;
+        EXPECT_LT(advised[static_cast<std::size_t>(i)], bets * 7 / 10) << "rung " << i;
+    }
+}
+
+TEST(AdvisorSizing, QuickBetsMatchAdvisorSizes) {
+    const auto check = [](const PlayerView& view, const HintRecommendation& hint) {
+        const int cap = clamp_raise_to(view, view.legal.max_raise_to);
+        const std::array<std::pair<double, std::optional<int>>, 4> rungs{{{0.25, hint.raise_25_to},
+                                                                          {0.50, hint.raise_50_to},
+                                                                          {0.75, hint.raise_75_to},
+                                                                          {1.00, hint.raise_100_to}}};
+        for (const auto& [fraction, to] : rungs) {
+            const int quick = quick_bet_to(view.legal, view.current_bet, view.total_pot, fraction, cap);
+            EXPECT_EQ(quick, clamp_raise_to(view, raise_to_for_pot_fraction(view, fraction)));
+            if (to) EXPECT_EQ(quick, *to);
+        }
+    };
+
+    GameEngine normal = heads_up_to_flop(hole("Ac", "Ah"), hole("8c", "8d"), board_of("Kd", "8s", "3c", "2h", "Jd"));
+    check(normal.player_view(1), TrainingAdvisor(44, 500).analyze(normal.player_view(1)));
+
+    ASSERT_TRUE(normal.apply_action({ActionType::Bet, 60}));  // Facing a bet
+    check(normal.player_view(0), TrainingAdvisor(44, 500).analyze(normal.player_view(0)));
+
+    GameConfig config;
+    config.first_button = 0;
+    config.hero_seat = std::nullopt;
+    config.stacks = std::array<int, kMaxSeats>{500, 2000, 0, 0, 0, 0};
+    GameEngine short_stack(config);
+    ScriptedDeal deal;
+    deal.holes[0] = hole("Qs", "Qd");
+    deal.holes[1] = hole("Ac", "Ad");
+    deal.board = board_of("Kd", "8s", "3c", "2h", "Jd");
+    short_stack.start_hand(deal);
+    ASSERT_TRUE(short_stack.apply_action({ActionType::Raise, 400}));
+    ASSERT_TRUE(short_stack.apply_action({ActionType::Call, 0}));
+    const PlayerView capped = short_stack.player_view(1);
+    check(capped, TrainingAdvisor(44, 500).analyze(capped));
+    EXPECT_EQ(quick_bet_to(capped.legal, capped.current_bet, capped.total_pot, 1.0, clamp_raise_to(capped, capped.legal.max_raise_to)), 100);
+}
+
 // Run by hand: reads the advice for a spread of spots.
 TEST(Advisor, DISABLED_PrintSampleHints) {
     const auto show = [](const char* what, const PlayerView& view) {
         const HintRecommendation h = TrainingAdvisor(1).analyze(view);
-        std::printf("%s\n  -> %s\n  %s\n  EV fold %.0f call %.0f r33 %.0f r75 %.0f shove %.0f\n", what,
+        std::printf("%s\n  -> %s\n  %s\n  EV fold %.0f call %.0f r25 %.0f r50 %.0f r75 %.0f r100 %.0f shove %.0f\n", what,
                     h.best_action.c_str(), h.rationale.c_str(), h.ev.fold.value_or(-1), h.ev.check_call.value_or(-1),
-                    h.ev.raise_33.value_or(-1), h.ev.raise_75.value_or(-1), h.ev.all_in.value_or(-1));
+                    h.ev.raise_25.value_or(-1), h.ev.raise_50.value_or(-1), h.ev.raise_75.value_or(-1),
+                    h.ev.raise_100.value_or(-1), h.ev.all_in.value_or(-1));
     };
     for (const auto& h : {hole("Ac", "Ad"), hole("Ac", "Kd"), hole("Tc", "Td"), hole("Kc", "Td"), hole("8h", "7h"), hole("9h", "4d")}) {
         GameEngine utg = six_max(3, h);

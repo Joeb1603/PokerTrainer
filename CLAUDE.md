@@ -56,7 +56,7 @@ Implement an `IBotStrategy` interface driven by a shared `GtoHeuristicEngine` an
 
 Create a `TrainingAdvisor` class that analyzes Hero's current decision state whenever it is Hero's turn:
 
-\- Compute Hero's raw equity via Monte Carlo simulation (5,000 rollouts), exact Pot Odds %, Stack-to-Pot Ratio (SPR), and estimated EV for Fold, Check/Call, and Raise (33%, 75%, All-in).
+\- Compute Hero's raw equity via Monte Carlo simulation (5,000 rollouts), exact Pot Odds %, Stack-to-Pot Ratio (SPR), and estimated EV for Fold, Check/Call, and Raise (25%, 50%, 75%, 100%, All-in). A heuristic EV decides whether to bet; a rule over board texture and hand strength chooses the size.
 
 \- Output a structured `HintRecommendation` containing:
 

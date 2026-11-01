@@ -11,13 +11,16 @@
 namespace poker {
 
 // Estimated chips won or lost from this decision on, relative to folding now.
-// An absent option is not legal here, or would duplicate a larger one: a 75% raise
-// that takes the whole stack is listed only as all-in.
+// An absent option is not legal here, or would duplicate another: a 75% raise that
+// takes the whole stack is listed only as all-in, and sizes that clamp to the same
+// bet are listed once, under the smallest.
 struct EvEstimates {
     std::optional<double> fold;
     std::optional<double> check_call;
-    std::optional<double> raise_33;
+    std::optional<double> raise_25;
+    std::optional<double> raise_50;
     std::optional<double> raise_75;
+    std::optional<double> raise_100;
     std::optional<double> all_in;
 };
 
@@ -28,9 +31,12 @@ struct HintRecommendation {
     double pot_odds_pct = 0.0;  // 0 when there is nothing to call
     double mdf_pct = 100.0;     // 100 when not facing a bet
     double spr = 0.0;
-    EvEstimates ev;
-    std::optional<int> raise_33_to;
+    EvEstimates ev;       // With the size-fit adjustment, so the advice is the highest listed
+    EvEstimates base_ev;  // The model alone, which is what mistakes are judged on
+    std::optional<int> raise_25_to;
+    std::optional<int> raise_50_to;
     std::optional<int> raise_75_to;
+    std::optional<int> raise_100_to;
     std::string rationale;
 };
 
@@ -65,7 +71,22 @@ struct HintRecommendation {
 // the hands that call one are stronger still. `implied` rewards a raise that keeps chips behind for later
 // streets, which a single-street formula otherwise misses and which would make
 // all-in look best with every strong hand:
-// (e_c - 0.5, if positive) * effective stack left * 0.5, before the river only.
+// (e_c - 0.5, if positive) * effective stack left * 0.5, before the river only, and at
+// most half the pot once called. Without that cap the stack behind outweighs everything
+// else, and the nuts would choose the smallest bet.
+//
+// Postflop, that model decides whether to bet at all, comparing the best bet with
+// checking, calling and folding. It says little about which size, so a rule chooses:
+//
+//   100%  A very strong hand on the river, or on a wet and dynamic board
+//   25%   Any other hand on a monotone board; thin value on a dry or paired one
+//   50%   Other value on a dry or paired board; thin value on a wet one
+//   75%   Solid value or a strong draw on a wet board
+//
+// The chosen size is listed at the best bet's EV, its fit adjustment, so `ev` shows the
+// advice as the highest option while `base_ev` keeps the model's own numbers. Fit never
+// turns a check, call or fold into a bet. All-in is chosen only when it has the best
+// model EV and costs at most 1.5 pots, or is the only raise left.
 //
 // Unopened preflop pots replace that fold model: nobody has shown interest, so each
 // opponent calls about 15% of the time at a standard open, proportionally less

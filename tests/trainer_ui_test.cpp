@@ -23,10 +23,11 @@ constexpr ImVec2 kRaise{399.0f, kConsoleTop + 27.0f};
 constexpr ImVec2 kAllIn{557.0f, kConsoleTop + 27.0f};
 constexpr float kQuickRow = kConsoleTop + 60.0f;
 constexpr ImVec2 kQuickMin{300.0f, kQuickRow};
-constexpr ImVec2 kQuick50{376.0f, kQuickRow};
-constexpr ImVec2 kQuick75{452.0f, kQuickRow};
-constexpr ImVec2 kQuickPot{528.0f, kQuickRow};
-constexpr ImVec2 kQuickAllIn{604.0f, kQuickRow};
+constexpr ImVec2 kQuick25{376.0f, kQuickRow};
+constexpr ImVec2 kQuick50{452.0f, kQuickRow};
+constexpr ImVec2 kQuick75{528.0f, kQuickRow};
+constexpr ImVec2 kQuickPot{604.0f, kQuickRow};
+constexpr ImVec2 kQuickAllIn{680.0f, kQuickRow};
 constexpr ImVec2 kNextHand{128.0f, kConsoleTop + 27.0f};
 constexpr ImVec2 kNewSession{1190.0f, 52.0f};
 constexpr ImVec2 kPlayGto{100.0f, kConsoleTop + 88.0f};
@@ -105,6 +106,7 @@ protected:
         t.legal.min_raise_to = 200;
         t.legal.max_raise_to = 1000;
         t.current_bet = 100;
+        t.raise_cap_to = 1000;
         t.pots.total = 300;
         t.action_log = {"a"};
     }
@@ -215,11 +217,23 @@ TEST_F(UiTest, QuickBetsSetTheSizeWithoutActing) {
         const int amount = fake_.submitted.empty() ? -1 : fake_.submitted[0].amount;
         return amount;
     };
+    EXPECT_EQ(size_after(kQuick25), 200);
     EXPECT_EQ(size_after(kQuick50), 300);
     EXPECT_EQ(size_after(kQuick75), 400);
     EXPECT_EQ(size_after(kQuickPot), 500);
     EXPECT_EQ(size_after(kQuickAllIn), 1000);
     EXPECT_EQ(size_after(kQuickMin), 200);
+}
+
+TEST_F(UiTest, QuickBetsStopAtWhatAnOpponentCanMatch) {
+    fake_.table.raise_cap_to = 350;
+    click(kQuickPot);
+    click(kRaise);
+    expect_single_action(fake_, ActionType::Raise, 350);
+    fake_.submitted.clear();
+    click(kQuickAllIn);  // All-in still means the whole stack
+    click(kRaise);
+    expect_single_action(fake_, ActionType::Raise, 1000);
 }
 
 TEST_F(UiTest, SliderResetsToTheMinimumForEachNewDecision) {
@@ -401,8 +415,10 @@ TEST_F(UiTest, EveryScreenDrawsWithFullData) {
     hint.rationale = "A rationale long enough that it has to wrap across the width of the sidebar panel.";
     hint.ev.fold = 0.0;
     hint.ev.check_call = 12.0;
-    hint.ev.raise_33 = 20.0;
+    hint.ev.raise_25 = 20.0;
+    hint.ev.raise_50 = 25.0;
     hint.ev.raise_75 = 30.0;
+    hint.ev.raise_100 = 35.0;
     hint.ev.all_in = -40.0;
     t.hint = hint;
 

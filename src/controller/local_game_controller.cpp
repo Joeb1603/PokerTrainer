@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "bots/bots.h"
+#include "bots/gto_heuristic_engine.h"
 
 namespace poker {
 namespace {
@@ -41,11 +42,11 @@ std::string describe_action(const ActionRecord& a) {
 
 }  // namespace
 
-int quick_bet_to(const LegalActions& legal, int current_bet, int total_pot, double pot_fraction) {
+int quick_bet_to(const LegalActions& legal, int current_bet, int total_pot, double pot_fraction, int raise_cap_to) {
     if (!legal.allows(ActionType::Bet) && !legal.allows(ActionType::Raise)) return 0;
     const double pot_after_call = total_pot + legal.call_amount;
     const int to = current_bet + static_cast<int>(std::lround(pot_fraction * pot_after_call));
-    return std::clamp(to, legal.min_raise_to, legal.max_raise_to);
+    return std::clamp(std::min(to, raise_cap_to), legal.min_raise_to, legal.max_raise_to);
 }
 
 int bet_pot_percent(const LegalActions& legal, int current_bet, int total_pot, int bet_to) {
@@ -366,6 +367,7 @@ void LocalGameController::rebuild_snapshot() {
     if (hero_view_) {
         next.legal = hero_view_->legal;
         next.current_bet = hero_view_->current_bet;
+        next.raise_cap_to = clamp_raise_to(*hero_view_, hero_view_->legal.max_raise_to);
         next.hint = hero_hint_;
     }
 

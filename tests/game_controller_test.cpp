@@ -221,20 +221,24 @@ TEST_F(Controller, QuickBetsAreSizedFromThePotAfterCallingAndClamped) {
     facing.min_raise_to = 200;
     facing.max_raise_to = 1000;
     // Pot 300 including a 100 bet: 400 after calling, so a pot raise goes to 100 + 400.
-    EXPECT_EQ(quick_bet_to(facing, 100, 300, 1.0), 500);
-    EXPECT_EQ(quick_bet_to(facing, 100, 300, 0.5), 300);
-    EXPECT_EQ(quick_bet_to(facing, 100, 300, 0.75), 400);
-    EXPECT_EQ(quick_bet_to(facing, 100, 300, 0.0), 200);  // Min clamps up
-    EXPECT_EQ(quick_bet_to(facing, 100, 300, 10.0), 1000);  // Stack clamps down
+    EXPECT_EQ(quick_bet_to(facing, 100, 300, 1.0, facing.max_raise_to), 500);
+    EXPECT_EQ(quick_bet_to(facing, 100, 300, 0.5, facing.max_raise_to), 300);
+    EXPECT_EQ(quick_bet_to(facing, 100, 300, 0.75, facing.max_raise_to), 400);
+    EXPECT_EQ(quick_bet_to(facing, 100, 300, 0.0, facing.max_raise_to), 200);  // Min clamps up
+    EXPECT_EQ(quick_bet_to(facing, 100, 300, 10.0, facing.max_raise_to), 1000);  // Stack clamps down
 
     LegalActions unbet;
     unbet.mask = 1u << static_cast<unsigned>(ActionType::Bet);
     unbet.min_raise_to = 20;
     unbet.max_raise_to = 1000;
-    EXPECT_EQ(quick_bet_to(unbet, 0, 200, 0.5), 100);
-    EXPECT_EQ(quick_bet_to(unbet, 0, 200, 1.0), 200);
+    EXPECT_EQ(quick_bet_to(unbet, 0, 200, 0.5, unbet.max_raise_to), 100);
+    EXPECT_EQ(quick_bet_to(unbet, 0, 200, 1.0, unbet.max_raise_to), 200);
 
-    EXPECT_EQ(quick_bet_to(LegalActions{}, 0, 200, 1.0), 0);
+    EXPECT_EQ(quick_bet_to(LegalActions{}, 0, 200, 1.0, 0), 0);
+
+    // A short opponent caps the size, but never below the legal minimum.
+    EXPECT_EQ(quick_bet_to(facing, 100, 300, 1.0, 350), 350);
+    EXPECT_EQ(quick_bet_to(facing, 100, 300, 1.0, 150), 200);
 }
 
 TEST_F(Controller, BetPercentRoundTripsWithQuickBets) {
@@ -250,12 +254,12 @@ TEST_F(Controller, BetPercentRoundTripsWithQuickBets) {
 
     for (const int percent : {50, 75, 100, 150, 300}) {
         const double fraction = percent / 100.0;
-        EXPECT_EQ(bet_pot_percent(facing, 100, 300, quick_bet_to(facing, 100, 300, fraction)), percent);
-        EXPECT_EQ(bet_pot_percent(unbet, 0, 200, quick_bet_to(unbet, 0, 200, fraction)), percent);
+        EXPECT_EQ(bet_pot_percent(facing, 100, 300, quick_bet_to(facing, 100, 300, fraction, facing.max_raise_to)), percent);
+        EXPECT_EQ(bet_pot_percent(unbet, 0, 200, quick_bet_to(unbet, 0, 200, fraction, unbet.max_raise_to)), percent);
     }
     // Rounding of the chips stays within a percent on a small pot, and clamping is reported as it is.
-    EXPECT_NEAR(bet_pot_percent(unbet, 0, 35, quick_bet_to(unbet, 0, 35, 0.75)), 75, 1);
-    EXPECT_EQ(bet_pot_percent(facing, 100, 300, quick_bet_to(facing, 100, 300, 0.0)), 25);  // Minimum raise
+    EXPECT_NEAR(bet_pot_percent(unbet, 0, 35, quick_bet_to(unbet, 0, 35, 0.75, unbet.max_raise_to)), 75, 1);
+    EXPECT_EQ(bet_pot_percent(facing, 100, 300, quick_bet_to(facing, 100, 300, 0.0, facing.max_raise_to)), 25);  // Minimum raise
     EXPECT_EQ(bet_pot_percent(LegalActions{}, 0, 0, 100), 0);
 }
 

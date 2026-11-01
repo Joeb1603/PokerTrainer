@@ -22,6 +22,8 @@ struct BoardTexture {
     bool paired = false;
     bool monotone = false;  // Three or more cards, all one suit
     bool wet = false;       // Two of a suit with cards to come, three of a suit, or three in a straight window
+    // With a card to come: a flush draw and three in a straight window, or three connected ranks.
+    bool dynamic = false;
 
     bool dry() const { return !wet; }
 };

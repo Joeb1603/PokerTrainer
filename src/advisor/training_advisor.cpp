@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
+#include <limits>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -13,11 +16,23 @@
 namespace poker {
 namespace {
 
-constexpr double kFractionSmall = 0.33;
-constexpr double kFractionLarge = 0.75;
+struct SizeRung {
+    double fraction;
+    std::optional<double> EvEstimates::*ev;
+    std::optional<int> HintRecommendation::*to;
+};
+constexpr std::array<SizeRung, 4> kLadder{{{0.25, &EvEstimates::raise_25, &HintRecommendation::raise_25_to},
+                                           {0.50, &EvEstimates::raise_50, &HintRecommendation::raise_50_to},
+                                           {0.75, &EvEstimates::raise_75, &HintRecommendation::raise_75_to},
+                                           {1.00, &EvEstimates::raise_100, &HintRecommendation::raise_100_to}}};
+
 constexpr double kUnfacedCallFloor = 0.10;
 constexpr double kMinimumCallFloor = 0.01;
 constexpr double kImpliedShare = 0.5;
+constexpr double kImpliedPotCap = 0.5;
+constexpr double kShoveMaxPots = 1.5;
+constexpr double kVeryStrongBar = 0.5;
+constexpr double kSolidBar = 0.3;
 constexpr double kUnopenedCallAtStandardOpen = 0.15;
 constexpr double kStandardOpenBigBlinds = 2.5;
 constexpr double kChartPriorBigBlinds = 1.0;
@@ -91,9 +106,38 @@ double raise_ev(const PlayerView& view, const EvInputs& in, int to) {
     double implied = 0.0;
     if (view.street != Street::River) {
         const int behind = std::min(me.street_bet + me.stack, deepest_total) - effective_to;
-        implied = std::max(0.0, called - 0.5) * std::max(0, behind) * kImpliedShare;
+        implied = std::min(std::max(0.0, called - 0.5) * std::max(0, behind) * kImpliedShare,
+                           kImpliedPotCap * (pot + added + match));
     }
     return fold_all * pot * in.pot_kept_share + (1.0 - fold_all) * (called * (pot + added + match) - added + implied);
+}
+
+struct SizeChoice {
+    double fraction;
+    const char* reason;
+};
+
+// The postflop size for a hand worth betting. The table is in training_advisor.h.
+SizeChoice preferred_size(const BoardTexture& texture, const HandRead& read, std::span<const Card> board, Street street,
+                          double equity, int opponents) {
+    const auto bar = [opponents](double strength) {
+        const double even_share = 1.0 / (opponents + 1);
+        return even_share + (1.0 - even_share) * strength;
+    };
+    // Two pair on an unpaired board uses both hole cards, so it counts with sets.
+    const bool made_big = is_nutted(read, board) || (read.category == HandCategory::TwoPair && !texture.paired);
+    const bool very_strong = made_big && equity >= bar(kVeryStrongBar);
+    const bool solid = very_strong || equity >= bar(kSolidBar);
+
+    if (street == Street::River && very_strong) return {1.0, "a very strong river hand wants the biggest value bet"};
+    if (texture.monotone) return {0.25, "a monotone board favors small bets"};
+    if (texture.paired || !texture.wet) {
+        return solid ? SizeChoice{0.5, "a standard value bet on a static board"}
+                     : SizeChoice{0.25, "a cheap probe or thin value bet on a static board"};
+    }
+    if (very_strong && texture.dynamic) return {1.0, "heavy protection on a dynamic board"};
+    if (solid || read.strong_draw()) return {0.75, "charges the draws on a wet board"};
+    return {0.5, "medium protection for thin value on a wet board"};
 }
 
 std::string percent_of_pot_label(const PlayerView& view, ActionType type, int to, int clean_to, double fraction) {
@@ -230,37 +274,76 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
         }
     }
 
+    const BoardTexture texture = classify_board(view.board);
+    const HandRead read = read_hand(hole, view.board);
+
     const ActionType raise_type = legal.allows(ActionType::Bet) ? ActionType::Bet : ActionType::Raise;
+    std::array<std::string, kLadder.size()> rung_labels;
+    std::optional<double> best_rung_ev;
     if (may_raise) {
-        const auto sized = [&](double fraction, std::optional<double>& ev_out, std::optional<int>& to_out) {
-            const int clean_to = raise_to_for_pot_fraction(view, fraction);
+        for (std::size_t i = 0; i < kLadder.size(); ++i) {
+            const SizeRung& rung = kLadder[i];
+            const int clean_to = raise_to_for_pot_fraction(view, rung.fraction);
             // Sized for what somebody can match, as raise_ev values it.
             const int to = clamp_raise_to(view, clean_to);
-            if (to >= legal.max_raise_to) return;  // That is the all-in option below
-            if (to == hint.raise_33_to) return;    // Both sizes clamped to the same bet
+            if (to >= legal.max_raise_to) continue;  // That is the all-in option below
+            const bool repeated = std::any_of(kLadder.begin(), kLadder.begin() + static_cast<std::ptrdiff_t>(i),
+                                              [&](const SizeRung& earlier) { return hint.*earlier.to == to; });
+            if (repeated) continue;  // Sizes clamped to the same bet
             const double ev = raise_ev(view, inputs, to) + prior(PreflopResponse::Raise, raise_risk(to));
-            ev_out = ev;
-            to_out = to;
-            consider(ev, {raise_type, to}, percent_of_pot_label(view, raise_type, to, clean_to, fraction));
-        };
-        sized(kFractionSmall, hint.ev.raise_33, hint.raise_33_to);
-        sized(kFractionLarge, hint.ev.raise_75, hint.raise_75_to);
+            hint.ev.*rung.ev = ev;
+            hint.*rung.to = to;
+            rung_labels[i] = percent_of_pot_label(view, raise_type, to, clean_to, rung.fraction);
+            best_rung_ev = std::max(best_rung_ev.value_or(ev), ev);
+            if (preflop) consider(ev, {raise_type, to}, rung_labels[i]);
+        }
     }
+
+    const std::string all_in_label = "ALL-IN " + std::to_string(view.seats[view.seat].street_bet + view.seats[view.seat].stack);
     if (legal.allows(ActionType::AllIn)) {
         // Without raising rights an all-in is just the call, already considered.
-        const double ev = may_raise ? raise_ev(view, inputs, legal.max_raise_to) +
-                                        prior(PreflopResponse::Raise, raise_risk(legal.max_raise_to))
-                                    : hint.ev.check_call.value_or(0.0);
-        hint.ev.all_in = ev;
-        consider(ev, {ActionType::AllIn, 0},
-                 "ALL-IN " + std::to_string(view.seats[view.seat].street_bet + view.seats[view.seat].stack));
+        hint.ev.all_in = may_raise ? raise_ev(view, inputs, legal.max_raise_to) +
+                                         prior(PreflopResponse::Raise, raise_risk(legal.max_raise_to))
+                                   : hint.ev.check_call.value_or(0.0);
+        if (preflop || !may_raise) consider(*hint.ev.all_in, {ActionType::AllIn, 0}, all_in_label);
+    }
+    hint.base_ev = hint.ev;
+
+    std::string size_reason;
+    if (!preflop && may_raise) {
+        const bool can_shove = legal.allows(ActionType::AllIn);
+        const bool shove_in_range =
+            can_shove && (!best_rung_ev || raise_risk(legal.max_raise_to) <= kShoveMaxPots * view.total_pot);
+        double best_bet = best_rung_ev.value_or(-std::numeric_limits<double>::infinity());
+        if (shove_in_range) best_bet = std::max(best_bet, *hint.ev.all_in);
+
+        if (best_bet > best_ev) {  // Betting beats the passive options, on the model alone
+            const SizeChoice size =
+                preferred_size(texture, read, view.board, view.street, equity, std::max(1, view.opponents_in_hand()));
+            const int target = clamp_raise_to(view, raise_to_for_pot_fraction(view, size.fraction));
+            const auto chosen = std::find_if(kLadder.begin(), kLadder.end(),
+                                             [&](const SizeRung& rung) { return hint.*rung.to == target; });
+            const bool shoves_on_ev = shove_in_range && (!best_rung_ev || *hint.ev.all_in > *best_rung_ev);
+            if (shoves_on_ev || chosen == kLadder.end()) {
+                // The chosen size would take the whole stack, or all-in is simply best.
+                if (can_shove) {
+                    hint.ev.all_in = best_bet;
+                    consider(best_bet, {ActionType::AllIn, 0}, all_in_label);
+                }
+            } else {
+                hint.ev.*chosen->ev = best_bet;
+                consider(best_bet, {raise_type, target},
+                         rung_labels[static_cast<std::size_t>(chosen - kLadder.begin())]);
+                size_reason = size.reason;
+            }
+        }
+        // A deep shove is not on offer, so it must not out-list the advice.
+        if (can_shove && !shove_in_range) hint.ev.all_in = std::min(*hint.ev.all_in, best_ev);
     }
 
     hint.best_action = best_label;
     hint.action = best_action;
 
-    const BoardTexture texture = classify_board(view.board);
-    const HandRead read = read_hand(hole, view.board);
     const std::string_view position = view.position ? to_string(*view.position) : std::string_view("Unknown");
     const std::string_view board_name = texture_name(texture, !view.board.empty());
 
@@ -276,7 +359,9 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
     }
     // A fold above the price must say why, or the numbers appear to argue against it.
     std::string verdict = best_label + " has the highest estimated EV.";
-    if (best_action.type == ActionType::Fold && hint.equity_pct > hint.pot_odds_pct) {
+    if (!size_reason.empty()) {
+        verdict = "Betting beats the passive options, and " + best_label + " fits: " + size_reason + ".";
+    } else if (best_action.type == ActionType::Fold && hint.equity_pct > hint.pot_odds_pct) {
         verdict = preflop ? "FOLD: the positional chart rejects this hand here, as random-hand equity overstates it."
                           : "FOLD: equity against random hands overstates this hand against a betting range.";
     }

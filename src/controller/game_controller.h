@@ -70,6 +70,7 @@ struct TableSnapshot {
     // Set only while it is Hero's turn.
     LegalActions legal;
     int current_bet = 0;
+    int raise_cap_to = 0;  // The most any opponent can match, within what is legal
     std::optional<HintRecommendation> hint;
 
     std::optional<std::string> hero_hand;  // From the flop on, until Hero folds, e.g. "Pair of Kings"
@@ -84,9 +85,10 @@ struct TableSnapshot {
 };
 
 // The chips a raise reaches for a share of the pot, clamped to what is legal. It sizes
-// from the pot after calling, so 1.0 is a standard pot-sized raise. Returns 0 if
-// neither a bet nor a raise is legal.
-int quick_bet_to(const LegalActions& legal, int current_bet, int total_pot, double pot_fraction);
+// from the pot after calling, so 1.0 is a standard pot-sized raise, and stops at
+// raise_cap_to, so it gives the same chips as the advisor's size. Returns 0 if neither
+// a bet nor a raise is legal.
+int quick_bet_to(const LegalActions& legal, int current_bet, int total_pot, double pot_fraction, int raise_cap_to);
 
 // The inverse of quick_bet_to: the size of a bet or raise to `bet_to`, as a whole
 // percentage of the pot after calling.
