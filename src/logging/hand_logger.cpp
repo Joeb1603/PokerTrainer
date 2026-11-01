@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <format>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <utility>
 
@@ -134,6 +135,12 @@ Json mistake_json(const HeroMistake& mistake) {
 
 }  // namespace
 
+std::string make_session_id() {
+    const auto now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+    std::random_device entropy;
+    return std::format("{:%Y%m%dT%H%M%SZ}-{:04x}", now, entropy() & 0xFFFFu);
+}
+
 std::optional<HeroMistake> assess_hero_decision(const PlayerView& view, const HintRecommendation& hint,
                                                 const Action& taken) {
     const std::optional<double> taken_ev = ev_of_action(hint, view, taken);
@@ -157,6 +164,7 @@ std::string serialize_hand(const GameState& state, const HandLogContext& context
     const HandResult& result = *state.last_result;
 
     Json root;
+    root["session_id"] = context.session_id;
     root["h"] = state.hand_number;
     root["sb"] = context.small_blind;
     root["bb"] = context.big_blind;
@@ -262,6 +270,7 @@ void SessionLogger::write_session(const SessionSummary& summary, const HandLogCo
     }
 
     Json root;
+    root["session_id"] = context.session_id;
     root["ts"] = *timestamp;
     root["sb"] = context.small_blind;
     root["bb"] = context.big_blind;

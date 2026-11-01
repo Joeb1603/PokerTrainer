@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,7 @@ constexpr std::array<int, kMaxSeats> kThreeHanded{1000, 1000, 1000, 0, 0, 0};
 
 HandLogContext context(std::optional<int> hero = 0) {
     HandLogContext c;
+    c.session_id = "S1";
     c.small_blind = 10;
     c.big_blind = 20;
     c.seat_labels = {"Hero", "Nit", "Shift:GTO", "Loose", "WildGTO", "GTO"};
@@ -112,7 +114,7 @@ TEST(HandLog, ExactLineForAFullHand) {
 
     const std::string hand = describe_hand(*e.state().last_result->showdown_ranks[0]);
     const std::string expected =
-        R"({"h":1,"sb":10,"bb":20,"btn":0,"post":{"sb":{"s":1,"amt":10},"bb":{"s":2,"amt":20}},)"
+        R"({"session_id":"S1","h":1,"sb":10,"bb":20,"btn":0,"post":{"sb":{"s":1,"amt":10},"bb":{"s":2,"amt":20}},)"
         R"("seats":[{"s":0,"p":"Hero","pos":"BTN","st":1000,"c":"AsAd"},{"s":1,"p":"Nit","pos":"SB","st":1000},)"
         R"({"s":2,"p":"Shift:GTO","pos":"BB","st":1000,"c":"QsQd"}],)"
         R"("pre":{"pot":30,"a":["BTN:R60","SB:F","BB:C40"]},)"
@@ -558,6 +560,61 @@ TEST_F(LoggerFiles, SeveralMistakesOnOneStreetAreKeptSeparately) {
 
 // --- Session summaries -------------------------------------------------------
 
+TEST(SessionId, IsCompactUtcTimeWithRandomSuffixAndDistinct) {
+    const std::string id = make_session_id();
+    ASSERT_EQ(id.size(), 21u) << id;  // YYYYMMDDTHHMMSSZ-xxxx
+    EXPECT_EQ(id[8], 'T');
+    EXPECT_EQ(id[15], 'Z');
+    EXPECT_EQ(id[16], '-');
+
+    std::set<std::string> ids;
+    for (int i = 0; i < 200; ++i) ids.insert(make_session_id());
+    EXPECT_GT(ids.size(), 190u);  // Same second: only the suffix differs, and may rarely clash
+}
+
+TEST_F(LoggerFiles, HandsJoinToTheirSessionAcrossAppendedRuns) {
+    const fs::path hands = dir_ / "h.jsonl";
+    const fs::path sessions = dir_ / "s.jsonl";
+    for (const char* id : {"run-a", "run-b"}) {
+        HandLogger hand_logger(hands);
+        SessionLogger session_logger({1000, 1000, 1000, 0, 0, 0}, sessions);
+        HandLogContext c = context();
+        c.session_id = id;
+        GameEngine e(config_with(kThreeHanded));
+        e.start_hand();
+        act(e, ActionType::Fold);
+        act(e, ActionType::Fold);
+        hand_logger.write_hand(e.state(), c);
+        session_logger.write_session(e.session_summary(), c, "t");
+    }
+
+    const auto hand_lines = read_lines(hands);
+    const auto session_lines = read_lines(sessions);
+    ASSERT_EQ(hand_lines.size(), 2u);
+    ASSERT_EQ(session_lines.size(), 2u);
+    for (std::size_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(json::parse(hand_lines[i])["session_id"], json::parse(session_lines[i])["session_id"]);
+        EXPECT_EQ(json::parse(hand_lines[i])["h"], 1);  // h alone could not tell them apart
+    }
+    EXPECT_NE(json::parse(hand_lines[0])["session_id"], json::parse(hand_lines[1])["session_id"]);
+}
+
+TEST_F(LoggerFiles, DiscardedMistakesDoNotReachTheNextHand) {
+    const fs::path path = dir_ / "h.jsonl";
+    HandLogger logger(path);
+    GameEngine e(config_with(kThreeHanded));
+    const PlayerView view = view_facing_open(e);
+    HintRecommendation hint = sample_hint({ActionType::Call}, "CALL 20");
+    hint.ev.fold = 0.0;
+    hint.ev.check_call = 200.0;
+    ASSERT_TRUE(logger.record_hero_decision(view, hint, {ActionType::Fold}));
+    logger.discard_pending_mistakes();
+
+    act(e, ActionType::Fold);
+    act(e, ActionType::Fold);
+    EXPECT_TRUE(logger.write_hand(e.state(), context()).empty());
+}
+
 TEST_F(LoggerFiles, SessionSummaryExactLine) {
     const fs::path path = dir_ / "s.jsonl";
     SessionLogger logger({100, 1000, 1000, 0, 0, 0}, path);
@@ -575,7 +632,7 @@ TEST_F(LoggerFiles, SessionSummaryExactLine) {
     const auto lines = read_lines(path);
     ASSERT_EQ(lines.size(), 1u);
     EXPECT_EQ(lines[0],
-              R"({"ts":"2026-11-01T12:00:00Z","sb":10,"bb":20,"hands":7,"done":true,)"
+              R"({"session_id":"S1","ts":"2026-11-01T12:00:00Z","sb":10,"bb":20,"hands":7,"done":true,)"
               R"("seats":[{"s":0,"p":"Hero","st":100,"end":0,"bust":7},{"s":1,"p":"Nit","st":1000,"end":900},)"
               R"({"s":2,"p":"Shift:GTO","st":1000,"end":1200}],)"
               R"("hero":{"s":0,"net":-100,"bust":true,"mistakes":3,"ev_loss":18.3,)"
@@ -634,6 +691,7 @@ TEST_F(LoggerFiles, FullSessionProducesConsistentLogs) {
     SessionLogger session(starting, session_path);
 
     HandLogContext c;
+    c.session_id = make_session_id();
     c.small_blind = 10;
     c.big_blind = 20;
     c.hero_seat = 0;
@@ -671,6 +729,7 @@ TEST_F(LoggerFiles, FullSessionProducesConsistentLogs) {
         const std::string last_line = read_lines(hands_path).back();
         const json line = json::parse(last_line);
         EXPECT_EQ(line["h"], e.state().hand_number);
+        EXPECT_EQ(line["session_id"], c.session_id);
 
         for (const json& seat : line["seats"]) {
             const int index = seat["s"];
@@ -692,6 +751,7 @@ TEST_F(LoggerFiles, FullSessionProducesConsistentLogs) {
     c.seat_labels[5] = std::string(bots[5]->name());
     session.write_session(e.session_summary(), c);
     const json summary = json::parse(read_lines(session_path).at(0));
+    EXPECT_EQ(summary["session_id"], c.session_id);
     EXPECT_EQ(summary["hero"]["mistakes"], total_mistakes);
     EXPECT_EQ(summary["hands"], e.state().hand_number);
     EXPECT_EQ(summary["seats"][5]["p"], "Shifter");

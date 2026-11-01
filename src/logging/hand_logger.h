@@ -38,7 +38,12 @@ struct HeroMistake {
 std::optional<HeroMistake> assess_hero_decision(const PlayerView& view, const HintRecommendation& hint,
                                                 const Action& taken);
 
+// A new id for a session, e.g. "20261101T120000Z-a3f9": UTC start time plus a random
+// suffix, so sessions started within the same second stay distinct across runs.
+std::string make_session_id();
+
 struct HandLogContext {
+    std::string session_id;  // Joins hand lines to their session summary line
     int small_blind = 0;
     int big_blind = 0;
     std::array<std::string, kMaxSeats> seat_labels;  // e.g. "Hero", "Nit", "Shift:GTO"
@@ -48,6 +53,7 @@ struct HandLogContext {
 
 // One finished hand as a single line of JSON with no trailing newline:
 //
+//   session_id       The session this hand belongs to; h restarts in each session
 //   h, sb, bb, btn   Hand number, configured blinds, button seat index
 //   post             Blinds actually posted, {sb:{s,amt}, bb:{s,amt}}; a short stack
 //                    can post less than sb or bb, and heads-up the BTN posts sb
@@ -84,6 +90,10 @@ public:
     // `context` are replaced. Throws std::runtime_error if the write fails.
     std::vector<HeroMistake> write_hand(const GameState& state, HandLogContext context);
 
+    // Drops mistakes noted for a hand that will never be written, such as one
+    // abandoned by resetting the session.
+    void discard_pending_mistakes() { pending_mistakes_.clear(); }
+
 private:
     std::ofstream out_;
     std::vector<HeroMistake> pending_mistakes_;
@@ -91,6 +101,7 @@ private:
 
 // Appends one summary line per session, by default to logs/session_summary.jsonl:
 //
+//   session_id  Same value as on the session's hand lines
 //   ts          UTC time the session was written
 //   sb, bb      Configured blinds
 //   hands       Hands played
