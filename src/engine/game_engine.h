@@ -6,6 +6,7 @@
 #include <random>
 
 #include "engine/game_types.h"
+#include "engine/player_view.h"
 
 namespace poker {
 
@@ -62,6 +63,10 @@ public:
 
     // Legal options for the player to act; an empty mask if nobody is to act.
     LegalActions legal_actions() const;
+
+    // Sanitized snapshot for one seat; the only thing to hand a bot or the advisor.
+    // Throws std::invalid_argument for a seat out of range.
+    PlayerView player_view(int seat) const;
 
     // Applies an action for the player to act. Returns false and changes
     // nothing if the action is illegal.

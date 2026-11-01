@@ -42,4 +42,11 @@ Card Deck::deal() {
     return cards_[next_++];
 }
 
+Card Deck::deal_random(std::mt19937_64& rng) {
+    if (next_ == size_) throw std::out_of_range("Deck::deal_random: deck is empty");
+    const std::size_t j = next_ + static_cast<std::size_t>(bounded(rng, size_ - next_));
+    std::swap(cards_[next_], cards_[j]);
+    return cards_[next_++];
+}
+
 }  // namespace poker

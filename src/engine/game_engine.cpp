@@ -254,6 +254,10 @@ LegalActions GameEngine::legal_actions() const {
     return legal;
 }
 
+PlayerView GameEngine::player_view(int seat) const {
+    return make_player_view(state_, seat, config_.small_blind, config_.big_blind, legal_actions());
+}
+
 bool GameEngine::apply_action(const Action& action) {
     const LegalActions legal = legal_actions();
     if (!legal.allows(action.type)) return false;

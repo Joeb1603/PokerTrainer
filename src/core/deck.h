@@ -26,6 +26,11 @@ public:
     // Removes and returns the next card. Throws std::out_of_range when empty.
     Card deal();
 
+    // Removes and returns a uniformly random undealt card: one step of a partial
+    // Fisher-Yates, so rollouts pay only for the cards they use. Throws
+    // std::out_of_range when empty.
+    Card deal_random(std::mt19937_64& rng);
+
     std::size_t remaining() const { return size_ - next_; }
 
 private:

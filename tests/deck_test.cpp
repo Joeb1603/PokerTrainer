@@ -82,6 +82,38 @@ TEST(Deck, DuplicateExclusionsCountOnce) {
     EXPECT_EQ(Deck(excluded).remaining(), 51u);
 }
 
+TEST(Deck, DealRandomGivesEveryCardOnceThenThrows) {
+    Deck deck;
+    std::mt19937_64 rng(5);
+    std::set<Card> dealt;
+    for (int i = 0; i < kDeckSize; ++i) dealt.insert(deck.deal_random(rng));
+    EXPECT_EQ(dealt.size(), 52u);
+    EXPECT_EQ(deck.remaining(), 0u);
+    EXPECT_THROW(deck.deal_random(rng), std::out_of_range);
+}
+
+// 51 degrees of freedom: p = 0.001 critical value is about 87.
+TEST(Deck, DealRandomIsUniformFromAnOrderedDeck) {
+    constexpr int kTrials = 260000;
+    std::array<int, kDeckSize> first_counts{};
+    std::array<int, kDeckSize> second_counts{};
+    std::mt19937_64 rng(777);
+    for (int t = 0; t < kTrials; ++t) {
+        Deck deck;
+        ++first_counts[deck.deal_random(rng).id];
+        ++second_counts[deck.deal_random(rng).id];
+    }
+
+    const double expected = static_cast<double>(kTrials) / kDeckSize;
+    const auto chi_squared = [expected](const std::array<int, kDeckSize>& counts) {
+        double total = 0.0;
+        for (const int count : counts) total += (count - expected) * (count - expected) / expected;
+        return total;
+    };
+    EXPECT_LT(chi_squared(first_counts), 87.0);
+    EXPECT_LT(chi_squared(second_counts), 87.0);
+}
+
 // Chi-squared test on which card lands on top. The seed is fixed, so this is
 // deterministic. 51 degrees of freedom: p = 0.001 critical value is about 87.
 TEST(Deck, ShuffleIsUniform) {

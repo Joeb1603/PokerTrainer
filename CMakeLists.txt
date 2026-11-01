@@ -51,14 +51,21 @@ endif()
 
 # --- Core library (no GUI dependencies) --------------------------------------
 add_library(poker_core STATIC
+    src/advisor/training_advisor.cpp
+    src/bots/bots.cpp
+    src/bots/gto_heuristic_engine.cpp
     src/core/card.cpp
     src/core/deck.cpp
     src/core/hand_evaluator.cpp
     src/engine/game_engine.cpp
+    src/engine/player_view.cpp
     src/engine/pots.cpp
+    src/equity/equity.cpp
+    src/strategy/preflop_charts.cpp
 )
+find_package(Threads REQUIRED)
 target_include_directories(poker_core PUBLIC src)
-target_link_libraries(poker_core PRIVATE phevaluator_lib)
+target_link_libraries(poker_core PRIVATE phevaluator_lib Threads::Threads)
 target_compile_options(poker_core PRIVATE ${POKER_WARNINGS})
 
 # --- CLI test harness --------------------------------------------------------
@@ -87,12 +94,24 @@ if(POKER_BUILD_TESTS)
         tests/hand_evaluator_test.cpp
         tests/pots_test.cpp
         tests/game_engine_test.cpp
+        tests/player_view_test.cpp
+        tests/player_boundary_test.cpp
+        tests/equity_test.cpp
+        tests/preflop_charts_test.cpp
+        tests/bots_test.cpp
+        tests/training_advisor_test.cpp
     )
     target_link_libraries(core_tests PRIVATE poker_core GTest::gtest_main)
     target_compile_options(core_tests PRIVATE ${POKER_WARNINGS})
 
     include(GoogleTest)
-    gtest_discover_tests(core_tests)
+    # PRE_TEST: the default POST_BUILD list follows whichever config linked last,
+    # so ctest -C Debug could silently run the Release binary.
+    gtest_discover_tests(core_tests DISCOVERY_MODE PRE_TEST)
 
     add_test(NAME poker_cli_stress COMMAND poker_cli --games 500 --seed 1)
+
+    # Bots and the advisor must see the table only through PlayerView.
+    add_test(NAME no_engine_access_in_players
+             COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/check_no_engine_access.cmake)
 endif()
