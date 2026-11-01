@@ -45,4 +45,8 @@ std::string describe_category(HandRank rank);
 // Specific hand name, e.g. "Aces Full over Kings".
 std::string describe_hand(HandRank rank);
 
+// The name to show a player for their current hand, e.g. "Ace High" or
+// "Two Pair, Aces and Kings". Logs keep using describe_hand.
+std::string describe_made_hand(HandRank rank);
+
 }  // namespace poker

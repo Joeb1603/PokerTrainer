@@ -154,6 +154,29 @@ TEST(HandEvaluator, ResultIndependentOfSuitRelabelling) {
     EXPECT_EQ(rank_of("Ac Kc 9c 5c 2c Qh Js"), expected);
 }
 
+TEST(HandEvaluator, NamesTheCurrentHandInEveryCategory) {
+    EXPECT_EQ(describe_made_hand(rank_of("As Ks Qs Js Ts 2d 3c")), "Royal Flush");
+    EXPECT_EQ(describe_made_hand(rank_of("9s 8s 7s 6s 5s 2d 3c")), "Nine-High Straight Flush");
+    EXPECT_EQ(describe_made_hand(rank_of("Ac Ad Ah As Kd 3d 7h")), "Four Aces");
+    EXPECT_EQ(describe_made_hand(rank_of("Ac Ad Ah Ks Kd 3d 7h")), "Aces Full over Kings");
+    EXPECT_EQ(describe_made_hand(rank_of("As Ks 9s 7s 2s 3d 4h")), "Ace-High Flush");
+    EXPECT_EQ(describe_made_hand(rank_of("Ts 9d 8c 7h 6s 2d 2c")), "Ten-High Straight");
+    EXPECT_EQ(describe_made_hand(rank_of("Ac Ad Ah Ks Qd 3d 7h")), "Three Aces");
+    EXPECT_EQ(describe_made_hand(rank_of("Ac Ad Ks Kd 9h 3d 7h")), "Two Pair, Aces and Kings");
+    EXPECT_EQ(describe_made_hand(rank_of("Kc Kd As 9d 7h 3d 2h")), "Pair of Kings");
+    EXPECT_EQ(describe_made_hand(rank_of("Ac Qd 9s 7d 5h 3d 2h")), "Ace High");
+}
+
+TEST(HandEvaluator, NamesTheCurrentHandFromFiveAndSixCards) {
+    const std::array<Card, 7> c = {Card(Rank::Ace, Suit::Clubs),  Card(Rank::Ace, Suit::Diamonds),
+                                   Card(Rank::King, Suit::Spades), Card(Rank::King, Suit::Diamonds),
+                                   Card(Rank::Nine, Suit::Hearts), Card(Rank::Three, Suit::Diamonds),
+                                   Card(Rank::Seven, Suit::Hearts)};
+    EXPECT_EQ(describe_made_hand(evaluate(std::span<const Card>(c.data(), 5))), "Two Pair, Aces and Kings");
+    EXPECT_EQ(describe_made_hand(evaluate(std::span<const Card>(c.data(), 6))), "Two Pair, Aces and Kings");
+    EXPECT_EQ(describe_made_hand(evaluate(std::span<const Card>(c.data(), 7))), "Two Pair, Aces and Kings");
+}
+
 TEST(HandEvaluator, DescribesHands) {
     EXPECT_EQ(describe_category(rank_of("Ac Ad Ah Ks Kd 3d 7h")), "Full House");
     EXPECT_FALSE(describe_hand(rank_of("Ac Ad Ah Ks Kd 3d 7h")).empty());

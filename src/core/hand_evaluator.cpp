@@ -47,4 +47,17 @@ std::string describe_hand(HandRank rank) {
     return describe_rank(rank);
 }
 
+std::string describe_made_hand(HandRank rank) {
+    std::string name = describe_hand(rank);
+    switch (hand_category(rank)) {
+        case HandCategory::TwoPair:
+            return "Two Pair, " + name;  // "Aces and Kings"
+        case HandCategory::HighCard:
+            if (const auto dash = name.find('-'); dash != std::string::npos) name[dash] = ' ';  // "Ace-High"
+            return name;
+        default:
+            return name;
+    }
+}
+
 }  // namespace poker
