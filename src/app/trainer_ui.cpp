@@ -200,7 +200,7 @@ void TrainerUi::draw() {
 
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     const float sidebar_w = u(340.0f);
-    const float console_h = u(128.0f);
+    const float console_h = u(136.0f);
     const float table_w = display.x - sidebar_w;
 
     draw_table(0.0f, 0.0f, table_w, display.y - console_h);
@@ -275,11 +275,14 @@ void TrainerUi::draw_seat(ImDrawList* dl, const SeatSnapshot& seat, int index, c
     // Cards.
     const float card_y = min.y + u(8.0f);
     const float cards_x = min.x + u(8.0f);
-    if (seat.holds_cards) {
+    if (seat.holds_cards || seat.revealed_after_fold) {
         for (std::size_t i = 0; i < 2; ++i) {
             const ImVec2 pos{cards_x + static_cast<float>(i) * (card_w + u(3.0f)), card_y};
             if (seat.visible_hole) {
                 draw_card_face(dl, fonts_, (*seat.visible_hole)[i], pos, card_w, card_h);
+                if (seat.revealed_after_fold) {
+                    dl->AddRectFilled(pos, {pos.x + card_w, pos.y + card_h}, IM_COL32(16, 19, 25, 150), card_w * 0.10f);
+                }
             } else {
                 draw_card_back(dl, pos, card_w, card_h);
             }
@@ -324,10 +327,12 @@ void TrainerUi::draw_seat(ImDrawList* dl, const SeatSnapshot& seat, int index, c
     }
     if (!status.empty()) text_at(dl, fonts_.bold, small, {text_x, line_y}, status_color, status);
 
-    if (seat.shown_hand) {
+    const TableSnapshot& table = controller_.snapshot();
+    const std::optional<std::string>& hand_name = seat.shown_hand || !is_hero ? seat.shown_hand : table.hero_hand;
+    if (hand_name) {
         const float hand_size = u(13.0f);
         draw_pill(dl, fonts_.regular, hand_size, {mid.x, max.y + hand_size * 0.2f}, IM_COL32(16, 18, 24, 245), kText,
-                  *seat.shown_hand);
+                  *hand_name);
     }
 
     // Between the seat and the table center: the street bet and the dealer button.
@@ -398,28 +403,47 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
     const TableSnapshot& s = controller_.snapshot();
     const float row_h = u(38.0f);
 
+    const auto reveal_button = [&] {
+        ImGui::SameLine();
+        if (sized_button(s.bots_revealed ? "Bot Hands Revealed" : "Reveal Bot Hands", !s.bots_revealed, u(200.0f), row_h)) {
+            (void)controller_.reveal_bot_hands();
+        }
+    };
+
     if (s.phase == ControllerPhase::SessionOver) {
         push_button_color(0.33f);
         if (ImGui::Button("Start New Game", {u(240.0f), row_h})) controller_.new_session();
         ImGui::PopStyleColor(3);
+        reveal_button();
         ImGui::SameLine();
-        ImGui::BeginGroup();
+        ImGui::AlignTextToFramePadding();
         ImGui::PushFont(fonts_.bold);
         ImGui::Text("%s", s.session.hero_busted ? "You busted" : "You won the freezeout");
         ImGui::PopFont();
         ImGui::Text("Hands %d   |   Net %+d chips   |   Flagged mistakes %d (about %.0f chips of estimated EV)",
                     s.session.hands_played, s.session.hero_net, s.session.mistakes, s.session.ev_lost);
-        ImGui::EndGroup();
         // The last hand stays on the table, so its result is still worth reading.
         draw_payout_lines(s);
     } else if (s.phase == ControllerPhase::HandComplete) {
         push_button_color(0.33f);
         if (ImGui::Button("Next Hand  (Space)", {u(240.0f), row_h})) (void)controller_.next_hand();
         ImGui::PopStyleColor(3);
+        reveal_button();
         draw_payout_lines(s);
     } else if (s.phase == ControllerPhase::BotToAct) {
+        if (s.early_fold_armed) {
+            push_button_color(0.0f);
+            if (ImGui::Button("Cancel Early Fold", {u(180.0f), row_h})) (void)controller_.set_early_fold(false);
+            ImGui::PopStyleColor(3);
+            ImGui::SameLine();
+        } else if (s.can_fold_early) {
+            if (ImGui::Button("Fold Early", {u(180.0f), row_h})) (void)controller_.set_early_fold(true);
+            ImGui::SameLine();
+        }
         ImGui::AlignTextToFramePadding();
-        if (s.seats[kHeroSeat].status == SeatStatus::Folded) {
+        if (s.early_fold_armed) {
+            ImGui::TextColored(kWarnText, "Folding when action reaches you...");
+        } else if (s.seats[kHeroSeat].status == SeatStatus::Folded) {
             ImGui::TextColored(kMutedText, "You folded. Waiting for %s...", s.waiting_on->c_str());
         } else {
             ImGui::TextColored(kMutedText, "Waiting for %s...", s.waiting_on->c_str());
@@ -438,21 +462,20 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
         }
         raise_to_ = std::clamp(raise_to_, legal.min_raise_to, std::max(legal.min_raise_to, legal.max_raise_to));
 
-        const float button_w = u(150.0f);
         std::optional<Action> chosen;
 
         push_button_color(0.0f);
-        if (sized_button("Fold", legal.allows(ActionType::Fold), button_w, row_h)) chosen = Action{ActionType::Fold};
+        if (sized_button("Fold", legal.allows(ActionType::Fold), u(120.0f), row_h)) chosen = Action{ActionType::Fold};
         ImGui::PopStyleColor(3);
         ImGui::SameLine();
 
         push_button_color(0.58f);
         if (legal.allows(ActionType::Check)) {
-            if (sized_button("Check", true, button_w, row_h)) chosen = Action{ActionType::Check};
+            if (sized_button("Check", true, u(150.0f), row_h)) chosen = Action{ActionType::Check};
         } else {
             const std::string label = "Call " + std::to_string(legal.call_amount) +
                                       (legal.call_amount == s.seats[kHeroSeat].stack ? " (All-In)" : "");
-            if (sized_button(label.c_str(), legal.allows(ActionType::Call), button_w, row_h)) {
+            if (sized_button(label.c_str(), legal.allows(ActionType::Call), u(150.0f), row_h)) {
                 chosen = Action{ActionType::Call};
             }
         }
@@ -461,15 +484,17 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
 
         push_button_color(0.33f);
         const std::string raise_label = can_raise ? (raise_type == ActionType::Bet ? "Bet " : "Raise to ") +
-                                                        std::to_string(raise_to_)
+                                                        std::to_string(raise_to_) + " (" +
+                                                        std::to_string(bet_pot_percent(legal, s.current_bet, s.pots.total, raise_to_)) +
+                                                        "%)"
                                                   : "Raise";
-        if (sized_button(raise_label.c_str(), can_raise, button_w, row_h)) chosen = Action{raise_type, raise_to_};
+        if (sized_button(raise_label.c_str(), can_raise, u(200.0f), row_h)) chosen = Action{raise_type, raise_to_};
         ImGui::PopStyleColor(3);
         ImGui::SameLine();
 
         push_button_color(0.08f);
         const std::string all_in_label = "All-In " + std::to_string(all_in_to);
-        if (sized_button(all_in_label.c_str(), legal.allows(ActionType::AllIn), button_w, row_h)) {
+        if (sized_button(all_in_label.c_str(), legal.allows(ActionType::AllIn), u(130.0f), row_h)) {
             chosen = Action{ActionType::AllIn};
         }
         ImGui::PopStyleColor(3);
@@ -498,10 +523,16 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
         if (ImGui::Button("All-In", {u(68.0f), 0.0f})) raise_to_ = legal.max_raise_to;
         ImGui::EndDisabled();
 
+        if (s.hint) {
+            const std::string gto_label = show_advisor_ ? "Play GTO: " + s.hint->best_action : "Play GTO";
+            if (ImGui::Button(gto_label.c_str(), {u(420.0f), u(30.0f)})) chosen = s.hint->action;
+        }
+
         if (chosen) (void)controller_.submit_hero_action(*chosen);
     }
 
     if (s.log_error) {
+        if (s.phase == ControllerPhase::HeroToAct && s.hint) ImGui::SameLine();  // No spare row under the button
         ImGui::TextColored(kWarnText, "Logging is off: %s", s.log_error->c_str());
     }
     ImGui::End();

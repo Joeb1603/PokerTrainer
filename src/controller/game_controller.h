@@ -31,6 +31,7 @@ struct SeatSnapshot {
     std::optional<std::array<Card, 2>> visible_hole;
     std::optional<std::string> shown_hand;  // Hand name, once shown at showdown
     int won = 0;                            // Chips won from pots in the finished hand
+    bool revealed_after_fold = false;       // visible_hole is a folded bot's, shown on request
 };
 
 struct PayoutLine {
@@ -71,6 +72,11 @@ struct TableSnapshot {
     int current_bet = 0;
     std::optional<HintRecommendation> hint;
 
+    std::optional<std::string> hero_hand;  // From the flop on, until Hero folds, e.g. "Pair of Kings"
+    bool can_fold_early = false;           // A bot is to act and Hero could still fold
+    bool early_fold_armed = false;
+    bool bots_revealed = false;
+
     std::vector<std::string> action_log;       // This hand, oldest first
     std::vector<HeroMistake> hand_mistakes;    // Noted so far in this hand
     SessionStats session;
@@ -81,6 +87,10 @@ struct TableSnapshot {
 // from the pot after calling, so 1.0 is a standard pot-sized raise. Returns 0 if
 // neither a bet nor a raise is legal.
 int quick_bet_to(const LegalActions& legal, int current_bet, int total_pot, double pot_fraction);
+
+// The inverse of quick_bet_to: the size of a bet or raise to `bet_to`, as a whole
+// percentage of the pot after calling.
+int bet_pot_percent(const LegalActions& legal, int current_bet, int total_pot, int bet_to);
 
 // The boundary between the game and any front end. The GUI uses only this, so it could
 // be replaced by a server without touching engine, bot or advisor code.
@@ -99,6 +109,15 @@ public:
     // Deals the next hand. Returns false unless the last hand is complete and the
     // session continues.
     [[nodiscard]] virtual bool next_hand() = 0;
+
+    // Arms or cancels a fold that happens when action reaches Hero, unless Hero could
+    // check for free, which cancels it instead. While armed, bots act without their
+    // delay. Arming returns false, changing nothing, unless can_fold_early is set.
+    [[nodiscard]] virtual bool set_early_fold(bool armed) = 0;
+
+    // Shows every bot's cards for the finished hand, until the next one is dealt.
+    // Returns false during a hand.
+    [[nodiscard]] virtual bool reveal_bot_hands() = 0;
 
     // Ends the current freezeout, even mid-hand, and starts a new one.
     virtual void new_session() = 0;

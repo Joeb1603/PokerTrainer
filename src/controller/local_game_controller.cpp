@@ -48,6 +48,12 @@ int quick_bet_to(const LegalActions& legal, int current_bet, int total_pot, doub
     return std::clamp(to, legal.min_raise_to, legal.max_raise_to);
 }
 
+int bet_pot_percent(const LegalActions& legal, int current_bet, int total_pot, int bet_to) {
+    const int pot_after_call = total_pot + legal.call_amount;
+    if (pot_after_call <= 0) return 0;
+    return static_cast<int>(std::lround(100.0 * (bet_to - current_bet) / pot_after_call));
+}
+
 LocalGameController::LocalGameController(const ControllerOptions& options)
     : options_(options),
       engine_(make_config(options)),
@@ -106,9 +112,25 @@ bool LocalGameController::next_hand() {
     return true;
 }
 
+bool LocalGameController::set_early_fold(bool armed) {
+    if (armed && !snapshot_.can_fold_early) return false;
+    early_fold_armed_ = armed;
+    rebuild_snapshot();
+    return true;
+}
+
+bool LocalGameController::reveal_bot_hands() {
+    if (snapshot_.phase != ControllerPhase::HandComplete && snapshot_.phase != ControllerPhase::SessionOver) return false;
+    bots_revealed_ = true;
+    rebuild_snapshot();
+    return true;
+}
+
 void LocalGameController::begin_hand() {
     engine_.start_hand();
     hand_handled_ = false;
+    early_fold_armed_ = false;
+    bots_revealed_ = false;
     hand_mistakes_.clear();
     for (int seat = 1; seat < kMaxSeats; ++seat) bots_[seat]->begin_hand(engine_.state().hand_number);
     bot_timer_ms_ = 0.0;
@@ -116,8 +138,11 @@ void LocalGameController::begin_hand() {
 }
 
 void LocalGameController::tick(double elapsed_ms) {
-    if (instant_play_) {
-        while (snapshot_.phase == ControllerPhase::BotToAct) play_one_bot_action();
+    if (instant_play_ || early_fold_armed_) {
+        // An armed fold ends once action reaches Hero, so normal pacing resumes after it.
+        while (snapshot_.phase == ControllerPhase::BotToAct && (instant_play_ || early_fold_armed_)) {
+            play_one_bot_action();
+        }
         return;
     }
     if (snapshot_.phase != ControllerPhase::BotToAct) return;
@@ -168,7 +193,12 @@ void LocalGameController::after_state_change() {
         hero_view_ = engine_.player_view(kHeroSeat);
         hero_hint_ = advisor_.analyze(*hero_view_);
     }
+
+    // The early fold is spent here either way: a free check goes back to Hero to decide.
+    const bool fold_now = early_fold_armed_ && hero_view_ && !hero_view_->legal.allows(ActionType::Check);
+    if (hero_view_ || state.phase != GamePhase::Betting) early_fold_armed_ = false;
     rebuild_snapshot();
+    if (fold_now) (void)submit_hero_action({ActionType::Fold});
 }
 
 HandLogContext LocalGameController::log_context(bool per_hand_labels) const {
@@ -293,8 +323,22 @@ void LocalGameController::rebuild_snapshot() {
 
         const bool shown = result && result->showdown_ranks[seat].has_value();
         if (s.hole && (seat == kHeroSeat || shown)) out.visible_hole = s.hole;
-        if (shown) out.shown_hand = describe_hand(*result->showdown_ranks[seat]);
+        if (shown) out.shown_hand = describe_made_hand(*result->showdown_ranks[seat]);
+        if (bots_revealed_ && seat != kHeroSeat && s.hole) {
+            out.visible_hole = s.hole;
+            out.revealed_after_fold = s.status == SeatStatus::Folded;
+        }
     }
+
+    const Seat& hero = state.seats[kHeroSeat];
+    if (hero.hole && hero.status != SeatStatus::Folded && state.board.size() >= 3) {
+        std::vector<Card> cards(hero.hole->begin(), hero.hole->end());
+        cards.insert(cards.end(), state.board.begin(), state.board.end());
+        next.hero_hand = describe_made_hand(evaluate(cards));
+    }
+    next.can_fold_early = next.phase == ControllerPhase::BotToAct && hero.hole && hero.status == SeatStatus::Active;
+    next.early_fold_armed = early_fold_armed_;
+    next.bots_revealed = bots_revealed_;
 
     if (result) {
         // Returned chips were never at stake, so the final pot is what was paid out.
@@ -303,7 +347,7 @@ void LocalGameController::rebuild_snapshot() {
         for (const Payout& payout : result->payouts) {
             next.seats[payout.seat].won = payout.amount;
             PayoutLine line{public_names_[payout.seat], payout.amount, std::nullopt};
-            if (result->showdown_ranks[payout.seat]) line.hand = describe_hand(*result->showdown_ranks[payout.seat]);
+            if (result->showdown_ranks[payout.seat]) line.hand = describe_made_hand(*result->showdown_ranks[payout.seat]);
             next.payouts.push_back(std::move(line));
         }
         if (result->refund) {

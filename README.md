@@ -22,8 +22,12 @@ The executable isn't code-signed, so Windows SmartScreen may warn you the first 
 - 6-max table with Hero at the bottom center, rendered with Dear ImGui and GLFW
 - 4-color deck, so suits are easy to tell apart at a glance
 - Live main and side pot display, showing who is eligible for each pot
-- Fold, check, call, bet, raise and all-in controls, with a raise slider and quick-bet sizes (Min, 50%, 75%, Pot, All-In)
+- Fold, check, call, bet, raise and all-in controls, with a raise slider and quick-bet sizes (Min, 50%, 75%, Pot, All-In), and the bet shown as a percentage of the pot
+- Your current hand named from the flop onward, such as `Two Pair, Aces and Kings`
+- **Play GTO** button that plays the advisor's recommendation in one click
+- **Fold Early** button that skips the wait: bots act without their delay, and you fold when action reaches you, unless you could check for free
 - Adjustable bot speed or instant play, and a pause after each hand (press **Space** or click **Next Hand**)
+- **Reveal Bot Hands** button at the end of a hand, including bots that folded
 
 ### The poker engine
 - Fisher-Yates shuffle, implemented directly in the deck code

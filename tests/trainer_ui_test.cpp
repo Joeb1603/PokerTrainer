@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <imgui.h>
+#include <imgui_internal.h>
 
 #include "app/trainer_ui.h"
 
@@ -15,7 +16,7 @@ using namespace poker;
 
 namespace {
 
-constexpr float kConsoleTop = 860.0f - 128.0f;
+constexpr float kConsoleTop = 860.0f - 136.0f;
 constexpr ImVec2 kFold{83.0f, kConsoleTop + 27.0f};
 constexpr ImVec2 kCheckCall{241.0f, kConsoleTop + 27.0f};
 constexpr ImVec2 kRaise{399.0f, kConsoleTop + 27.0f};
@@ -28,6 +29,10 @@ constexpr ImVec2 kQuickPot{528.0f, kQuickRow};
 constexpr ImVec2 kQuickAllIn{604.0f, kQuickRow};
 constexpr ImVec2 kNextHand{128.0f, kConsoleTop + 27.0f};
 constexpr ImVec2 kNewSession{1190.0f, 52.0f};
+constexpr ImVec2 kPlayGto{100.0f, kConsoleTop + 88.0f};
+constexpr ImVec2 kFoldEarly{100.0f, kConsoleTop + 27.0f};
+constexpr ImVec2 kReveal{356.0f, kConsoleTop + 27.0f};  // Right of Next Hand
+constexpr ImVec2 kAdvisorToggle{1037.0f, 97.0f};
 
 std::uint8_t mask_of(std::initializer_list<ActionType> types) {
     std::uint8_t mask = 0;
@@ -41,8 +46,18 @@ public:
     std::vector<Action> submitted;
     int next_hand_calls = 0;
     int new_session_calls = 0;
+    int reveal_calls = 0;
+    std::vector<bool> early_fold_requests;
 
     const TableSnapshot& snapshot() const override { return table; }
+    bool set_early_fold(bool armed) override {
+        early_fold_requests.push_back(armed);
+        return true;
+    }
+    bool reveal_bot_hands() override {
+        ++reveal_calls;
+        return true;
+    }
     void tick(double) override {}
     bool submit_hero_action(const Action& action) override {
         submitted.push_back(action);
@@ -118,6 +133,23 @@ protected:
         frame();
         io.AddKeyEvent(ImGuiKey_Space, false);
         frame();
+    }
+
+    // True if the console item under `pos` is the button with this exact label.
+    bool console_button_is(ImVec2 pos, const char* label) {
+        frame();  // The window must exist before it can be hovered
+        ImGui::GetIO().AddMousePosEvent(pos.x, pos.y);
+        frame();
+        frame();
+        ImGuiWindow* console = ImGui::FindWindowByName("Console");
+        return console != nullptr && ImGui::GetCurrentContext()->HoveredIdPreviousFrame == console->GetID(label);
+    }
+
+    void set_hint(const Action& action) {
+        HintRecommendation hint;
+        hint.best_action = "RAISE to 500 (100% Pot)";
+        hint.action = action;
+        fake_.table.hint = hint;
     }
 
     ImGuiContext* context_ = nullptr;
@@ -265,8 +297,98 @@ TEST_F(UiTest, ResetButtonStartsANewSessionMidHand) {
     EXPECT_TRUE(fake_.submitted.empty());
 }
 
+TEST_F(UiTest, RaiseButtonShowsThePotPercentageAsTheSizeChanges) {
+    EXPECT_TRUE(console_button_is(kRaise, "Raise to 200 (25%)"));
+    click(kQuick50);
+    EXPECT_TRUE(console_button_is(kRaise, "Raise to 300 (50%)"));
+    click(kQuickPot);
+    EXPECT_TRUE(console_button_is(kRaise, "Raise to 500 (100%)"));
+    click(kQuickAllIn);
+    EXPECT_TRUE(console_button_is(kRaise, "Raise to 1000 (225%)"));
+}
+
+TEST_F(UiTest, BetButtonShowsThePotPercentage) {
+    fake_.table.legal.mask = mask_of({ActionType::Fold, ActionType::Check, ActionType::Bet, ActionType::AllIn});
+    fake_.table.legal.call_amount = 0;
+    fake_.table.legal.min_raise_to = 20;
+    fake_.table.current_bet = 0;
+    fake_.table.pots.total = 200;
+    click(kQuick75);
+    EXPECT_TRUE(console_button_is(kRaise, "Bet 150 (75%)"));
+}
+
+TEST_F(UiTest, PlayGtoSubmitsExactlyTheHintsAction) {
+    set_hint({ActionType::Raise, 500});
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Raise, 500);
+}
+
+TEST_F(UiTest, PlayGtoAppearsOnlyWithAHint) {
+    fake_.table.hint.reset();
+    click(kPlayGto);
+    EXPECT_TRUE(fake_.submitted.empty());
+}
+
+TEST_F(UiTest, PlayGtoLabelHidesTheAdviceWhenTheAdvisorIsOff) {
+    set_hint({ActionType::Raise, 500});
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: RAISE to 500 (100% Pot)"));
+    click(kAdvisorToggle);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO"));
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Raise, 500);
+    click(kAdvisorToggle);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: RAISE to 500 (100% Pot)"));
+}
+
+TEST_F(UiTest, FoldEarlyArmsAndCancels) {
+    fake_.table.phase = ControllerPhase::BotToAct;
+    fake_.table.legal = {};
+    fake_.table.waiting_on = "Nit";
+    fake_.table.can_fold_early = true;
+    click(kFoldEarly);
+    ASSERT_EQ(fake_.early_fold_requests.size(), 1u);
+    EXPECT_TRUE(fake_.early_fold_requests[0]);
+
+    fake_.table.early_fold_armed = true;
+    click(kFoldEarly);
+    ASSERT_EQ(fake_.early_fold_requests.size(), 2u);
+    EXPECT_FALSE(fake_.early_fold_requests[1]);
+    EXPECT_TRUE(fake_.submitted.empty());
+}
+
+TEST_F(UiTest, FoldEarlyIsAbsentWhenHeroCannotUseIt) {
+    fake_.table.phase = ControllerPhase::BotToAct;
+    fake_.table.legal = {};
+    fake_.table.waiting_on = "Nit";
+    fake_.table.can_fold_early = false;
+    click(kFoldEarly);
+    EXPECT_TRUE(fake_.early_fold_requests.empty());
+}
+
+TEST_F(UiTest, RevealButtonWorksOnceAtTheEndOfAHand) {
+    click(kReveal);  // During Hero's turn this spot is not the reveal button
+    EXPECT_EQ(fake_.reveal_calls, 0);
+
+    fake_.table.phase = ControllerPhase::HandComplete;
+    fake_.table.legal = {};
+    click(kReveal);
+    EXPECT_EQ(fake_.reveal_calls, 1);
+
+    fake_.table.bots_revealed = true;
+    click(kReveal);
+    EXPECT_EQ(fake_.reveal_calls, 1);
+
+    fake_.table.phase = ControllerPhase::SessionOver;
+    fake_.table.bots_revealed = false;
+    click(kReveal);
+    EXPECT_EQ(fake_.reveal_calls, 2);
+}
+
 TEST_F(UiTest, EveryScreenDrawsWithFullData) {
     TableSnapshot& t = fake_.table;
+    t.hero_hand = "Two Pair, Aces and Kings";
+    t.seats[1].revealed_after_fold = true;
+    t.seats[1].visible_hole = std::array<Card, 2>{Card(Rank::Three, Suit::Clubs), Card(Rank::Four, Suit::Clubs)};
     t.board = {Card(Rank::Ace, Suit::Spades), Card(Rank::King, Suit::Hearts), Card(Rank::Ten, Suit::Diamonds),
                Card(Rank::Two, Suit::Clubs), Card(Rank::Nine, Suit::Spades)};
     t.pots.pots = {Pot{300, {0, 1, 2}}, Pot{400, {1, 2}}};

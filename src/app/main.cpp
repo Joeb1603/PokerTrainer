@@ -8,7 +8,9 @@
 //                           hands and sessions advancing by themselves
 //   --stop-on WHAT          With --auto-shove, hold the screen at: live-side-pot (Hero
 //                           to act with side pots), side-pot (showdown with side
-//                           pots), showdown, or bust
+//                           pots), showdown, flop (Hero to act with a board), or bust
+//   --reveal                With --auto-shove, reveal the bots' hands at the held screen
+//   --bot-delay MS          Start with this bot delay, to hold a "waiting" screen
 
 #include <cstdint>
 #include <cstdio>
@@ -94,6 +96,8 @@ struct Arguments {
     std::filesystem::path log_dir = "logs";
     std::optional<long> exit_after_frames;
     bool auto_shove = false;
+    bool reveal = false;
+    std::optional<double> bot_delay_ms;
     std::string stop_on;
 };
 
@@ -109,22 +113,28 @@ void auto_play(poker::IGameController& controller, const Arguments& arguments) {
             break;
         case ControllerPhase::HeroToAct: {
             if (arguments.stop_on == "live-side-pot" && side_pots) return;
+            if (arguments.stop_on == "flop" && !s.board.empty()) return;
             // Calling keeps Hero in the hand with chips behind while bots go all-in.
-            const bool shove = arguments.stop_on != "live-side-pot" && s.legal.allows(poker::ActionType::AllIn);
+            const bool shove = arguments.stop_on != "live-side-pot" && arguments.stop_on != "flop" &&
+                               s.legal.allows(poker::ActionType::AllIn);
             const poker::ActionType fallback =
                 s.legal.allows(poker::ActionType::Check) ? poker::ActionType::Check : poker::ActionType::Call;
             (void)controller.submit_hero_action({shove ? poker::ActionType::AllIn : fallback});
             break;
         }
         case ControllerPhase::HandComplete:
-            if (arguments.stop_on == "showdown" && s.showdown) return;
-            if (arguments.stop_on == "side-pot" && s.showdown && side_pots) return;
+            if ((arguments.stop_on == "showdown" && s.showdown) || (arguments.stop_on == "side-pot" && s.showdown && side_pots)) {
+                if (arguments.reveal) (void)controller.reveal_bot_hands();
+                return;
+            }
             (void)controller.next_hand();
             break;
         case ControllerPhase::SessionOver:
-            if (arguments.stop_on == "bust") return;
-            if (arguments.stop_on == "showdown" && s.showdown) return;
-            if (arguments.stop_on == "side-pot" && s.showdown && side_pots) return;
+            if (arguments.stop_on == "bust" || (arguments.stop_on == "showdown" && s.showdown) ||
+                (arguments.stop_on == "side-pot" && s.showdown && side_pots)) {
+                if (arguments.reveal) (void)controller.reveal_bot_hands();
+                return;
+            }
             controller.new_session();
             break;
     }
@@ -143,6 +153,10 @@ std::optional<Arguments> parse_arguments(int argc, char** argv) {
             arguments.exit_after_frames = std::strtol(argv[++i], nullptr, 10);
         } else if (arg == "--auto-shove") {
             arguments.auto_shove = true;
+        } else if (arg == "--reveal") {
+            arguments.reveal = true;
+        } else if (arg == "--bot-delay" && i + 1 < argc) {
+            arguments.bot_delay_ms = std::strtod(argv[++i], nullptr);
         } else if (arg == "--stop-on" && i + 1 < argc) {
             arguments.stop_on = argv[++i];
         } else {
@@ -194,6 +208,7 @@ int run(const Arguments& arguments) {
                                                                std::random_device{}();
         options.log_dir = arguments.log_dir;
         options.instant_play = arguments.auto_shove;
+        if (arguments.bot_delay_ms) options.bot_delay_ms = *arguments.bot_delay_ms;
         poker::LocalGameController controller(options);
         poker::TrainerUi ui(controller, fonts, scale);
 
@@ -239,7 +254,7 @@ int run(const Arguments& arguments) {
 int main(int argc, char** argv) {
     const auto arguments = parse_arguments(argc, argv);
     if (!arguments) {
-        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT]");
+        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT] [--reveal] [--bot-delay MS]");
         return 2;
     }
     return run(*arguments);

@@ -237,6 +237,349 @@ TEST_F(Controller, QuickBetsAreSizedFromThePotAfterCallingAndClamped) {
     EXPECT_EQ(quick_bet_to(LegalActions{}, 0, 200, 1.0), 0);
 }
 
+TEST_F(Controller, BetPercentRoundTripsWithQuickBets) {
+    LegalActions facing;
+    facing.mask = 1u << static_cast<unsigned>(ActionType::Raise);
+    facing.call_amount = 100;
+    facing.min_raise_to = 200;
+    facing.max_raise_to = 100000;
+    LegalActions unbet;
+    unbet.mask = 1u << static_cast<unsigned>(ActionType::Bet);
+    unbet.min_raise_to = 20;
+    unbet.max_raise_to = 100000;
+
+    for (const int percent : {50, 75, 100, 150, 300}) {
+        const double fraction = percent / 100.0;
+        EXPECT_EQ(bet_pot_percent(facing, 100, 300, quick_bet_to(facing, 100, 300, fraction)), percent);
+        EXPECT_EQ(bet_pot_percent(unbet, 0, 200, quick_bet_to(unbet, 0, 200, fraction)), percent);
+    }
+    // Rounding of the chips stays within a percent on a small pot, and clamping is reported as it is.
+    EXPECT_NEAR(bet_pot_percent(unbet, 0, 35, quick_bet_to(unbet, 0, 35, 0.75)), 75, 1);
+    EXPECT_EQ(bet_pot_percent(facing, 100, 300, quick_bet_to(facing, 100, 300, 0.0)), 25);  // Minimum raise
+    EXPECT_EQ(bet_pot_percent(LegalActions{}, 0, 0, 100), 0);
+}
+
+// --- Current hand name -------------------------------------------------------
+
+TEST_F(Controller, HeroHandNameShowsFromTheFlopUntilHeroFolds) {
+    LocalGameController c(options());
+    int named = 0;
+    for (int hand = 0; hand < 40; ++hand) {
+        for (int guard = 0; guard < 500; ++guard) {
+            c.tick(0.0);
+            const TableSnapshot& s = c.snapshot();
+            const SeatSnapshot& hero = s.seats[kHeroSeat];
+            if (s.board.size() < 3 || hero.status == SeatStatus::Folded) {
+                EXPECT_FALSE(s.hero_hand.has_value());
+            } else {
+                ASSERT_TRUE(s.hero_hand.has_value());
+                std::vector<Card> cards(hero.visible_hole->begin(), hero.visible_hole->end());
+                cards.insert(cards.end(), s.board.begin(), s.board.end());
+                EXPECT_EQ(*s.hero_hand, describe_made_hand(evaluate(cards)));
+                ++named;
+            }
+            if (s.phase == ControllerPhase::HandComplete || s.phase == ControllerPhase::SessionOver) break;
+            if (s.phase == ControllerPhase::HeroToAct) {
+                // Fold some flops, so a named hand is seen to clear.
+                const bool fold = !s.board.empty() && hand % 3 == 0 && !s.legal.allows(ActionType::Check);
+                ASSERT_TRUE(c.submit_hero_action(fold ? Action{ActionType::Fold} : passive(s.legal)));
+            }
+        }
+        if (c.snapshot().phase == ControllerPhase::SessionOver) c.new_session();
+        else ASSERT_TRUE(c.next_hand());
+    }
+    EXPECT_GT(named, 0);
+}
+
+// --- Play GTO ----------------------------------------------------------------
+
+TEST_F(Controller, PlayingEveryHintLogsNoMistakes) {
+    {
+        LocalGameController c(options());
+        for (int hand = 0; hand < 30; ++hand) {
+            play_hand_out(c, [](const TableSnapshot& s) { return s.hint->action; });
+            EXPECT_TRUE(c.snapshot().hand_mistakes.empty());
+            if (c.snapshot().phase == ControllerPhase::SessionOver) c.new_session();
+            else ASSERT_TRUE(c.next_hand());
+        }
+    }
+    for (const json& line : read_json_lines(hands())) EXPECT_TRUE(line["hero_mistakes"].empty()) << line.dump();
+}
+
+// --- Early fold --------------------------------------------------------------
+
+namespace {
+
+std::vector<std::string> log_without_session_ids(const fs::path& path) {
+    std::vector<std::string> out;
+    for (json line : read_json_lines(path)) {
+        line.erase("session_id");
+        out.push_back(line.dump());
+    }
+    return out;
+}
+
+// Runs the bots until something other than a bot is up, whatever the delay.
+void run_bots(IGameController& c) {
+    for (int guard = 0; guard < 50 && c.snapshot().phase == ControllerPhase::BotToAct; ++guard) c.tick(1e9);
+}
+
+}  // namespace
+
+TEST_F(Controller, EarlyFoldPlaysAndLogsExactlyLikeFoldingAtHerosTurn) {
+    ControllerOptions base = options();
+    base.instant_play = false;
+    int compared = 0;
+
+    for (std::uint64_t seed = 1; seed < 60 && compared < 5; ++seed) {
+        ControllerOptions early = base;
+        early.seed = seed;
+        early.log_dir = dir_ / ("early" + std::to_string(seed));
+        ControllerOptions manual = early;
+        manual.log_dir = dir_ / ("manual" + std::to_string(seed));
+        std::vector<std::string> early_actions;
+        std::vector<std::string> manual_actions;
+        {
+            LocalGameController a(early);
+            if (!a.snapshot().can_fold_early) continue;
+            ASSERT_TRUE(a.set_early_fold(true));
+            EXPECT_TRUE(a.snapshot().early_fold_armed);
+            a.tick(0.0);
+            if (a.snapshot().phase == ControllerPhase::HeroToAct) continue;  // A free check: tested below
+            EXPECT_EQ(a.snapshot().seats[kHeroSeat].status, SeatStatus::Folded);
+            EXPECT_FALSE(a.snapshot().early_fold_armed);
+            run_bots(a);
+
+            LocalGameController b(manual);
+            run_bots(b);
+            ASSERT_EQ(b.snapshot().phase, ControllerPhase::HeroToAct);
+            ASSERT_TRUE(b.submit_hero_action({ActionType::Fold}));
+            run_bots(b);
+
+            early_actions = a.snapshot().action_log;
+            manual_actions = b.snapshot().action_log;
+        }
+        EXPECT_EQ(early_actions, manual_actions);
+        const auto early_log = log_without_session_ids(early.log_dir / "hand_history.jsonl");
+        ASSERT_EQ(early_log.size(), 1u);
+        EXPECT_EQ(early_log, log_without_session_ids(manual.log_dir / "hand_history.jsonl"));
+        ++compared;
+    }
+    EXPECT_EQ(compared, 5);
+}
+
+TEST_F(Controller, EarlyFoldSkipsTheDelayOnlyWhileArmed) {
+    ControllerOptions o = options();
+    o.instant_play = false;
+    o.bot_delay_ms = 400.0;
+
+    for (std::uint64_t seed = 1; seed < 100; ++seed) {
+        o.seed = seed;
+        LocalGameController c(o);
+        if (!c.snapshot().can_fold_early) continue;
+
+        ASSERT_TRUE(c.set_early_fold(true));
+        c.tick(0.0);
+        EXPECT_DOUBLE_EQ(c.bot_delay_ms(), 400.0);
+        EXPECT_FALSE(c.instant_play());
+        // Needs bots still to act after Hero's fold, to see the delay come back.
+        if (c.snapshot().seats[kHeroSeat].status != SeatStatus::Folded || c.snapshot().phase != ControllerPhase::BotToAct) continue;
+
+        const std::size_t before = c.snapshot().action_log.size();
+        c.tick(399.0);
+        EXPECT_EQ(c.snapshot().action_log.size(), before);
+        c.tick(1.0);
+        EXPECT_EQ(c.snapshot().action_log.size(), before + 1);
+        return;
+    }
+    FAIL() << "no seed with bots acting both before and after Hero";
+}
+
+TEST_F(Controller, CancellingAnEarlyFoldRestoresPacing) {
+    ControllerOptions o = options();
+    o.instant_play = false;
+    o.bot_delay_ms = 400.0;
+
+    for (std::uint64_t seed = 1; seed < 50; ++seed) {
+        o.seed = seed;
+        LocalGameController c(o);
+        if (!c.snapshot().can_fold_early) continue;
+
+        const std::size_t before = c.snapshot().action_log.size();
+        ASSERT_TRUE(c.set_early_fold(true));
+        ASSERT_TRUE(c.set_early_fold(false));
+        EXPECT_FALSE(c.snapshot().early_fold_armed);
+        c.tick(399.0);
+        EXPECT_EQ(c.snapshot().action_log.size(), before);
+        c.tick(1.0);
+        EXPECT_EQ(c.snapshot().action_log.size(), before + 1);
+
+        run_bots(c);
+        EXPECT_NE(c.snapshot().seats[kHeroSeat].status, SeatStatus::Folded);
+        return;
+    }
+    FAIL() << "no seed with a bot first to act";
+}
+
+TEST_F(Controller, EarlyFoldBecomesADecisionWhenHeroCouldCheckForFree) {
+    ControllerOptions o = options();
+    o.instant_play = false;
+    LocalGameController c(o);
+
+    for (int step = 0; step < 20000; ++step) {
+        const TableSnapshot& s = c.snapshot();
+        if (s.phase == ControllerPhase::SessionOver) {
+            c.new_session();
+        } else if (s.phase == ControllerPhase::HandComplete) {
+            ASSERT_TRUE(c.next_hand());
+        } else if (s.phase == ControllerPhase::HeroToAct) {
+            ASSERT_TRUE(c.submit_hero_action(passive(s.legal)));
+        } else if (s.can_fold_early) {
+            ASSERT_TRUE(c.set_early_fold(true));
+            c.tick(0.0);
+            const TableSnapshot& after = c.snapshot();
+            EXPECT_FALSE(after.early_fold_armed);
+            if (after.phase == ControllerPhase::HeroToAct) {
+                EXPECT_TRUE(after.legal.allows(ActionType::Check));
+                EXPECT_EQ(after.seats[kHeroSeat].status, SeatStatus::Active);
+                return;
+            }
+        } else {
+            c.tick(1e9);
+        }
+    }
+    FAIL() << "never reached a free check with an early fold armed";
+}
+
+TEST_F(Controller, EarlyFoldIsRefusedAtHerosTurnAndDoesNotCarryOver) {
+    ControllerOptions o = options();
+    o.instant_play = false;
+
+    for (std::uint64_t seed = 1; seed < 50; ++seed) {
+        o.seed = seed;
+        LocalGameController c(o);
+        if (!c.snapshot().can_fold_early) {
+            EXPECT_FALSE(c.set_early_fold(true));  // Hero is first to act
+            EXPECT_FALSE(c.snapshot().early_fold_armed);
+            continue;
+        }
+
+        ASSERT_TRUE(c.set_early_fold(true));
+        c.new_session();
+        EXPECT_FALSE(c.snapshot().early_fold_armed);
+
+        for (int hand = 0; hand < 3; ++hand) {
+            if (c.snapshot().can_fold_early) {
+                ASSERT_TRUE(c.set_early_fold(true));
+                c.tick(0.0);
+            }
+            for (int guard = 0; guard < 500; ++guard) {
+                const TableSnapshot& s = c.snapshot();
+                if (s.phase == ControllerPhase::HandComplete || s.phase == ControllerPhase::SessionOver) break;
+                if (s.phase == ControllerPhase::HeroToAct) ASSERT_TRUE(c.submit_hero_action(passive(s.legal)));
+                run_bots(c);
+            }
+            ASSERT_NE(c.snapshot().phase, ControllerPhase::BotToAct);
+            ASSERT_NE(c.snapshot().phase, ControllerPhase::HeroToAct);
+            EXPECT_FALSE(c.snapshot().early_fold_armed);
+            EXPECT_FALSE(c.snapshot().can_fold_early);
+            EXPECT_FALSE(c.set_early_fold(true));
+            if (c.snapshot().phase == ControllerPhase::SessionOver) c.new_session();
+            else ASSERT_TRUE(c.next_hand());
+            EXPECT_FALSE(c.snapshot().early_fold_armed);
+            EXPECT_EQ(c.snapshot().seats[kHeroSeat].status, SeatStatus::Active);
+        }
+        return;
+    }
+    FAIL() << "no seed with a bot first to act";
+}
+
+// --- Revealing bot hands -----------------------------------------------------
+
+TEST_F(Controller, RevealIsRefusedDuringAHandAndShowsEveryBotAfterIt) {
+    fs::path log_path;
+    std::vector<std::vector<std::string>> revealed_cards;
+    {
+        LocalGameController c(options());
+        c.tick(0.0);
+        for (int hand = 0; hand < 25; ++hand) {
+            c.tick(0.0);
+            if (c.snapshot().phase == ControllerPhase::HeroToAct) {
+                EXPECT_FALSE(c.reveal_bot_hands());
+                EXPECT_FALSE(c.snapshot().bots_revealed);
+            }
+            play_hand_out(c, [](const TableSnapshot& s) { return passive(s.legal); });
+
+            const TableSnapshot before = c.snapshot();
+            ASSERT_TRUE(c.reveal_bot_hands());
+            const TableSnapshot& after = c.snapshot();
+            EXPECT_TRUE(after.bots_revealed);
+            expect_no_hidden_text(after);
+
+            std::set<int> ids;
+            for (const Card& card : after.board) ids.insert(card.id);
+            std::vector<std::string> row(kMaxSeats);
+            for (int seat = 0; seat < kMaxSeats; ++seat) {
+                const SeatSnapshot& s = after.seats[seat];
+                EXPECT_EQ(s.shown_hand, before.seats[seat].shown_hand);
+                EXPECT_EQ(s.won, before.seats[seat].won);
+                ASSERT_EQ(s.position.has_value(), s.visible_hole.has_value()) << "seat " << seat;
+                EXPECT_EQ(s.revealed_after_fold, seat != kHeroSeat && s.position && s.status == SeatStatus::Folded);
+                if (s.visible_hole) {
+                    EXPECT_TRUE(ids.insert((*s.visible_hole)[0].id).second);
+                    EXPECT_TRUE(ids.insert((*s.visible_hole)[1].id).second);
+                    row[seat] = (*s.visible_hole)[0].to_string() + (*s.visible_hole)[1].to_string();
+                }
+            }
+            revealed_cards.push_back(std::move(row));
+
+            if (after.phase == ControllerPhase::SessionOver) {
+                c.new_session();
+            } else {
+                ASSERT_TRUE(c.next_hand());
+            }
+            EXPECT_FALSE(c.snapshot().bots_revealed);
+            for (int seat = 1; seat < kMaxSeats; ++seat) {
+                EXPECT_FALSE(c.snapshot().seats[seat].visible_hole.has_value());
+                EXPECT_FALSE(c.snapshot().seats[seat].revealed_after_fold);
+            }
+        }
+    }
+
+    // Where the log records a seat's cards, they must be the ones revealed. The session
+    // can restart, so hands are matched by order rather than by hand number.
+    const auto lines = read_json_lines(hands());
+    ASSERT_EQ(lines.size(), revealed_cards.size());
+    int checked = 0;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        for (const json& seat : lines[i]["seats"]) {
+            if (!seat.contains("c")) continue;
+            EXPECT_EQ(seat["c"].get<std::string>(), revealed_cards[i][seat["s"].get<int>()]);
+            ++checked;
+        }
+    }
+    EXPECT_GT(checked, 0);
+}
+
+TEST_F(Controller, RevealingDoesNotChangeTheLogs) {
+    const auto run = [&](const std::string& name, bool reveal) {
+        ControllerOptions o = options();
+        o.log_dir = dir_ / name;
+        LocalGameController c(o);
+        for (int hand = 0; hand < 15; ++hand) {
+            play_hand_out(c, [](const TableSnapshot& s) { return passive(s.legal); });
+            if (reveal) ASSERT_TRUE(c.reveal_bot_hands());
+            if (c.snapshot().phase == ControllerPhase::SessionOver) c.new_session();
+            else ASSERT_TRUE(c.next_hand());
+        }
+    };
+    run("plain", false);
+    run("revealed", true);
+    const auto plain = log_without_session_ids(dir_ / "plain" / "hand_history.jsonl");
+    EXPECT_FALSE(plain.empty());
+    EXPECT_EQ(plain, log_without_session_ids(dir_ / "revealed" / "hand_history.jsonl"));
+}
+
 // --- Live pots through the controller ----------------------------------------
 
 TEST_F(Controller, PotBreakdownAlwaysAddsUpToTheTotal) {

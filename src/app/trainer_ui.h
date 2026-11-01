@@ -41,6 +41,7 @@ private:
     UiFonts fonts_;
     float scale_;
 
+    // Off keeps the advice hidden, including from the Play GTO button.
     bool show_advisor_ = true;
     int raise_to_ = 0;
     // Identifies the current decision, so the slider resets once for each one.

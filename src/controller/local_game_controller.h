@@ -44,6 +44,8 @@ public:
     void tick(double elapsed_ms) override;
     [[nodiscard]] bool submit_hero_action(const Action& action) override;
     [[nodiscard]] bool next_hand() override;
+    [[nodiscard]] bool set_early_fold(bool armed) override;
+    [[nodiscard]] bool reveal_bot_hands() override;
     void new_session() override;
 
     void set_bot_delay_ms(double delay_ms) override { bot_delay_ms_ = delay_ms; }
@@ -86,6 +88,8 @@ private:
     double bot_delay_ms_;
     bool instant_play_;
     double bot_timer_ms_ = 0.0;
+    bool early_fold_armed_ = false;
+    bool bots_revealed_ = false;
     std::optional<std::string> log_error_;
     TableSnapshot snapshot_;
 };
