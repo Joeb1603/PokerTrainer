@@ -65,6 +65,7 @@ add_library(poker_core STATIC
     src/bots/gto_heuristic_engine.cpp
     src/core/card.cpp
     src/core/deck.cpp
+    src/controller/local_game_controller.cpp
     src/core/hand_evaluator.cpp
     src/engine/game_engine.cpp
     src/engine/player_view.cpp
@@ -82,6 +83,56 @@ target_compile_options(poker_core PRIVATE ${POKER_WARNINGS})
 add_executable(poker_cli tools/poker_cli.cpp)
 target_link_libraries(poker_cli PRIVATE poker_core)
 target_compile_options(poker_cli PRIVATE ${POKER_WARNINGS})
+
+# --- Desktop app (GLFW + OpenGL3 + Dear ImGui) ---------------------------------
+option(POKER_BUILD_APP "Build the poker_trainer desktop app" ON)
+if(POKER_BUILD_APP)
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        glfw
+        GIT_REPOSITORY https://github.com/glfw/glfw.git
+        GIT_TAG        3.4
+        GIT_SHALLOW    TRUE
+    )
+    # Upstream ships no CMakeLists; the target is defined below, as with phevaluator.
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG        v1.92.9b
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(glfw imgui)
+    find_package(OpenGL REQUIRED)
+
+    add_library(imgui_lib STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+    )
+    target_include_directories(imgui_lib SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+    target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
+
+    # Separate from main.cpp so tests can drive the UI without a window.
+    add_library(trainer_ui STATIC src/app/trainer_ui.cpp)
+    target_include_directories(trainer_ui PUBLIC src)
+    target_link_libraries(trainer_ui PUBLIC poker_core imgui_lib)
+    target_compile_options(trainer_ui PRIVATE ${POKER_WARNINGS})
+
+    add_executable(poker_trainer src/app/main.cpp)
+    target_link_libraries(poker_trainer PRIVATE trainer_ui)
+    target_compile_options(poker_trainer PRIVATE ${POKER_WARNINGS})
+    if(MSVC)
+        # A window with no console, keeping main() as the entry point.
+        set_target_properties(poker_trainer PROPERTIES WIN32_EXECUTABLE TRUE)
+        target_link_options(poker_trainer PRIVATE /ENTRY:mainCRTStartup)
+    endif()
+endif()
 
 # --- Tests -------------------------------------------------------------------
 if(POKER_BUILD_TESTS)
@@ -111,9 +162,14 @@ if(POKER_BUILD_TESTS)
         tests/bots_test.cpp
         tests/training_advisor_test.cpp
         tests/hand_logger_test.cpp
+        tests/game_controller_test.cpp
     )
     target_link_libraries(core_tests PRIVATE poker_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_compile_options(core_tests PRIVATE ${POKER_WARNINGS})
+    if(POKER_BUILD_APP)
+        target_sources(core_tests PRIVATE tests/trainer_ui_test.cpp)
+        target_link_libraries(core_tests PRIVATE trainer_ui)
+    endif()
 
     include(GoogleTest)
     # PRE_TEST: the default POST_BUILD list follows whichever config linked last,

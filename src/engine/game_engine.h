@@ -7,6 +7,7 @@
 
 #include "engine/game_types.h"
 #include "engine/player_view.h"
+#include "engine/pots.h"
 
 namespace poker {
 
@@ -67,6 +68,9 @@ public:
     // Sanitized snapshot for one seat; the only thing to hand a bot or the advisor.
     // Throws std::invalid_argument for a seat out of range.
     PlayerView player_view(int seat) const;
+
+    // Main and side pots as they stand now, for display during a hand.
+    LivePots live_pots() const;
 
     // Applies an action for the player to act. Returns false and changes
     // nothing if the action is illegal.

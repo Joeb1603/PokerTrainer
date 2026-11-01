@@ -221,6 +221,16 @@ void GameEngine::start_hand(const std::optional<ScriptedDeal>& script) {
     settle(state_.big_blind_seat);
 }
 
+LivePots GameEngine::live_pots() const {
+    std::array<int, kMaxSeats> contributed{};
+    std::array<SeatStatus, kMaxSeats> statuses{};
+    for (int seat = 0; seat < kMaxSeats; ++seat) {
+        contributed[seat] = state_.seats[seat].total_bet;
+        statuses[seat] = state_.seats[seat].status;
+    }
+    return calculate_live_pots(contributed, statuses);
+}
+
 LegalActions GameEngine::legal_actions() const {
     LegalActions legal;
     if (!state_.to_act) return legal;

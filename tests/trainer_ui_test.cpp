@@ -1,0 +1,309 @@
+// Runs the real TrainerUi in a windowless ImGui context, injecting input through
+// ImGui's event queue, so buttons and shortcuts are tested without a display. The
+// coordinates follow the layout at scale 1 in a 1360x860 window with the default style.
+
+#include <gtest/gtest.h>
+
+#include <optional>
+#include <vector>
+
+#include <imgui.h>
+
+#include "app/trainer_ui.h"
+
+using namespace poker;
+
+namespace {
+
+constexpr float kConsoleTop = 860.0f - 128.0f;
+constexpr ImVec2 kFold{83.0f, kConsoleTop + 27.0f};
+constexpr ImVec2 kCheckCall{241.0f, kConsoleTop + 27.0f};
+constexpr ImVec2 kRaise{399.0f, kConsoleTop + 27.0f};
+constexpr ImVec2 kAllIn{557.0f, kConsoleTop + 27.0f};
+constexpr float kQuickRow = kConsoleTop + 60.0f;
+constexpr ImVec2 kQuickMin{300.0f, kQuickRow};
+constexpr ImVec2 kQuick50{376.0f, kQuickRow};
+constexpr ImVec2 kQuick75{452.0f, kQuickRow};
+constexpr ImVec2 kQuickPot{528.0f, kQuickRow};
+constexpr ImVec2 kQuickAllIn{604.0f, kQuickRow};
+constexpr ImVec2 kNextHand{128.0f, kConsoleTop + 27.0f};
+constexpr ImVec2 kNewSession{1190.0f, 52.0f};
+
+std::uint8_t mask_of(std::initializer_list<ActionType> types) {
+    std::uint8_t mask = 0;
+    for (const ActionType type : types) mask |= static_cast<std::uint8_t>(1u << static_cast<unsigned>(type));
+    return mask;
+}
+
+class FakeController final : public IGameController {
+public:
+    TableSnapshot table;
+    std::vector<Action> submitted;
+    int next_hand_calls = 0;
+    int new_session_calls = 0;
+
+    const TableSnapshot& snapshot() const override { return table; }
+    void tick(double) override {}
+    bool submit_hero_action(const Action& action) override {
+        submitted.push_back(action);
+        return true;
+    }
+    bool next_hand() override {
+        ++next_hand_calls;
+        return true;
+    }
+    void new_session() override { ++new_session_calls; }
+    void set_bot_delay_ms(double) override {}
+    double bot_delay_ms() const override { return 400.0; }
+    void set_instant_play(bool) override {}
+    bool instant_play() const override { return false; }
+};
+
+class UiTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        context_ = ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.DisplaySize = {1360.0f, 860.0f};
+        io.DeltaTime = 1.0f / 60.0f;
+        io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;  // No renderer needs the atlas
+        ImFont* font = io.Fonts->AddFontDefault();
+
+        fake_.table.small_blind = 10;
+        fake_.table.big_blind = 20;
+        for (int seat = 0; seat < kMaxSeats; ++seat) fake_.table.seats[seat].name = "Seat" + std::to_string(seat);
+        fake_.table.seats[kHeroSeat].stack = 1000;
+        set_facing_raise();
+
+        ui_.emplace(fake_, UiFonts{font, font}, 1.0f);
+    }
+
+    void TearDown() override { ImGui::DestroyContext(context_); }
+
+    // Facing a 100 bet into a pot of 300: 100 to call, minimum raise to 200, 1000 behind.
+    void set_facing_raise() {
+        TableSnapshot& t = fake_.table;
+        t.phase = ControllerPhase::HeroToAct;
+        t.legal.mask = mask_of({ActionType::Fold, ActionType::Call, ActionType::Raise, ActionType::AllIn});
+        t.legal.call_amount = 100;
+        t.legal.min_raise_to = 200;
+        t.legal.max_raise_to = 1000;
+        t.current_bet = 100;
+        t.pots.total = 300;
+        t.action_log = {"a"};
+    }
+
+    void frame() {
+        ImGui::NewFrame();
+        ui_->draw();
+        ImGui::Render();
+    }
+
+    void click(ImVec2 pos) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.AddMousePosEvent(pos.x, pos.y);
+        frame();
+        frame();
+        io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        frame();
+        io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        frame();
+        frame();
+    }
+
+    void press_space() {
+        ImGuiIO& io = ImGui::GetIO();
+        io.AddKeyEvent(ImGuiKey_Space, true);
+        frame();
+        io.AddKeyEvent(ImGuiKey_Space, false);
+        frame();
+    }
+
+    ImGuiContext* context_ = nullptr;
+    FakeController fake_;
+    std::optional<TrainerUi> ui_;
+};
+
+void expect_single_action(const FakeController& fake, ActionType type, int amount = 0) {
+    ASSERT_EQ(fake.submitted.size(), 1u);
+    EXPECT_EQ(fake.submitted[0].type, type);
+    EXPECT_EQ(fake.submitted[0].amount, amount);
+}
+
+}  // namespace
+
+TEST_F(UiTest, FoldButtonSubmitsFold) {
+    click(kFold);
+    expect_single_action(fake_, ActionType::Fold);
+}
+
+TEST_F(UiTest, MiddleButtonCallsWhenFacingABet) {
+    click(kCheckCall);
+    expect_single_action(fake_, ActionType::Call);
+}
+
+TEST_F(UiTest, MiddleButtonChecksWhenNothingToCall) {
+    fake_.table.legal.mask = mask_of({ActionType::Fold, ActionType::Check, ActionType::Bet, ActionType::AllIn});
+    fake_.table.legal.call_amount = 0;
+    click(kCheckCall);
+    expect_single_action(fake_, ActionType::Check);
+}
+
+TEST_F(UiTest, RaiseStartsAtTheMinimum) {
+    click(kRaise);
+    expect_single_action(fake_, ActionType::Raise, 200);
+}
+
+TEST_F(UiTest, BetIsSentAsABetWhenNothingHasBeenBet) {
+    fake_.table.legal.mask = mask_of({ActionType::Fold, ActionType::Check, ActionType::Bet, ActionType::AllIn});
+    fake_.table.legal.call_amount = 0;
+    fake_.table.legal.min_raise_to = 20;
+    fake_.table.current_bet = 0;
+    fake_.table.pots.total = 200;
+    click(kQuickPot);
+    click(kRaise);
+    expect_single_action(fake_, ActionType::Bet, 200);
+}
+
+TEST_F(UiTest, AllInButtonSubmitsAllIn) {
+    click(kAllIn);
+    expect_single_action(fake_, ActionType::AllIn);
+}
+
+// Each quick button only sets the slider; the raise button is what acts. From a pot of
+// 300 and 100 to call, the pot after calling is 400.
+TEST_F(UiTest, QuickBetsSetTheSizeWithoutActing) {
+    const auto size_after = [this](ImVec2 quick) {
+        fake_.submitted.clear();
+        click(quick);
+        EXPECT_TRUE(fake_.submitted.empty()) << "a quick button acted by itself";
+        click(kRaise);
+        EXPECT_EQ(fake_.submitted.size(), 1u);
+        const int amount = fake_.submitted.empty() ? -1 : fake_.submitted[0].amount;
+        return amount;
+    };
+    EXPECT_EQ(size_after(kQuick50), 300);
+    EXPECT_EQ(size_after(kQuick75), 400);
+    EXPECT_EQ(size_after(kQuickPot), 500);
+    EXPECT_EQ(size_after(kQuickAllIn), 1000);
+    EXPECT_EQ(size_after(kQuickMin), 200);
+}
+
+TEST_F(UiTest, SliderResetsToTheMinimumForEachNewDecision) {
+    frame();
+    click(kQuickPot);
+    fake_.table.action_log.push_back("next decision");
+    frame();
+    click(kRaise);
+    expect_single_action(fake_, ActionType::Raise, 200);
+}
+
+TEST_F(UiTest, IllegalButtonsAreDisabled) {
+    fake_.table.legal.mask = mask_of({ActionType::Fold, ActionType::Call});
+    fake_.table.legal.min_raise_to = 0;
+    fake_.table.legal.max_raise_to = 0;
+    click(kRaise);
+    click(kAllIn);
+    click(kQuickPot);
+    EXPECT_TRUE(fake_.submitted.empty());
+}
+
+TEST_F(UiTest, NoActionButtonsWhileABotIsToAct) {
+    fake_.table.phase = ControllerPhase::BotToAct;
+    fake_.table.legal = {};
+    fake_.table.waiting_on = "Nit";
+    click(kFold);
+    click(kRaise);
+    EXPECT_TRUE(fake_.submitted.empty());
+}
+
+TEST_F(UiTest, NextHandButtonAndSpacebarDealOnlyWhenTheHandIsComplete) {
+    press_space();
+    EXPECT_EQ(fake_.next_hand_calls, 0);
+
+    fake_.table.phase = ControllerPhase::BotToAct;
+    fake_.table.legal = {};
+    fake_.table.waiting_on = "Nit";
+    press_space();
+    EXPECT_EQ(fake_.next_hand_calls, 0);
+
+    fake_.table.phase = ControllerPhase::HandComplete;
+    fake_.table.payouts = {{"Hero", 300, "Pair of Aces"}};
+    press_space();
+    EXPECT_EQ(fake_.next_hand_calls, 1);
+
+    click(kNextHand);
+    EXPECT_EQ(fake_.next_hand_calls, 2);
+}
+
+TEST_F(UiTest, HoldingSpaceDealsOnlyOnce) {
+    fake_.table.phase = ControllerPhase::HandComplete;
+    fake_.table.legal = {};
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddKeyEvent(ImGuiKey_Space, true);
+    for (int i = 0; i < 120; ++i) frame();
+    io.AddKeyEvent(ImGuiKey_Space, false);
+    frame();
+    EXPECT_EQ(fake_.next_hand_calls, 1);
+}
+
+TEST_F(UiTest, SessionOverOffersANewGameAndIgnoresSpace) {
+    fake_.table.phase = ControllerPhase::SessionOver;
+    fake_.table.legal = {};
+    fake_.table.session.hero_busted = true;
+    press_space();
+    EXPECT_EQ(fake_.next_hand_calls, 0);
+
+    click(kNextHand);  // The same spot holds Start New Game here
+    EXPECT_EQ(fake_.new_session_calls, 1);
+}
+
+TEST_F(UiTest, ResetButtonStartsANewSessionMidHand) {
+    click(kNewSession);
+    EXPECT_EQ(fake_.new_session_calls, 1);
+    EXPECT_TRUE(fake_.submitted.empty());
+}
+
+TEST_F(UiTest, EveryScreenDrawsWithFullData) {
+    TableSnapshot& t = fake_.table;
+    t.board = {Card(Rank::Ace, Suit::Spades), Card(Rank::King, Suit::Hearts), Card(Rank::Ten, Suit::Diamonds),
+               Card(Rank::Two, Suit::Clubs), Card(Rank::Nine, Suit::Spades)};
+    t.pots.pots = {Pot{300, {0, 1, 2}}, Pot{400, {1, 2}}};
+    t.pots.uncalled = 50;
+    t.log_error = "disk full";
+    t.hand_mistakes.push_back({Street::Flop, "C40", "FOLD", 20.0, 30.0, 60.0, 25.0, "why"});
+
+    HintRecommendation hint;
+    hint.best_action = "RAISE to 150 (75% Pot)";
+    hint.rationale = "A rationale long enough that it has to wrap across the width of the sidebar panel.";
+    hint.ev.fold = 0.0;
+    hint.ev.check_call = 12.0;
+    hint.ev.raise_33 = 20.0;
+    hint.ev.raise_75 = 30.0;
+    hint.ev.all_in = -40.0;
+    t.hint = hint;
+
+    const Card ace(Rank::Ace, Suit::Hearts);
+    const Card two(Rank::Two, Suit::Diamonds);
+    for (int seat = 0; seat < kMaxSeats; ++seat) {
+        SeatSnapshot& s = t.seats[seat];
+        s.position = static_cast<Position>(seat);
+        s.holds_cards = seat != 1;
+        s.street_bet = seat * 10;
+        s.status = static_cast<SeatStatus>(seat % 4);
+        s.is_button = seat == 2;
+        s.is_to_act = seat == 0;
+        s.won = seat == 3 ? 100 : 0;
+    }
+    t.seats[kHeroSeat].visible_hole = std::array<Card, 2>{ace, two};
+    t.seats[2].shown_hand = "Pair of Aces";
+
+    for (const ControllerPhase phase : {ControllerPhase::HeroToAct, ControllerPhase::BotToAct,
+                                        ControllerPhase::HandComplete, ControllerPhase::SessionOver}) {
+        t.phase = phase;
+        t.waiting_on = "Nit";
+        for (int i = 0; i < 3; ++i) frame();
+    }
+    EXPECT_GT(ImGui::GetDrawData()->TotalVtxCount, 0);
+}

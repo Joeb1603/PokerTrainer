@@ -260,6 +260,13 @@ void play_game(std::mt19937_64& rng, bool verbose) {
 
         while (state.phase == GamePhase::Betting) {
             check_during_hand(state, chips);
+            const LivePots live = engine.live_pots();
+            int live_total = live.uncalled;
+            for (const Pot& pot : live.pots) {
+                live_total += pot.amount;
+                if (pot.eligible.empty()) fail(state, "live pot with nobody eligible");
+            }
+            if (live_total != state.total_pot()) fail(state, "live pots do not match chips bet");
             const LegalActions legal = engine.legal_actions();
             if (legal.mask == 0) {
                 fail(state, "betting phase with no legal action");
