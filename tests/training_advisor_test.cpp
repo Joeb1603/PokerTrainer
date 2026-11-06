@@ -573,7 +573,7 @@ TEST(Advisor, FieldsInRangeAndBestActionLegalAcrossRandomStates) {
                     EXPECT_FALSE(hint.ev.raise_75.has_value());
                     EXPECT_FALSE(hint.ev.raise_100.has_value());
                 }
-                if (!view.legal.allows(ActionType::AllIn)) EXPECT_FALSE(hint.ev.all_in.has_value());
+                if (!view.legal.allows(ActionType::AllIn)) { EXPECT_FALSE(hint.ev.all_in.has_value()); }
 
                 const LegalActions& legal = view.legal;
                 std::vector<Action> options;
@@ -720,7 +720,7 @@ TEST(AdvisorSizing, EverySizeIsUsedAndAdviceStaysSane) {
         const std::array<std::optional<int>, 4> sizes{hint.raise_25_to, hint.raise_50_to, hint.raise_75_to, hint.raise_100_to};
         for (std::size_t a = 0; a < sizes.size(); ++a) {
             for (std::size_t b = a + 1; b < sizes.size(); ++b) {
-                if (sizes[a] && sizes[b]) EXPECT_NE(*sizes[a], *sizes[b]);
+                if (sizes[a] && sizes[b]) { EXPECT_NE(*sizes[a], *sizes[b]); }
             }
         }
 
@@ -773,7 +773,7 @@ TEST(AdvisorSizing, QuickBetsMatchAdvisorSizes) {
         for (const auto& [fraction, to] : rungs) {
             const int quick = quick_bet_to(view.legal, view.current_bet, view.total_pot, fraction, cap);
             EXPECT_EQ(quick, clamp_raise_to(view, raise_to_for_pot_fraction(view, fraction)));
-            if (to) EXPECT_EQ(quick, *to);
+            if (to) { EXPECT_EQ(quick, *to); }
         }
     };
 

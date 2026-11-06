@@ -480,7 +480,7 @@ TEST_F(Controller, EarlyFoldIsRefusedAtHerosTurnAndDoesNotCarryOver) {
             for (int guard = 0; guard < 500; ++guard) {
                 const TableSnapshot& s = c.snapshot();
                 if (s.phase == ControllerPhase::HandComplete || s.phase == ControllerPhase::SessionOver) break;
-                if (s.phase == ControllerPhase::HeroToAct) ASSERT_TRUE(c.submit_hero_action(passive(s.legal)));
+                if (s.phase == ControllerPhase::HeroToAct) { ASSERT_TRUE(c.submit_hero_action(passive(s.legal))); }
                 run_bots(c);
             }
             ASSERT_NE(c.snapshot().phase, ControllerPhase::BotToAct);
@@ -572,7 +572,7 @@ TEST_F(Controller, RevealingDoesNotChangeTheLogs) {
         LocalGameController c(o);
         for (int hand = 0; hand < 15; ++hand) {
             play_hand_out(c, [](const TableSnapshot& s) { return passive(s.legal); });
-            if (reveal) ASSERT_TRUE(c.reveal_bot_hands());
+            if (reveal) { ASSERT_TRUE(c.reveal_bot_hands()); }
             if (c.snapshot().phase == ControllerPhase::SessionOver) c.new_session();
             else ASSERT_TRUE(c.next_hand());
         }
@@ -605,7 +605,7 @@ TEST_F(Controller, PotBreakdownAlwaysAddsUpToTheTotal) {
                 }
                 c.tick(0.0);
             }
-            if (c.snapshot().phase == ControllerPhase::HandComplete) ASSERT_TRUE(c.next_hand());
+            if (c.snapshot().phase == ControllerPhase::HandComplete) { ASSERT_TRUE(c.next_hand()); }
         }
         c.new_session();
     }
@@ -699,7 +699,7 @@ TEST_F(Controller, MistakesAreRecordedFromThePreActionViewAndLogged) {
             play_hand_out(c, [](const TableSnapshot&) { return Action{ActionType::Fold}; });
             mistakes = c.snapshot().session.mistakes;
             if (c.snapshot().phase == ControllerPhase::SessionOver) break;
-            if (mistakes == 0) ASSERT_TRUE(c.next_hand());
+            if (mistakes == 0) { ASSERT_TRUE(c.next_hand()); }
         }
         ASSERT_GT(mistakes, 0) << "always folding never gave up EV";
         ASSERT_FALSE(c.snapshot().hand_mistakes.empty());
@@ -758,7 +758,7 @@ TEST_F(Controller, FreezeoutEndsWhenHeroBustsAndNextHandIsRefused) {
             play_hand_out(c, [](const TableSnapshot& s) {
                 return Action{s.legal.allows(ActionType::AllIn) ? ActionType::AllIn : ActionType::Call};
             });
-            if (c.snapshot().phase == ControllerPhase::HandComplete) ASSERT_TRUE(c.next_hand());
+            if (c.snapshot().phase == ControllerPhase::HandComplete) { ASSERT_TRUE(c.next_hand()); }
         }
         const TableSnapshot& s = c.snapshot();
         if (s.phase == ControllerPhase::SessionOver && s.session.hero_busted) {

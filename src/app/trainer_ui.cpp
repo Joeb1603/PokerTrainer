@@ -41,8 +41,6 @@ ImU32 suit_color(Suit suit) {
     return IM_COL32_BLACK;
 }
 
-ImVec2 operator+(const ImVec2& a, const ImVec2& b) { return {a.x + b.x, a.y + b.y}; }
-
 void text_at(ImDrawList* dl, ImFont* font, float size, ImVec2 pos, ImU32 color, const std::string& text) {
     dl->AddText(font, size, pos, color, text.c_str());
 }

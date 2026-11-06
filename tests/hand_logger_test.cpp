@@ -479,7 +479,10 @@ TEST(Mistakes, InvalidUtf8InRationaleCannotBreakTheLog) {
     act(e, ActionType::Fold);
     HandLogContext c = context();
     c.hero_mistakes.push_back({Street::Preflop, "F", "CALL", 0, 0, 0, 0, std::string("bad \xC3\x28 byte")});
-    EXPECT_NO_THROW((void)json::parse(serialize_hand(e.state(), c)));
+    EXPECT_NO_THROW({
+        const json parsed = json::parse(serialize_hand(e.state(), c));
+        EXPECT_TRUE(parsed.is_object());
+    });
 }
 
 // --- Files -------------------------------------------------------------------

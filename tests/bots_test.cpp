@@ -827,7 +827,7 @@ TEST(WildGto, LightCallsAndBluffRaisesWhereGtoFolds) {
 
     for (int i = 0; i < 200; ++i) {
         const Action action = wild.decide(view);
-        if (is_aggressive(action)) EXPECT_EQ(action.amount, raise_to_for_pot_fraction(view, kWildOverbetFraction));
+        if (is_aggressive(action)) { EXPECT_EQ(action.amount, raise_to_for_pot_fraction(view, kWildOverbetFraction)); }
     }
 }
 
@@ -895,7 +895,7 @@ TEST(Factory, MakesEachBotWithItsPublicName) {
     for (const auto& [kind, name] : names) {
         const auto bot = make_bot(kind, 1, kFastRollouts);
         EXPECT_EQ(bot->name(), name);
-        if (kind != BotKind::Shifter) EXPECT_EQ(bot->hand_log_label(), name);
+        if (kind != BotKind::Shifter) { EXPECT_EQ(bot->hand_log_label(), name); }
     }
 }
 
