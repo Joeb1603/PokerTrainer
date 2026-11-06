@@ -293,6 +293,7 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
     double call_weight = 0.0;
     double call_equity = 0.0;
     double call_match = 0.0;
+    double call_refund = 0.0;
     double raise_weight = 0.0;
     double raise_equity = 0.0;
     double raised_value = 0.0;
@@ -323,9 +324,13 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
         no_raise *= 1.0 - raise;
 
         if (call > 0.0) {
+            const double e = equity_vs_range(in.equities->combos(), answer.call_range).value_or(0.0);
             call_weight += call;
-            call_equity += call * equity_vs_range(in.equities->combos(), answer.call_range).value_or(0.0);
+            call_equity += call * e;
             call_match += call * match;
+            // Chips a short caller cannot match come back to Hero: 0 when it covers.
+            const double unmatched = std::max(0, effective_to - total);
+            call_refund += call * unmatched * (1.0 - e);
         }
         if (raise > 0.0) {
             const double e = equity_vs_range(in.equities->combos(), answer.raise_range).value_or(0.0);
@@ -334,8 +339,11 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
                 std::max(static_cast<double>(effective_to),
                          std::min({effective_to + pot + added + match, static_cast<double>(hero_total),
                                    static_cast<double>(total)}));
-            const double hero_cost = reraise_to - me.street_bet;
-            const double raiser_cost = reraise_to - s.street_bet;
+            // A villain who cannot cover `to` only calls all in, for its stack, and the
+            // part of Hero's raise it cannot match comes back.
+            const double final_to = std::min(reraise_to, static_cast<double>(total));
+            const double hero_cost = final_to - me.street_bet;
+            const double raiser_cost = final_to - s.street_bet;
             raise_weight += raise;
             raise_equity += raise * e;
             raised_value += raise * std::max(-added, e * (pot + hero_cost + raiser_cost) - hero_cost);
@@ -355,7 +363,8 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
         implied = std::min(std::max(0.0, e_call - 0.5) * std::max(0, behind) * kImpliedShare,
                            kImpliedPotCap * (pot + added + m));
     }
-    const double v_called = e_call * (pot + added + m) - added + implied;
+    const double refund = call_weight > 0.0 ? call_refund / call_weight : 0.0;
+    const double v_called = e_call * (pot + added + m) - added + refund + implied;
     out.ev = fold_all * pot * in.pot_kept_share + p_call * v_called + p_raise * v_raised;
     out.outcome.fold_pct = 100.0 * fold_all;
     out.outcome.raise_pct = 100.0 * p_raise;
@@ -436,6 +445,8 @@ void run_tasks(std::size_t count, bool parallel, const Task& task) {
         }
     };
     std::vector<std::thread> workers;
+    // Reserved first: a reallocation failing with threads running would terminate.
+    if (parallel && count > 1) workers.reserve(count - 1);
     for (std::size_t i = 1; parallel && i < count; ++i) {
         try {
             workers.emplace_back(guarded, i);
@@ -521,7 +532,12 @@ LineResult evaluate_line(const Decision& d, RangeEquities& equities, const Arche
     if (may_raise) {
         inputs.equities = &equities;
         inputs.params = &params;
-        inputs.pot_kept_share = layer_chips > 0 ? kept / layer_chips : 1.0;
+        // Once everybody foldable folds, Hero puts in the call, plays each layer of
+        // the called pot against its all-in players, and the rest of the raise comes
+        // back: kept - to_call, which is the whole pot when nobody is all in.
+        inputs.pot_kept_share = layer_chips > 0 && view.total_pot > 0
+                                    ? (kept - math.to_call) / view.total_pot
+                                    : 1.0;
     }
 
     // The chart prior. A free check costs nothing, so it is left alone. Rejected

@@ -128,15 +128,22 @@ struct AdvisorOptions {
 // One caller is assumed, the opponents weighted by call_i (w_i) or raise_i (u_i),
 // each set of weights scaled to sum to 1:
 //   e_call  = sum w_i e(call range_i), m = sum w_i m_i
-//   V_called = e_call * (P + a + m) - a + implied
+//   V_called = e_call * (P + a + m) - a + refund + implied
 //   V_raised = sum u_i max(-a, e(raise range_i) * (P + T_i + T'_i) - T_i)
+// refund = sum w_i (1 - e(call range_i)) * x_i, where x_i is the part of `to` a
+// short caller i cannot match (0 when it covers): those chips come back, so a
+// short call is worth e_i * (P + a_i + m_i) - a_i with a_i = a - x_i.
 // The raise is taken to be pot-sized, to R2_i = to + (P + a + m_i), capped at both
 // stacks (Hero's street bet plus stack, and the raiser's) and at least `to`; Hero
 // calls it at a cost of T_i = R2_i - Hero's street bet, the raiser having put in
 // T'_i = R2_i - its street bet from now on, or folds for -a, whichever is better.
-// When Hero's raise is all in, R2_i = to and V_raised is a call. k is the share of
-// the pot Hero keeps once everybody foldable has folded: 1, unless a player already
-// all in contests part of it, when each layer counts at e against its all-in players.
+// When Hero's raise is all in, R2_i = to and V_raised is a call. A "raiser" who
+// cannot cover `to` can only call all in: R2_i is then its street bet plus stack.
+// P * k is what Hero gains once everybody foldable has folded: P (k = 1), unless a
+// player already all in contests part of the pot. Then Hero still pays the call,
+// each layer (pot_layers, so the pot after that call) counts at e against its
+// all-in players, and the rest of the raise comes back: P * k = sum over layers of
+// amount * e(its all-in players) - to_call.
 //
 // implied rewards a raise that keeps chips behind for later streets, which a
 // single-street formula otherwise misses and which would make all-in look best with

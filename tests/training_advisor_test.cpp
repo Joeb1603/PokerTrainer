@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -376,6 +378,139 @@ TEST(Advisor, CallEvCountsEachPotAgainstItsOwnOpponents) {
     const HintRecommendation hint = TrainingAdvisor(23, kRollouts).analyze(view);
     EXPECT_NEAR(*hint.ev.check_call, expected, 5.0);  // Monte Carlo on the 120-chip layer only
     EXPECT_EQ(hint.action.type, ActionType::Fold);
+}
+
+// The documented postflop bet/raise EV, rebuilt per villain from the range model's
+// public functions, with stacks that are not all equal (training_advisor.h).
+double rebuilt_raise_ev(const PlayerView& view, int to) {
+    const ArchetypeParams& params = archetype_params(Archetype::Baseline);
+    const PublicSeat& me = view.seats[static_cast<std::size_t>(view.seat)];
+    std::array<std::optional<WeightedRange>, kMaxSeats> ranges = infer_ranges(view, params);
+    const CardMask dead = card_mask(std::span<const Card>(view.board)) | card_mask(std::span<const Card>(*view.own_hole));
+    for (std::optional<WeightedRange>& range : ranges) {
+        if (range) range->remove_cards(dead);
+    }
+    std::bitset<kComboCount> every;
+    every.set();
+    const ComboEquities combos = hero_vs_each_combo(*view.own_hole, view.board, every);
+    const WeightedRange hero_range = infer_range_for(view, view.seat, params, false);
+    const StreetStrength strength = street_strength(view.board);
+
+    const int eff = clamp_raise_to(view, to);
+    const double a = eff - me.street_bet;
+    const double pot = view.total_pot;
+    const double facing = std::max(0, view.current_bet - me.street_bet);
+    const double size = (eff - view.current_bet) / (pot + facing);
+    const int hero_total = me.street_bet + me.stack;
+
+    // Everybody folds: Hero pays the call and plays each layer against its all-in players.
+    const PotMath math = pot_math(view);
+    double fold_win = -math.to_call;
+    for (const PotLayer& layer : pot_layers(view)) {
+        double e = 1.0;
+        for (int i = 0; i < kMaxSeats; ++i) {
+            if (((layer.opponent_seats >> i) & 1u) != 0 && view.seats[static_cast<std::size_t>(i)].status == SeatStatus::AllIn) {
+                e *= equity_vs_range(combos, *ranges[static_cast<std::size_t>(i)]).value();  // One all-in player here
+            }
+        }
+        fold_win += layer.amount * e;
+    }
+
+    double fold = 1.0, no_raise = 1.0, w = 0.0, we = 0.0, wm = 0.0, refund = 0.0, u = 0.0, raised = 0.0;
+    int deepest = view.current_bet;
+    for (int i = 0; i < kMaxSeats; ++i) {
+        const PublicSeat& s = view.seats[static_cast<std::size_t>(i)];
+        if (i == view.seat || s.status != SeatStatus::Active) continue;
+        const int total = s.street_bet + s.stack;
+        deepest = std::max(deepest, total);
+        const double match = std::max(0, std::min(eff, total) - s.street_bet);
+        const Response r = predict_postflop_response(*ranges[static_cast<std::size_t>(i)], strength, view.street, size,
+                                                     match / (pot + a + match), params, &hero_range);
+        fold *= 1.0 - r.call - r.raise;
+        no_raise *= 1.0 - r.raise;
+        const double ec = equity_vs_range(combos, r.call_range).value_or(0.0);
+        w += r.call;
+        we += r.call * ec;
+        wm += r.call * match;
+        refund += r.call * std::max(0, eff - total) * (1.0 - ec);  // What a short caller cannot match comes back
+        const double er = equity_vs_range(combos, r.raise_range).value_or(0.0);
+        const double r2 = std::min(std::max(static_cast<double>(eff), std::min({eff + pot + a + match,
+                                                                                 static_cast<double>(hero_total),
+                                                                                 static_cast<double>(total)})),
+                                   static_cast<double>(total));  // A short "raiser" only calls all in
+        u += r.raise;
+        raised += r.raise * std::max(-a, er * (pot + (r2 - me.street_bet) + (r2 - s.street_bet)) - (r2 - me.street_bet));
+    }
+    const double p_raise = 1.0 - no_raise;
+    const double p_call = 1.0 - fold - p_raise;
+    const double e_call = we / w;
+    const double m = wm / w;
+    double implied = 0.0;
+    if (view.street != Street::River) {
+        implied = std::min(std::max(0.0, e_call - 0.5) * std::max(0, std::min(hero_total, deepest) - eff) * 0.5,
+                           0.5 * (pot + a + m));
+    }
+    return fold * fold_win + p_call * (e_call * (pot + a + m) - a + refund / w + implied) +
+           (u > 0.0 ? p_raise * raised / u : 0.0);
+}
+
+// Three-way with a short stack: what folds leave beside a player already all in,
+// and what a villain too short to cover a shove can win from it.
+TEST(Advisor, RaiseEvsCountWhatShortStacksCanMatch) {
+    GameConfig config;
+    config.first_button = 0;
+    config.hero_seat = std::nullopt;
+    config.stacks = std::array<int, kMaxSeats>{2000, 2000, 300, 0, 0, 0};
+
+    // The big blind is all in for 300; the small blind bets 500 into 900 on the
+    // turn. If it folds to a raise, Hero pays the 500 call, plays the 900 main pot
+    // against the all-in range and gets the rest back.
+    {
+        GameEngine engine(config);
+        ScriptedDeal deal;
+        deal.holes[0] = hole("Jh", "Th");
+        deal.holes[1] = hole("Ac", "Kc");
+        deal.holes[2] = hole("5s", "5d");
+        deal.board = board_of("9h", "8c", "2h", "Kd", "3s");
+        engine.start_hand(deal);
+        ASSERT_TRUE(engine.apply_action({ActionType::Raise, 60}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::AllIn, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Bet, 500}));
+        const PlayerView view = engine.player_view(0);
+        const HintRecommendation hint = TrainingAdvisor(24, kRollouts).analyze(view);
+        ASSERT_TRUE(hint.raise_25_to.has_value());
+        EXPECT_NEAR(*hint.base_ev.raise_25, rebuilt_raise_ev(view, *hint.raise_25_to), 1e-6);
+        ASSERT_TRUE(hint.base_ev.all_in.has_value());
+        EXPECT_NEAR(*hint.base_ev.all_in, rebuilt_raise_ev(view, view.legal.max_raise_to), 1e-6);
+    }
+
+    // Three-way flop, checked to the button, with the big blind 240 behind: a shove
+    // risks only 240 against it, called or "raised".
+    {
+        GameEngine engine(config);
+        ScriptedDeal deal;
+        deal.holes[0] = hole("Ks", "Kd");
+        deal.holes[1] = hole("Ac", "Qc");
+        deal.holes[2] = hole("5s", "5d");
+        deal.board = board_of("Kh", "8c", "2h", "Jd", "3s");
+        engine.start_hand(deal);
+        ASSERT_TRUE(engine.apply_action({ActionType::Raise, 60}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        const PlayerView view = engine.player_view(0);
+        const HintRecommendation hint = TrainingAdvisor(25, kRollouts).analyze(view);
+        ASSERT_TRUE(hint.base_ev.all_in.has_value());
+        EXPECT_NEAR(*hint.base_ev.all_in, rebuilt_raise_ev(view, view.legal.max_raise_to), 1e-6);
+        ASSERT_TRUE(hint.raise_100_to.has_value());
+        EXPECT_NEAR(*hint.base_ev.raise_100, rebuilt_raise_ev(view, *hint.raise_100_to), 1e-6);
+    }
 }
 
 // A hand in every class, avoiding six_max's fixed board.
