@@ -46,12 +46,20 @@ Each stage is committed to `main` when its tests pass.
 11. **The flop sampler is "balanced":** one seeded shuffle of the 47 unseen cards, with turn i taking the next K river cards. Each card is a turn once and a river K times. Measured against independent per-turn shuffles, this halves the error (K=8: 0.39 pp rms vs 0.77 pp).
 12. **Multiway sampling redraws the whole deal** when two villains' sampled combos collide. Redrawing one villain at a time would bias the joint distribution. For example, villain 1 holding {AA, 72o} and villain 2 holding {AK} should give AA 20% of villain 1's hands; redrawing one villain at a time gives 33%. After 16,384 failed redraws it throws.
 13. **Preflop range equity reads the 169 × 169 class matrix,** so it ignores which suits hero's own cards block. The measured bias is about 0.02 pp.
+14. **Stage 5: the villains judge Hero's bets against Hero's range as it stands before the bet.** `predict_postflop_response` gets `infer_range_for(view, hero, Baseline, false)` as `bettor_range`, as the plan's batch instructions say. Narrowing it first by Hero's own bet (`bet_likelihood` against each villain, or `raise_likelihood` against the last aggressor when raising) was implemented and measured: 0.886 bb regret and 52% agreement, against 0.867 bb and 54% without it. It was dropped as slightly worse and more expensive; batch D may revisit it.
+15. **Stage 5: a called bet or raise assumes one caller and a pot-sized re-raise.** e_call, e_raise and the matched chips are weighted over the villains by their call or raise shares. The re-raise goes to to + (P + a + m_i), capped by both stacks, and Hero calls it or folds, whichever is better. When Hero is all in, the "raise" branch is a call.
+16. **Stage 5: preflop all-in only short, cheap, or as the only raise.** With ranges, the single-street model valued a 100 BB UTG open-shove with AA at 258 chips against 93 for a 3.5 BB open, because only the strong part of each range calls a shove and `implied` is capped at half a tiny preflop pot. Preflop, all-in is now advised only with an effective stack of at most 15 BB, within 1.5 pots, or as the only raise left; its `ev` is capped at the advice and `base_ev` keeps the model number. This matches CLAUDE.md section 11's size-rule limit, which had been applied only postflop.
+17. **Stage 5: impossible multiway deals fall back to independent villains.** When narrowed ranges can almost never be dealt together (seen in random play: two villains' ranges reduced to the same three JJ combos), `equity_vs_ranges` throws. The advisor then multiplies the heads-up equities instead of failing.
+18. **Stage 5: `TrainingAdvisor(seed, rollouts)` keeps working:** it sets `rollouts` and `range_rollouts = max(100, rollouts / 5 * 3)`, so 5,000 gives the default 3,000. The flop is exact, threads are automatic.
 
 ## Deviations from the spec or earlier statements
 
 - **What I said earlier:** in the conversation that led to the plan, I said "the GTO bot gets [range equity, exact equity, range-based fold equity] automatically".
 - **What changed:** that was reversed (decision 1). Section 4 of the spec fixes the GTO bot's method, and the bots also serve as fixed opponents for measuring the exploit advice.
 - **A correction to numbers given earlier:** during planning I quoted 8c8d on Ah9s4c as 65.6% against a random hand, and QhJh on Qd9s8h as 82.3%. Those came from only 4,000 Monte Carlo rollouts, about ±0.75 pp. Exact enumeration gives 63.95% and 82.80%, and 2 million rollouts agree. The comparison still holds: the underpair is about 47% against the BB's defend range and about 23% against the part of it that continues.
+
+- **Stage 5, `BetOutcome`:** its fields are percentages (0-100), like the other `_pct` fields of `HintRecommendation`, not the 0-1 shares the batch instructions described. It also has a fourth field, `equity_raised_pct`, because the raise branch of the EV can't be rebuilt or shown without it.
+- **Stage 5, preflop all-in rule:** decision 16 is new, a fix to a clear model bug rather than tuning.
 
 ## Measured results
 
@@ -305,6 +313,80 @@ The Stage 4 review found that value was judged only within the actor's own range
 - **Viewer card removal** moves equity by at most 1.5 pp in the reviewer's three spots (≤ 0.8 pp before).
 - **Speed:** `infer_ranges` on a river view, over two runs: p50 0.74–0.79 ms and p95 0.88–1.37 ms with 2 opponents; p50 1.11–1.18 ms and p95 1.28–1.82 ms with 5 (was p95 1.29). Every dealt player is now tracked and judged against the others.
 
+### Stage 5 batch A (Baseline advisor on ranges), uncommitted, on top of `f9d64e5`
+
+**The model** is documented in full in `training_advisor.h`. In short:
+- Fold is 0. Check is e_L × contestable. Call is e_L × (contestable + to_call) − to_call, where e_L is the layered range equity, each pot layer against its own villains' ranges.
+- A bet or raise of a chips is F·P·k + P_call·V_called + P_raise·V_raised, using each foldable villain's `predict_postflop_response` (or `predict_preflop_response`). The terms are in decision 15.
+- The chart prior, the cheap-call rule (inside `chart_response`), the size rule and its limits, and the `ev`/`base_ev` split are unchanged.
+- Removed: `bet_pressure`, the call floors, the exponents, the overbet term, the multiway averaging, and the unopened 15% model.
+
+**River bench** (`advisor_bench`, defaults, 2000 or more solver iterations), against the Stage 3 baseline:
+
+| Group | Stage 3 regret (BB) | Now (BB) | Stage 3 agree | Now agree |
+|---|---|---|---|---|
+| **Overall (36)** | **1.946** | **0.867** | **28%** | **54%** |
+| BTN vs BB | 0.939 | 0.324 | 27% | 59% |
+| CO vs BTN | 1.422 | 0.530 | 26% | 53% |
+| SB vs BTN 3-bet | 3.478 | 1.748 | 32% | 51% |
+| Dry | 1.68 | 0.700 | 30% | 50% |
+| Wet | 1.68 | 0.271 | 21% | 63% |
+| Paired | 2.26 | 1.197 | 33% | 54% |
+| Monotone | 2.17 | 1.300 | 30% | 50% |
+| OOP first to act | 0.966 | 0.450 | 24% | 40% |
+| IP facing 33% | 1.856 | 0.433 | 31% | 67% |
+| IP facing 75% | 3.016 | 1.719 | 30% | 55% |
+| Check-check line | 1.38 | 1.118 | | 54% |
+| Bet then check | 1.27 | 0.741 | | 49% |
+| Bet-bet | 3.18 | 0.744 | | 59% |
+
+- Overall regret is 0.45× the baseline (target ≤ 0.75×), and agreement is +26 pp (target +10 pp). Regret above 1 BB falls from 39% to 17% of hands, and regret as a share of the pot from 5.38% to 2.52%.
+- **Worst spots:** IP facing a 75% bet in the 3-bet pot. On monotone-xx regret is 5.9 BB and on paired-bx 4.9 BB, and on dry-xx it is 3.9 BB. The solver calls 83-92% there; the advisor folds 32-57% and raises 1-37%.
+  - The cause shows on dry-xx (Kc8h3d2s6c): AK, KQ, KJ, QQ, JJ, TT and 99 raise 75%, AQ and AJ fold, and the solver calls them all.
+  - The model predicts that a betting range facing a raise continues at about 0.95 × MDF of its own range. So JJ's raise wins about 46% of the time against a lead the bench's ranges make polarised, and AQ can't beat the price.
+  - This comes from the range model's response to raises and its few river bluffs (Stage 4 weakness 2), not from the advisor arithmetic. It is left to batch D's tuning.
+- **OOP first to act still bets too often:** 13% checks against the solver's 62% on btn_bb-dry-xx, and 44% against 90% on btn_bb-monotone-xx. Fold equity against MDF-based continues beats checking's plain e × pot.
+- **Per hand:** the advisor takes p50 2.25 ms and p95 3.23 ms per river decision on the bench (Stage 3: 0.35 / 0.40 ms).
+
+**Hint latency** (`Advisor.DISABLED_LatencyByStreet`, Release, default options, ms).
+- Random 6-max play with mostly checks and calls, so nearly every postflop spot is 3 or more ways.
+- Plus 300 heads-up spots checked to on each street.
+
+| Street | Automatic threads, p50 / p95 / max | 1 thread, p50 / p95 / max |
+|---|---|---|
+| Preflop (2014, mostly multiway) | 3.9 / 5.0 / 32 | 5.8 / 7.8 / 43 |
+| Flop, 3+ way (1774) | 6.8 / 13.0 / 25 | 11.4 / 29.2 / 61 |
+| Flop, heads-up (300) | 5.7 / 6.9 / 16 | 16.5 / 20.1 / 27 |
+| Turn, 3+ way (1588) | 5.6 / 8.8 / 46 | 6.6 / 12.1 / 119 |
+| Turn, heads-up | 2.1 / 2.5 / 4.3 | 2.1 / 2.9 / 11 |
+| River, 3+ way (1434) | 5.5 / 11.3 / 334 | 6.2 / 18.7 / 844 |
+| River, heads-up | 1.8 / 2.4 / 4.5 | 1.8 / 2.4 / 4.4 |
+
+- **Targets:** the multiway flop is well within 50 ms (worst case 25 ms automatic, 61 ms on 1 thread). Heads-up turn and river are within 10 ms. The multiway river p95 is 11.3 ms with automatic threads, just over 10 ms.
+- **Spikes:** the multiway maxima of 334 ms and 844 ms come from narrowed ranges that are nearly impossible to deal together, where `equity_vs_ranges` redraws thousands of times before succeeding or giving up (decision 17). They only appeared in random play's absurd lines, such as six-way min-raised 4-bet pots.
+- **Where the time goes** on turn and river (callgrind, 1 thread):
+  - 31% multiway Monte Carlo.
+  - 30% the two range walks (`infer_ranges` and `infer_range_for`); each walk recomputes `street_strength` on every street, which allocates inside `read_hand`.
+  - 20% random-hand equity.
+  - 13% the bet responses.
+  - Sharing one walk, or caching `street_strength`, would roughly halve the walk cost but needs a change in `src/range`.
+
+**`AdvisorSizing.EverySizeIsUsedAndAdviceStaysSane`** distribution over 1500 heads-up spots checked to:
+
+| Run | Bets | Advised 25 / 50 / 75 / 100% | Model alone 25 / 50 / 75 / 100% |
+|---|---|---|---|
+| Old advisor, 300 rollouts | 911 | 204 / 397 / 229 / 81 | 290 / 117 / 99 / 405 |
+| New, fast options {300, 500, 1, 1, false} | 883 | 245 / 341 / 216 / 81 | 281 / 205 / 135 / 262 |
+
+The model alone now spreads over sizes rather than piling on pot-sized bets. No bound was relaxed.
+
+**Test suite:** 424 tests pass in Release (420 + 4 new; one new disabled report). Release takes about 6 s and Debug about 24-25 s, against about 12 s before. The two loop tests account for most of it: `EverySizeIsUsedAndAdviceStaysSane` takes 2.3 s in Release and 17 s in Debug (0.1 s before), and `FieldsInRangeAndBestActionLegalAcrossRandomStates` 2.0 s and 10 s. The cost is the range walks and per-combo vectors, even with fast options. The GCC Release and Debug builds and the clang build have zero warnings, and `strict.sh` is clean on `training_advisor.cpp`, including its six earlier sign-conversion warnings.
+
+**Hand-checked numbers** (pot 200, 1900 behind):
+- **Royal flush on the river, checked to, betting 200:** F = 52.6%, raises 7.5%, calls 39.9%. A call wins 200 + 400 − 200 = 400. A pot-sized re-raise goes to 800 and Hero's call of it wins 200 + 1600 − 800 = 1000. EV = 0.526 × 200 + 0.399 × 400 + 0.075 × 1000 = 339.8, as listed.
+- **The same bet with 88 on Kd8s3c (a set):** 97.2% against the calls and 94.9% against the raises; EV 446.4 against 194.2 for checking.
+- **K9o facing 150 into 200 on the flop:** 74.4% against the estimated range and 85.9% against a random hand. The advice is to raise to 400.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -315,6 +397,9 @@ The Stage 4 review found that value was judged only within the actor's own range
 - Timings come only from this container.
 - Solver solves are single-threaded so far. The `threads` limit is validated but not yet used, so thread-count determinism has nothing to test until Stage 8.
 - Flop trees are built before the memory check runs. Stage 8 has to count nodes before building a flop tree.
+
+- Stage 5: the preflop all-in rule's 15 BB line was chosen to match the range model's short-stack threshold and Stage 6's push/fold range; it was not measured.
+- Stage 5: the 3+ way hint latencies come from random play, whose lines are not representative of real games.
 
 ## Test changes
 
@@ -329,3 +414,42 @@ The Stage 4 review found that value was judged only within the actor's own range
     - **Reason:** inference now judges value against the opponent. The BTN's own checked range holds too little air to calibrate, because as the flop aggressor it bluffed most of it.
   - `RangeModel.ThreeBetAndFourBetUseTheCharts`: a comment fix only (the viewer is the BTN, not the BB).
   - **New tests:** `CheckRaiseRangesAreStrong`, `CbetFrequenciesArePlausible`, `PredictedRaisesAreJudgedAgainstTheBettor`, `LimpCallKeepsASensibleRange`, `FallbackNeverRevivesPreflopFolds`, `WidthsOrderByTypeHeadsUpAndByPosition`, `ShortAllInIsNotANewRaiseLevel`. Each takes ≤ 0.015 s in Release.
+
+- **Stage 5 batch A** (`tests/training_advisor_test.cpp`):
+  - `Advisor.EvFormulasMatchTheDocumentedModelForCheckAndCall`:
+    - **Old:** check = `equity_pct` × 200; call = (`equity_pct` − 0.075) × 500 − 150.
+    - **New:** check = `range_equity_pct` × 200; call = `range_equity_pct` × 500 − 150.
+    - **Reason:** the EVs use range equity, and the advisor no longer applies `bet_pressure`.
+  - `Advisor.RaiseEvsMatchTheDocumentedModel`:
+    - **Old:** each rung and the all-in equal the MDF and floor formula with exponent fudges on `equity_pct`.
+    - **New:** each equals F·200 + P_call·(e_c·(200 + 2a) − a + implied) + P_raise·max(−a, e_r·(200 + 2·R2) − R2), with R2 = min(200 + 3a, 1900), rebuilt from `outcomes` (within 1e-9).
+    - **Also new:** some of the range folds to each size; the set has more than 50% against the calls; and the fold share grows from 25% to pot to all-in.
+    - **Reason:** the new model.
+  - `Advisor.RiverNutsRaiseEvsAreExact`:
+    - **Old:** all-in = 0.9 × 200 + 0.1 × 2100 (the 10% call floor); 75% = (1 − 1/1.75) × 200 + (1/1.75) × 350.
+    - **New:** `range_equity_pct` and both outcome equities are 100. All-in = F × 200 + (1 − F) × 2100. 75% = F × 200 + P_call × 350 + P_raise × 850 (a pot-sized re-raise to 650 called), with F and the shares from `outcomes`.
+    - **Reason:** fold and raise shares now come from the range model.
+  - `Advisor.CallEvCountsEachPotAgainstItsOwnOpponents`:
+    - **Old:** the BTN limps, the SB completes, the BB shoves 40, both call, the river bet is 1000. Expected = ((120·e₂ + 2000·e₁)/2120 − 0.15) × 2120 − 1000 with random-hand equities, and the advice is Fold.
+    - **New:** the BTN opens to 60, the SB calls, the BB calls all in for 40, the river bet is 1000. Expected = Σ layer amount × equity_vs_ranges(`infer_ranges`, that layer's villains, 200,000 rollouts) − 1000, within 5 chips. The test also checks the layers (120 chips 3-way, 2040 heads-up), that the heads-up layer has the higher equity (2.4% against 0.3%), and that the advice is still Fold.
+    - **Reason:** in the old line the Baseline SB's completing range is a 2% limp window, narrowed to about 2 combos by the river bet, all beating Q5o. Both layers were 0, so the test no longer checked the layering. The pressure term is gone.
+  - `Advisor.DoesNotShoveAirOrTopPairDeep`:
+    - **Old:** 54o checked to on Kd8s3c checks.
+    - **New:** it never shoves, and any bet is at most 50 (25% pot).
+    - **Reason:** against ranges, a 25% stab wins 43.5 against 36.9 for checking, from 24% folds (the Baseline continues 0.95 × MDF). That is the known fold-equity limit in CLAUDE.md section 12, not a shove. The other two assertions are unchanged and pass.
+  - `Advisor.FieldsInRangeAndBestActionLegalAcrossRandomStates`:
+    - **Old:** `TrainingAdvisor(12, 100)`.
+    - **New:** fast options {100, 500, 1, 1, false}, plus the outcome invariants (`expect_consistent_outcomes`): outcomes are listed for exactly the listed raise rows; fold + raise ≤ 100; equities are in [0, 100]; `range_equity_pct` is in [0, 100]; `versus` is empty.
+    - **Reason:** speed (an exact flop per state). No bound changed.
+  - `AdvisorSizing.EverySizeIsUsedAndAdviceStaysSane`:
+    - **Old:** `TrainingAdvisor(43, 300)`.
+    - **New:** {300, 500, 1, 1, false} plus the same outcome invariants. Every bound is unchanged (each rung used, none above 70%). The distribution is under Measured results.
+    - **Reason:** speed.
+  - **Unchanged and still green:** `DifferentDecisionsGetDifferentRollouts`, `AdvisorSizing.EachSizeIsRecommendedInItsSpot` (no spot needed replacing), the 169-class chart tests, `Mistakes.RealAdvisorFlagsFoldingAcesPreflop`, `Controller.PlayingEveryHintLogsNoMistakes` and `LoggerFiles.FullSessionProducesConsistentLogs`.
+  - **New tests:**
+    - `RangeEquityBelowRandomFacingRiverPotBet`: K4o check-calls the flop and turn and faces a pot-sized river bet. Random-hand equity is above 70%, range equity is at least 20 pp lower, and the rationale names both.
+    - `OutcomesAreConsistent`: checked to, facing a bet, first in preflop, and facing a covering all-in (no outcomes). Fold shares grow and equity when called shrinks with size.
+    - `OptionsAreValidated`: rejected options and the delegating constructor's values.
+    - `ThreadCountDoesNotChangeTheHint`: 1 and 3 threads on a multiway flop give bit-identical hints.
+    - `DISABLED_LatencyByStreet`: a report.
+    - Each new test takes ≤ 0.03 s in Release.
