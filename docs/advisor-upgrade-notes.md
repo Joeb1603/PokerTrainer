@@ -41,21 +41,72 @@ Each stage is committed to `main` when its tests pass.
    - Sorts break ties by combo index.
    - The bots already use `uniform_real_distribution`, and that is left alone.
 9. **Stale-result key:** the solver's key includes a `decision_epoch` owned by the controller, because `new_session()` restarts hand numbers.
+10. **Flop equity is exact in the advisor.** The plan proposed sampling the flop as 47 turn cards × 8 river cards. That turned out to be off by up to 1.6 pp on range equity and 5.9 pp on single combos (6 flops × 20 seeds). Exact enumeration of all 1,081 runouts takes about 22 ms on one thread and about 6 ms with automatic threading, which fits the budget, so the advisor uses it.
+    - `RangeEquityOptions::flop_rivers_per_turn` keeps the sampled mode (default 8) for cheap test loops. A value of 0, or 23 or more, means exact.
+11. **The flop sampler is "balanced":** one seeded shuffle of the 47 unseen cards, with turn i taking the next K river cards. Each card is a turn once and a river K times. Measured against independent per-turn shuffles, this halves the error (K=8: 0.39 pp rms vs 0.77 pp).
+12. **Multiway sampling redraws the whole deal** when two villains' sampled combos collide. Redrawing one villain at a time would bias the joint distribution. For example, villain 1 holding {AA, 72o} and villain 2 holding {AK} should give AA 20% of villain 1's hands; redrawing one villain at a time gives 33%. After 16,384 failed redraws it throws.
+13. **Preflop range equity reads the 169 × 169 class matrix,** so it ignores which suits hero's own cards block. The measured bias is about 0.02 pp.
 
 ## Deviations from the spec or earlier statements
 
 - **What I said earlier:** in the conversation that led to the plan, I said "the GTO bot gets [range equity, exact equity, range-based fold equity] automatically".
 - **What changed:** that was reversed (decision 1). Section 4 of the spec fixes the GTO bot's method, and the bots also serve as fixed opponents for measuring the exploit advice.
+- **A correction to numbers given earlier:** during planning I quoted 8c8d on Ah9s4c as 65.6% against a random hand, and QhJh on Qd9s8h as 82.3%. Those came from only 4,000 Monte Carlo rollouts, about ±0.75 pp. Exact enumeration gives 63.95% and 82.80%, and 2 million rollouts agree. The comparison still holds: the underpair is about 47% against the BB's defend range and about 23% against the part of it that continues.
 
 ## Measured results
 
-(Filled in per stage, each with its commit hash.)
+### Stage 1 (foundations), measured on the 4-core container
+
+**Preflop matrix** (commit `a22d13b`)
+- `tools/gen_preflop_tables` ran 200,000 rollouts per class pair across 14,365 entries, upper triangle plus diagonal, with seed 20261106. It took 196 s on 4 threads.
+- Standard error is at most 0.11 pp per entry.
+- Sample values:
+
+  | Matchup | Equity |
+  |---|---|
+  | AA vs KK | 81.97% |
+  | 22 vs AKo | 52.79% |
+  | QQ vs AKo | 56.62% |
+  | AKs vs 72o | 69.05% |
+  | KK vs AKs | 65.79% |
+  | JTs vs AKo | 40.51% |
+  | AKs vs AKs | 49.98% |
+
+- Runs with 1 thread and with 4 threads give byte-identical output.
+
+**Per-combo equity vector** (`hero_vs_each_combo`, Release, all 1,326 combos needed, 60 runs each)
+
+| Street | 1 thread, p50 / p95 | Automatic threading, p50 / p95 |
+|---|---|---|
+| River | 0.03 / 0.04 ms | (same) |
+| Turn | 0.87 / ~1.1 ms | (same); 4 threads 0.44 / 0.55 ms |
+| Flop, exact | 21-22 / 23-27 ms | 5.6-5.9 / 6.2-7.3 ms |
+| Flop, K=8 | 8.1-8.4 / 9.6-11.5 ms | 2.3-2.6 / 2.6-2.8 ms |
+| Preflop (matrix) | 0.04 / 0.06 ms | |
+
+The machine was noisy: runs differed by up to about 20% at p95.
+
+**Multiway Monte Carlo:** 3 players, 3,000 rollouts, 2 pot layers, 0.7-0.9 / 0.8-1.1 ms on 1 thread.
+
+**Flop sampling error against exact,** over 6 flops × 20 seeds:
+
+| K | Uniform range, rms / worst | BB defend range, worst | Single combo, rms / worst |
+|---|---|---|---|
+| 4 | 0.63 / 2.63 pp | 3.20 pp | 1.39 / 8.1 pp |
+| 8 | 0.39 / 1.25 pp | 1.62 pp | 0.88 / 5.86 pp |
+| 12 | 0.24 / 0.82 pp | 1.02 pp | 0.59 / 3.96 pp |
+| 16 | 0.16 / 0.62 pp | 0.66 pp | 0.39 / 2.41 pp |
+
+**Tests:** 371 pass in Release (about 4 s wall time) and Debug (about 11 s). The GCC and clang builds have zero warnings, and the strict clang check is clean on new files.
 
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
 - Windows memory detection for solver tiers (`GlobalMemoryStatusEx`).
 - Real GLFW mouse and keyboard input, which the spec's existing known limit already covers.
+- The combo tables (`combos.cpp`) are built at run time behind a function-local static rather than with `constexpr`, to stay clear of MSVC's constexpr step limit. Whether MSVC would actually hit that limit wasn't tested.
+- The multiway redraw cap (16,384) and the flop threading threshold (64 needed combos) were chosen, not tuned.
+- Timings come only from this container.
 
 ## Test changes
 

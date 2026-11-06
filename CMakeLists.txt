@@ -74,6 +74,7 @@ add_library(poker_core STATIC
     src/logging/hand_logger.cpp
     src/range/combos.cpp
     src/range/generated/preflop_equity_data.cpp
+    src/range/hand_vs_range.cpp
     src/range/preflop_matrix.cpp
     src/range/weighted_range.cpp
     src/strategy/preflop_charts.cpp
