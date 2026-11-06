@@ -227,7 +227,7 @@
     },
     {
       "id": "co_btn-dry-bx",
-      "description": "CO opens 2.5bb, BTN calls (BTN in position); dry board, flop bet-call, turn checked; hero IP facing a 75% bet. CO c-bet small, checked the turn and bets big on the river queen: top pair top kicker, two pair and sets against K-high and missed gutshots. BTN called with aces and pairs and checked back.",
+      "description": "CO opens 2.5bb, BTN calls (BTN in position); dry board, flop bet-call, turn checked; hero IP facing a 75% bet. CO c-bet small, checked the turn and bets big on the river queen: top pair top kicker, two pair and sets against K-high, missed gutshots and pairs of fives (54s, K5s) turned into bluffs. BTN called with aces and pairs and checked back.",
       "pot_type": "co_btn",
       "family": "dry",
       "line": "bx",
@@ -601,7 +601,7 @@
     },
     {
       "id": "sb_btn_3bet-monotone-bb",
-      "description": "BTN opens 2.5bb, SB 3-bets to 9bb, BTN calls (3-bet pot); monotone board, flop and turn bet-call; hero IP facing a 33% bet. SB barrelled twice on a monotone board and blocks small with top pair and weak flushes; BTN called with Kx, flushes and the nut-flush draw.",
+      "description": "BTN opens 2.5bb, SB 3-bets to 9bb, BTN calls (3-bet pot); monotone board, flop and turn bet-call; hero IP facing a 33% bet. SB barrelled twice on a monotone board and blocks small with top pair and flushes, nut flushes (Ad8d, Ad4d-Ad2d) among them; BTN called with Kx, flushes and the nut-flush draw.",
       "pot_type": "sb_btn_3bet",
       "family": "monotone",
       "line": "bb",

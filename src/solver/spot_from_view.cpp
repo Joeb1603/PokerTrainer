@@ -57,15 +57,21 @@ SolveSpot spot_from_view(const PlayerView& view, const WeightedRange& hero_range
     SolveSpot spot;
     spot.board = view.board;
 
+    std::array<int, 2> bet{};    // Street bets as the table has them
     std::array<int, 2> reach{};  // Street bet plus stack: the most each can have in this street
     for (std::size_t p = 0; p < 2; ++p) {
         const PublicSeat& player = view.seats[static_cast<std::size_t>(heads_up.players[p])];
-        spot.street_bet[p] = player.street_bet;
+        bet[p] = player.street_bet;
         reach[p] = player.street_bet + player.stack;
     }
+    // A street bet beyond what the other player can reach is never called: the
+    // engine returns the excess, so it is neither pot nor street bet here.
+    const int cap = std::min(reach[0], reach[1]);
+    const int uncalled = std::max(0, std::max(bet[0], bet[1]) - cap);
+    for (std::size_t p = 0; p < 2; ++p) spot.street_bet[p] = std::min(bet[p], cap);
     const int larger_bet = std::max(spot.street_bet[0], spot.street_bet[1]);
-    spot.pot = view.total_pot - spot.street_bet[0] - spot.street_bet[1];
-    spot.effective_stack = std::max(0, std::min(reach[0], reach[1]) - larger_bet);
+    spot.pot = view.total_pot - uncalled - spot.street_bet[0] - spot.street_bet[1];
+    spot.effective_stack = std::max(0, cap - larger_bet);
     spot.to_act = heads_up.viewer;
     spot.last_raise = view.last_raise_size;
     spot.raises_made = static_cast<int>(std::count_if(view.actions.begin(), view.actions.end(), [&](const ActionRecord& a) {

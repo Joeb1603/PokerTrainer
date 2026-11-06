@@ -89,7 +89,7 @@ r("co_btn", "dry", "xx",
 r("co_btn", "dry", "bx",
   "AKs, AKo, AQs, AQo, A5s:0.8, A3s:0.8, A8s, 88:0.8, 33:0.8, 55:0.6, QQ:0.8, KQs:0.3, AJs:0.3, AJo:0.3, KJs:0.5, KTs:0.5, K9s:0.5, K7s-K5s:0.4, JTs:0.4, J9s:0.4, T9s:0.4, 97s:0.4, 76s:0.4, 54s:0.5, 75s:0.3",
   "AJs:0.7, ATs:0.7, A9s:0.7, A8s:0.2, AJo:0.7, TT-99:0.7, 77-66:0.5, 44:0.4, 33:0.2, 88:0.2, 55:0.2, 22:0.3, 98s:0.6, 87s:0.6, QJs:0.2, QTs:0.2, JTs:0.2, J9s:0.2, T9s:0.2, KQo:0.2, KTs:0.2, 65s:0.2, 76s:0.2",
-  "CO c-bet small, checked the turn and bets big on the river queen: top pair top kicker, two pair and sets against K-high and missed gutshots. BTN called with aces and pairs and checked back.")
+  "CO c-bet small, checked the turn and bets big on the river queen: top pair top kicker, two pair and sets against K-high, missed gutshots and pairs of fives (54s, K5s) turned into bluffs. BTN called with aces and pairs and checked back.")
 r("co_btn", "dry", "bb",
   "AKs, AKo, AQs, AQo, AJs, AJo:0.8, ATs:0.8, ATo:0.6, A9s:0.6, A9o:0.4, A8s, A8o:0.5, A7s-A6s:0.4, A5s, A4s:0.6, A3s, A2s:0.6, 88, 33, 55:0.7, 76s:0.8, 75s:0.6, 65s:0.6, 54s:0.7, KQs:0.4, KQo:0.3, KJs:0.4, KTs:0.4, K9s:0.3, QJs:0.3, JTs:0.3, T9s:0.3",
   "AJs, ATs:0.9, A9s:0.7, A8s:0.6, AJo:0.9, 88:0.6, 33:0.6, 55:0.6, 44:0.4, TT:0.3, 99:0.3, 76s:0.6, 65s:0.4, QJs:0.1, KQo:0.1",
@@ -179,7 +179,7 @@ r("sb_btn_3bet", "monotone", "bx",
 r("sb_btn_3bet", "monotone", "bb",
   "AKs:0.6, AKo:0.6, KQs:0.6, KJs:0.5, KTs:0.4, AA:0.5, KK:0.3, 99:0.3, AQo@d:0.2, A8s@d:0.4, A4s-A2s@d:0.4, QTs@d:0.5, JTs@d:0.5",
   "KQs:0.8, KQo:0.4, KJs:0.8, KTs:0.56, AKs:0.15, AKo:0.15, 99:0.5, 77:0.2, QQ:0.1, A9s:0.15, T9s:0.2, AQs@d, AJs@d, ATs@d, QJs@d, QTs@d:0.5, JTs@d, AQo@d:0.6, AJo@d:0.25",
-  "SB barrelled twice on a monotone board and blocks small with top pair and weak flushes; BTN called with Kx, flushes and the nut-flush draw.")
+  "SB barrelled twice on a monotone board and blocks small with top pair and flushes, nut flushes (Ad8d, Ad4d-Ad2d) among them; BTN called with Kx, flushes and the nut-flush draw.")
 
 def role_of(pot_i, fam_i, line_i):
     return ROLES[(fam_i + line_i + pot_i) % 3]

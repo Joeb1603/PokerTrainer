@@ -10,6 +10,7 @@
 #include "engine/game_engine.h"
 #include "range/combos.h"
 #include "range/weighted_range.h"
+#include "solver/betting_tree.h"
 #include "solver/postflop_solver.h"
 #include "solver/spot_from_view.h"
 
@@ -153,6 +154,71 @@ TEST(SpotFromView, SixMaxOrderAndDeadStreetChips) {
     EXPECT_EQ(spot.effective_stack, 2000 - 50 - 160);
     EXPECT_EQ(spot.raises_made, 1);
     EXPECT_EQ(spot.last_raise, 120);
+}
+
+// Uneven stacks: the button overbets 1500 into a big blind with 800 behind. The
+// 700 the big blind can't reach is uncalled, so it is in neither the pot nor the
+// button's street bet, and the big blind can only call all in or fold.
+TEST(SpotFromView, ShortStackFacingOverbetCapsTheUncalledExcess) {
+    GameConfig config;
+    config.first_button = 0;
+    config.hero_seat = std::nullopt;
+    config.stacks = std::array<int, kMaxSeats>{3000, 860, 0, 0, 0, 0};
+    GameEngine engine(config);
+    std::array<std::optional<std::array<Card, 2>>, kMaxSeats> named{};
+    engine.start_hand(deal_of(named, board_of("Qs", "9h", "4c", "2d", "Jc"), {0, 1}));
+    ASSERT_TRUE(engine.apply_action({ActionType::Raise, 60}));
+    ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));
+    ASSERT_EQ(engine.state().street, Street::Flop);
+    ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+    ASSERT_TRUE(engine.apply_action({ActionType::Bet, 1500}));
+    ASSERT_EQ(engine.state().to_act, 1);
+    const PlayerView view = engine.player_view(1);
+    ASSERT_EQ(view.seats[1].stack, 800);
+    ASSERT_EQ(view.seats[0].street_bet, 1500);
+    ASSERT_EQ(view.total_pot, 120 + 1500);
+
+    const SolveSpot spot = spot_from_view(view, wide(), wide());
+    EXPECT_EQ(spot.to_act, 0);
+    EXPECT_EQ(spot.street_bet, (std::array<int, 2>{0, 800}));
+    EXPECT_EQ(spot.pot, 120);
+    EXPECT_EQ(spot.effective_stack, 0);
+    EXPECT_EQ(spot.total_pot(), view.total_pot - 700);
+    const BettingTree tree = build_betting_tree(spot, river_default_abstraction());
+    const auto actions = tree.actions_of(0);
+    ASSERT_EQ(actions.size(), 2u);
+    EXPECT_EQ(actions[0].type, ActionType::Fold);
+    EXPECT_EQ(actions[1].type, ActionType::Call);
+}
+
+// The mirror case, where the player to act has the larger street bet and the other
+// is all in for less, can't arise heads-up through the engine (an all-in for less
+// than a bet only calls and closes the action), so this view is edited by hand:
+// hero bet 500, the villain is all in for 300 and hero is to act.
+TEST(SpotFromView, OpponentAllInForLessThanHeroBetDropsTheExcess) {
+    GameConfig config;
+    config.first_button = 0;
+    config.hero_seat = std::nullopt;
+    config.stacks = std::array<int, kMaxSeats>{2000, 2000, 0, 0, 0, 0};
+    GameEngine engine(config);
+    std::array<std::optional<std::array<Card, 2>>, kMaxSeats> named{};
+    engine.start_hand(deal_of(named, board_of("Qs", "9h", "4c", "2d", "Jc"), {0, 1}));
+    ASSERT_TRUE(engine.apply_action({ActionType::Raise, 60}));
+    ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));
+    ASSERT_EQ(engine.state().to_act, 1);
+    PlayerView view = engine.player_view(1);
+    view.seats[1].street_bet = 500;  // Hero, OOP
+    view.seats[1].stack = 1440;
+    view.seats[0].street_bet = 300;  // Villain, all in
+    view.seats[0].stack = 0;
+    view.seats[0].status = SeatStatus::AllIn;
+    view.total_pot = 120 + 500 + 300;
+
+    const SolveSpot spot = spot_from_view(view, wide(), wide());
+    EXPECT_EQ(spot.street_bet, (std::array<int, 2>{300, 300}));
+    EXPECT_EQ(spot.pot, 120);
+    EXPECT_EQ(spot.effective_stack, 0);
+    EXPECT_EQ(spot.total_pot(), 120 + 600);
 }
 
 TEST(SpotFromView, RejectsPreflop) {

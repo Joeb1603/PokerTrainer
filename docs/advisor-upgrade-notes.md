@@ -175,33 +175,43 @@ At SPR 3.3, exploitability is 0.051% of pot after 300 iterations.
   - × 3 lines: check-check, bet then check, bet-bet.
   - Hero is either first to act out of position, or in position facing a 33% or 75% bet.
 - The ranges are hand-written assumptions, not solved. Each bettor's share of air was checked to be plausible: 27-41% for 75% bets and 4-20% for 33% bets.
-- Every spot is solved to ≤ 0.3% of pot exploitability, with at least 200 iterations.
+- Every spot is solved to ≤ 0.3% of pot exploitability, with at least 2000 iterations. It was 200 at first; the Stage 3 review showed that off-path `ev_best` values hadn't converged at 200, with single combos moving by up to 2.9 BB.
 - **Hero combos:** up to 80 per spot, sampled evenly across river hand strength.
 - **Regret:** the best `ev_best` minus the `ev_best` of the advisor's action, in BB. `ev_best` is the best-continuation EV.
 - **Size mapping:** the solver tree uses `all_in_merge = 1.0`, so every advisor size maps exactly.
 - **Cost:** a full run takes 2.1 s, of which 1.0 s is solving. The advisor takes p50 0.35 ms and p95 0.40 ms per river decision.
 
-**Baseline: the current random-hand advisor, measured at `dd9e9ed` plus the bench**
+**Baseline: the current random-hand advisor, at 2000 or more solver iterations**
+
+At 200 iterations the first measurement had been 1.992 BB overall regret and 28% agreement.
 
 | Group | Regret (BB) | % of pot | Regret > 0.5 BB | Regret > 1 BB | Agrees with solver's top action | Solver's frequency for advised action | Advised action used < 10% |
 |---|---|---|---|---|---|---|---|
-| **Overall (36)** | **1.992** | 5.60 | 50% | 40% | 28% | 28% | 66% |
-| BTN vs BB | 1.009 | 4.79 | 46% | 32% | 26% | 25% | 67% |
-| CO vs BTN | 1.439 | 5.85 | 50% | 40% | 26% | 26% | 68% |
-| SB vs BTN 3-bet | 3.527 | 6.16 | 53% | 48% | 33% | 32% | 62% |
-| Dry / wet / paired / monotone | 1.76 / 1.78 / 2.28 / 2.15 | | | | 30 / 20 / 32 / 30% | | |
-| OOP first to act | 1.046 | 3.97 | 42% | 29% | 23% | 22% | 68% |
-| IP facing 33% | 1.905 | 5.68 | 45% | 36% | 32% | 31% | 61% |
-| IP facing 75% | 3.024 | 7.16 | 62% | 55% | 30% | 30% | 68% |
+| **Overall (36)** | **1.946** | 5.38 | 47% | 39% | 28% | 28% | 69% |
+| BTN vs BB | 0.939 | 4.38 | 41% | 28% | 27% | 26% | 70% |
+| CO vs BTN | 1.422 | 5.73 | 49% | 40% | 26% | 27% | 71% |
+| SB vs BTN 3-bet | 3.478 | 6.04 | 52% | 48% | 32% | 31% | 65% |
+| Dry / wet / paired / monotone | 1.68 / 1.68 / 2.26 / 2.17 | | | | 30 / 21 / 33 / 30% | | |
+| OOP first to act | 0.966 | 3.59 | 38% | 25% | 24% | 23% | 71% |
+| IP facing 33% | 1.856 | 5.41 | 43% | 35% | 31% | 31% | 65% |
+| IP facing 75% | 3.016 | 7.15 | 61% | 55% | 30% | 30% | 69% |
 
-By line, regret is 1.41 BB for check-check, 1.33 for bet then check, and 3.24 for bet-bet.
+By line, regret is 1.38 BB for check-check, 1.27 for bet then check, and 3.18 for bet-bet. A full run takes 10.4 s, of which 9.4 s is solving.
+
+**Stability:** `--stability` re-solves each spot at 4000 iterations. The mean change in a combo's regret is 0.011 BB, overall regret moves by 0.002 BB, and the largest move for one spot is 0.028 BB.
 
 **Patterns, consistent with random-hand equity overrating hands on the river**
 - **It bets too often when first to act, and too big.** On one monotone board the solver checks 92% and the advisor bets 84%.
 - **It raises with bluff-catchers when facing bets.** On a paired board in the 3-bet pot it raises 67% where the solver raises 2%, and QQ raises for −7.2 BB where calling is worth +8.8 BB. On one wet bet-bet line it shoves every hand where the solver folds 49%.
 - **It rarely folds.** One spot has the solver folding 73% and the advisor 21%.
 - **Agreeing is nearly free:** when the advisor matches the solver's top action, its mean regret is 0.002 BB. That supports measuring regret on `ev_best`.
-- **The plan's acceptance target for Stage 5:** mean regret ≤ 1.49 BB (0.75 × the baseline), and agreement ≥ 38%.
+- **The plan's acceptance target for Stage 5:** mean regret ≤ 1.46 BB (0.75 × 1.946), and agreement ≥ 38%.
+
+**Stage 3 review fixes**
+- `advisor_bench` now uses at least 2000 solver iterations, and exits with status 3 if any advisor action maps inexactly to a solver action.
+- `spot_from_view` caps both street bets at what the shorter player can reach and drops the uncalled excess. This was latent: every bench stack is 2000, but uneven stacks in the trainer would have solved the wrong spot.
+- A comment notes that `raises_made` counts short all-in raises.
+- Two spot notes were corrected; the numbers didn't change.
 
 ### Stage 4 (range model and player types)
 
@@ -244,7 +254,7 @@ On K72r, BTN vs BB, after a flop c-bet is called and the turn is checked, the vi
 - **8c8d on Ah9s4c:** 51.8% against the Baseline BB defend range (with traps), and 43.1% after the BB check-calls a third-pot bet.
 
 **Known weaknesses, left for Stage 5 tuning and logged**
-1. **Raise share was flat** at `raise_share` for every bet size; 10% raises facing a 125% river bet is too many. Being fixed now (see the Stage 4 follow-up below).
+1. **Raise share was flat** at `raise_share` for every bet size. **Fixed:** the cap is now `raise_share` × clamp(1.5/(1+s), 0.4, 1.25), so it is ×1.13 at 33% pot and ×0.67 at 125%. Both inference and prediction use it. On K72r the Baseline now raises 11 / 9 / 7% against bets of 33 / 75 / 125% of the pot, and the Maniac 27 / 21 / 17%.
 2. **Few pure bluffs after three barrels:** only 11% of the Baseline's river betting range is no-pair air. The model's bluffs are the bottom of its own betting range, which by the river is mostly weak pairs.
 3. **The Station keeps 46% air after calling two barrels,** because the 0.95 continue cap lets it call almost anything at small sizes. That is roughly what a station does, but it's extreme.
 4. **The Maniac bets almost its whole range at 33%,** because its value threshold, 0.72, overlaps the air region.

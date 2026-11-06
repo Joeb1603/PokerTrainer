@@ -3,7 +3,7 @@
 //
 //   advisor_bench [--spots PATH] [--iterations N] [--min-iterations N] [--target PCT]
 //                 [--combos N] [--advisor-rollouts N] [--seed S] [--timing] [--only ID]
-//                 [--csv PATH]
+//                 [--csv PATH] [--stability]
 //
 // For each spot: replay the script through GameEngine, solve the river from the
 // spot's assumed ranges, then ask the advisor about a sample of hero combos and
@@ -16,6 +16,15 @@
 //   freq    = the solver's frequency for the advisor's action
 // Each spot's figures are weighted by the sampled combos' root share (renormalised);
 // the group tables average spots with equal weight.
+//
+// Exit status: 0 on success, 1 on a spot error, 2 on a usage or file error, and 3
+// when any advisor action mapped inexactly to a root action (the tables still
+// print, with the count in the "inexact maps" column).
+//
+// --stability continues each solve to twice the iterations it used and reports how
+// much the sampled combos' regrets move: a check that ev_best has converged off
+// the solver's own path. (The solver is deterministic, so continuing a solve is the
+// same as re-solving at twice the iterations.)
 
 #include <algorithm>
 #include <array>
@@ -52,28 +61,32 @@ constexpr int kCheckEvery = 25;  // Iterations between exploitability checks
 constexpr std::string_view kUsage =
     "Usage: advisor_bench [--spots PATH] [--iterations N] [--min-iterations N] [--target PCT]\n"
     "                     [--combos N] [--advisor-rollouts N] [--seed S] [--timing] [--only ID]\n"
-    "                     [--csv PATH]\n"
+    "                     [--csv PATH] [--stability]\n"
     "  --spots             spot file (default tools/bench/river_spots.json)\n"
     "  --iterations        solver iteration cap per spot (default 3000)\n"
-    "  --min-iterations    iterations before the target may stop a solve (default 200), so\n"
-    "                      frequencies have settled even where exploitability falls fast\n"
+    "  --min-iterations    iterations before the target may stop a solve (default 2000, at\n"
+    "                      most --iterations), so off-path ev_best values have converged\n"
+    "                      even where exploitability falls fast\n"
     "  --target            stop once exploitability is at most PCT % of pot (default 0.3)\n"
     "  --combos            hero combos sampled per spot (default 80)\n"
     "  --advisor-rollouts  advisor Monte Carlo rollouts (default 5000)\n"
     "  --seed              advisor seed (default 0)\n"
     "  --timing            report advisor milliseconds per decision\n"
     "  --only              run one spot by id\n"
-    "  --csv               write one row per sampled combo\n";
+    "  --csv               write one row per sampled combo\n"
+    "  --stability         re-solve each spot at twice its iterations and report the change\n"
+    "                      in per-combo regret\n";
 
 struct Options {
     std::string spots = "tools/bench/river_spots.json";
     int iterations = 3000;
-    int min_iterations = 200;
+    int min_iterations = 2000;
     double target = 0.3;
     int combos = 80;
     int rollouts = kDefaultRollouts;
     std::uint64_t seed = 0;
     bool timing = false;
+    bool stability = false;
     std::optional<std::string> only;
     std::optional<std::string> csv;
 };
@@ -97,6 +110,10 @@ Options parse_options(int argc, char** argv) {
         const std::string_view arg = argv[i];
         if (arg == "--timing") {
             options.timing = true;
+            continue;
+        }
+        if (arg == "--stability") {
+            options.stability = true;
             continue;
         }
         if (arg == "--help" || arg == "-h") {
@@ -129,6 +146,7 @@ Options parse_options(int argc, char** argv) {
             usage_error("unknown flag: " + std::string(arg));
         }
     }
+    options.min_iterations = std::min(options.min_iterations, options.iterations);
     return options;
 }
 
@@ -234,6 +252,11 @@ struct SpotResult {
     std::vector<double> advisor_mix;  // Share-weighted advisor choices
     std::vector<ComboResult> combos;
     SpotMetrics metrics;
+    // --stability: at twice the iterations, the share-weighted mean |change| in the
+    // sampled combos' regret, and the change in the spot's mean regret (bb)
+    int stability_iterations = 0;
+    double stability_abs_change = 0.0;
+    double stability_mean_change = 0.0;
 };
 
 // Up to `count` hands spread evenly over the root player's hands sorted by river
@@ -344,6 +367,23 @@ SpotResult run_spot(const bench::BenchFile& file, const bench::BenchSpot& spot, 
         m.freq += row.share * row.freq;
         m.rare += row.freq < 0.10 ? row.share : 0.0;
         result.combos.push_back(row);
+    }
+
+    if (options.stability) {
+        result.stability_iterations = 2 * result.iterations;
+        solver.run(result.stability_iterations - solver.iterations());
+        const RootSolution again = solver.root();
+        double regret = 0.0;
+        for (std::size_t i = 0; i < sample.size(); ++i) {
+            const std::size_t h = sample[i];
+            const ComboResult& row = result.combos[i];
+            double best_ev = again.ev_best[0][h];
+            for (std::size_t a = 1; a < actions; ++a) best_ev = std::max(best_ev, static_cast<double>(again.ev_best[a][h]));
+            const double regret_bb = std::max(0.0, best_ev - again.ev_best[row.advisor][h]) / bb;
+            result.stability_abs_change += row.share * std::abs(regret_bb - row.regret_bb);
+            regret += row.share * regret_bb;
+        }
+        result.stability_mean_change = regret - result.metrics.regret;
     }
     return result;
 }
@@ -474,6 +514,24 @@ int main(int argc, char** argv) {
     }
     std::cout << "\nSolver time " << fixed(solve_ms / 1000.0, 1) << " s over " << results.size() << " spots; "
               << (all_converged ? "every spot reached the target.\n" : "SOME SPOTS MISSED THE TARGET.\n");
+    if (options.stability) {
+        std::cout << "\n### Stability (re-solved at twice the iterations)\n\n"
+                  << "| spot | iters | mean abs combo regret change bb | spot regret change bb |\n|---|---|---|---|\n";
+        double abs_sum = 0.0;
+        double mean_sum = 0.0;
+        double max_abs = 0.0;
+        for (const SpotResult& r : results) {
+            std::cout << "| " << r.spot->id << " | " << r.stability_iterations << " | " << fixed(r.stability_abs_change, 4)
+                      << " | " << fixed(r.stability_mean_change, 4) << " |\n";
+            abs_sum += r.stability_abs_change;
+            mean_sum += r.stability_mean_change;
+            max_abs = std::max(max_abs, std::abs(r.stability_mean_change));
+        }
+        const double n = static_cast<double>(results.size());
+        std::cout << "\nStability over " << results.size() << " spots: mean abs combo regret change "
+                  << fixed(abs_sum / n, 4) << " bb; overall regret change " << fixed(mean_sum / n, 4)
+                  << " bb; largest spot change " << fixed(max_abs, 4) << " bb.\n";
+    }
     if (options.timing) {
         std::cout << "Advisor ms per decision: p50 " << fixed(percentile(millis, 0.5), 2) << ", p95 "
                   << fixed(percentile(millis, 0.95), 2) << " over " << millis.size() << " decisions.\n";
@@ -499,5 +557,14 @@ int main(int argc, char** argv) {
     }
     const double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     std::cout << "Total runtime " << fixed(total, 1) << " s.\n";
+
+    int inexact = 0;
+    for (const SpotResult& r : results) inexact += r.inexact;
+    if (inexact > 0) {
+        std::cout << "\nWARNING: " << inexact << " advisor action(s) mapped inexactly to a root action; regret for"
+                  << " those combos is measured on the nearest root size. See the \"inexact maps\" column.\n";
+        std::cerr << "advisor_bench: WARNING: " << inexact << " inexact advisor action map(s)\n";
+        return 3;
+    }
     return 0;
 }

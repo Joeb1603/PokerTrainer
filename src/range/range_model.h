@@ -116,13 +116,17 @@ namespace poker {
 //   pairs_and_draws_continue (Station): max(p_c, pairs_and_draws_prob) for a
 //        hand holding a pair (read_hand's holds_pair) or any draw
 //
-// Raise facing a bet (any size; the raise likelihood ignores both sizes):
+// Raise facing a bet of size s (the raise's own size is ignored):
 //   p_rv = sigma((value_bet_top / 2 - t) / w) * (1 - sp)
 //   y    = draw_bet / 2 for a strong draw, 0.1 * bluff_mult for air, else 0
 //   q    = p_rv + (1 - p_rv) * min(1, y)
-//   P_raise = k * q with k = min(1, raise_share / Q), Q = the range's mean q:
-//        raise_share caps the share of the range that raises, scaling every
-//        combo alike so the shape holds.
+//   R    = raise_share * clamp(1.5 / (1 + s), 0.4, 1.25)   (raise_share_scale)
+//   P_raise = k * q with k = min(1, R / Q), Q = the range's mean q: R caps the
+//        share of the range that raises, scaling every combo alike so the shape
+//        holds. The cap is raise_share at half pot and falls as the bet grows:
+//        x1.13 at 0.33 pot, x0.86 at 0.75, x0.67 at 1.25, x0.5 at 2 pots, and
+//        never below x0.4. The inference likelihood and the predicted response
+//        use the same cap for the same faced size.
 //
 // Bluff raises come out of the continue budget: with F = the range's mean of
 // (1 - p_c) * P_raise, the hands that would fold but raise, p_c is recomputed
@@ -167,7 +171,7 @@ struct ArchetypeParams {
     double continue_floor = 0.10;  // ... at least this, at most 0.95
     bool pairs_and_draws_continue = false;
     double pairs_and_draws_prob = 0.9;
-    double raise_share = 0.10;     // Most of a range that raises a bet
+    double raise_share = 0.10;     // Most of a range that raises a half-pot bet (see raise_share_scale)
     double value_bet_top = 0.33;   // Top share of a range that bets for value at 0.5-0.8 pot
     double bluff_mult = 1.0;       // Air : value = bluff_mult * s / (1 + s)
     double draw_bet = 0.5;         // Strong draws bet this often
@@ -248,8 +252,14 @@ WeightedRange check_likelihood(const WeightedRange& range, const StreetStrength&
 // Facing a bet of `size_pots` at `pot_odds` (call / (pot + call)).
 WeightedRange call_likelihood(const WeightedRange& range, const StreetStrength& strength, Street street,
                               double size_pots, double pot_odds, const ArchetypeParams& params);
-WeightedRange raise_likelihood(const WeightedRange& range, const StreetStrength& strength,
+// A raise of a bet of `size_pots`: the size sets the raise share cap.
+WeightedRange raise_likelihood(const WeightedRange& range, const StreetStrength& strength, double size_pots,
                                const ArchetypeParams& params);
+
+// The factor on raise_share for a faced bet of `size_pots` (a fraction of the pot
+// after calling): clamp(1.5 / (1 + size_pots), 0.4, 1.25). A non-finite or
+// negative size counts as 0.
+double raise_share_scale(double size_pots);
 
 // A range's answer to a bet or raise: shares by mass (summing to 1 for a range
 // with live weight; an empty range folds), and the ranges that call and raise.

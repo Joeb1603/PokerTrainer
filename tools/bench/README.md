@@ -15,11 +15,19 @@ From the repository root, after a Release build:
 ```
 advisor_bench [--spots PATH] [--iterations N] [--min-iterations N] [--target PCT]
               [--combos N] [--advisor-rollouts N] [--seed S] [--timing] [--only ID]
-              [--csv PATH]
+              [--csv PATH] [--stability]
 ```
 
-Defaults: `--iterations 3000`, `--min-iterations 200`, `--target 0.3` (% of pot),
-`--combos 80`, `--advisor-rollouts 5000`, `--seed 0`.
+Defaults: `--iterations 3000`, `--min-iterations 2000` (capped at `--iterations`),
+`--target 0.3` (% of pot), `--combos 80`, `--advisor-rollouts 5000`, `--seed 0`.
+At 200 minimum iterations the off-path `ev_best` values had not converged (single
+combos moved up to 2.9 bb by 2000). `--stability` continues each solve to twice its
+iterations and reports the mean absolute change in per-combo regret and the change
+in each spot's mean regret.
+
+Exit status: 0, or 3 when any advisor action mapped inexactly to a root action (a
+warning is printed and the tables still show the count), 1 on a spot error and 2
+on a usage or file error.
 
 ## File format
 
@@ -156,7 +164,7 @@ The boards are rainbow unless a flush is part of the family:
    - `all_in_merge` is set to 1.0, so a size merges into all-in only when it
      takes the whole stack, the same way the advisor lists sizes. Every advisor
      bet or raise then has a root action with the same street total. The tool
-     still reports any inexact mapping.
+     still reports any inexact mapping, and exits with status 3 if there is one.
    - The solve runs at least `--min-iterations` and stops once exploitability is
      at most `--target`% of the pot, or at `--iterations`.
 3. **Sample.** It picks up to `--combos` hero hands with positive root share. The

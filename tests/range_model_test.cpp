@@ -505,6 +505,49 @@ TEST(RangeModel, ContinueShareTracksMdfTimesMult) {
     }
 }
 
+// The raise share cap is raise_share x clamp(1.5 / (1 + s), 0.4, 1.25): fewer
+// raises against bigger bets, the same cap in the predicted response and in the
+// inference likelihood.
+TEST(RangeModel, RaiseShareFallsAsBetSizeGrows) {
+    EXPECT_NEAR(raise_share_scale(0.5), 1.0, 1e-12);
+    EXPECT_NEAR(raise_share_scale(0.33), 1.5 / 1.33, 1e-12);
+    EXPECT_NEAR(raise_share_scale(1.25), 1.5 / 2.25, 1e-12);
+    EXPECT_NEAR(raise_share_scale(2.0), 0.5, 1e-12);
+    EXPECT_NEAR(raise_share_scale(0.1), 1.25, 1e-12);
+    EXPECT_NEAR(raise_share_scale(10.0), 0.4, 1e-12);
+
+    const StreetStrength s = street_strength(kNeutralRiver);
+    for (const Archetype a : kArchetypes) {
+        const ArchetypeParams& p = archetype_params(a);
+        const WeightedRange range = bb_range_on_river(p, kNeutralRiver);
+        double previous = 1.0;
+        for (const double size : {0.33, 0.5, 0.75, 1.25, 2.0}) {
+            const Response r = predict_postflop_response(range, s, Street::River, size, size / (1 + 2 * size), p);
+            const double cap = p.raise_share * raise_share_scale(size);
+            EXPECT_LE(r.raise, cap + 1e-9) << to_string(a) << " at " << size;
+            EXPECT_LT(r.raise, previous) << to_string(a) << " at " << size;
+            previous = r.raise;
+
+            // The likelihood a raise multiplies in has the same mean as the predicted share.
+            const WeightedRange raise = raise_likelihood(range, s, size, p);
+            double mass = 0.0;
+            double raising = 0.0;
+            for (int combo = 0; combo < kComboCount; ++combo) {
+                mass += range.weight(combo);
+                raising += range.weight(combo) * raise.weight(combo);
+            }
+            EXPECT_NEAR(raising / mass, r.raise, 1e-5) << to_string(a) << " at " << size;
+        }
+    }
+    // The Baseline's cap binds from half pot up, so its share is the cap itself.
+    const ArchetypeParams& base = archetype_params(Archetype::Baseline);
+    const WeightedRange range = bb_range_on_river(base, kNeutralRiver);
+    for (const double size : {0.5, 1.25, 2.0}) {
+        const Response r = predict_postflop_response(range, s, Street::River, size, size / (1 + 2 * size), base);
+        EXPECT_NEAR(r.raise, base.raise_share * raise_share_scale(size), 1e-6) << size;
+    }
+}
+
 TEST(RangeModel, ArchetypesOrderAsTheirNamesSay) {
     // One range, the Baseline's flop defend range, answered by each type.
     Holes holes{};

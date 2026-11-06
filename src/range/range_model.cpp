@@ -30,6 +30,11 @@ constexpr double kDrawPriceSlack = 0.9;      // Draws call when equity >= 0.9 x 
 constexpr double kDrawContinueOtherwise = 0.3;
 constexpr double kRaiseDrawShare = 0.5;      // Strong draws raise at draw_bet x this
 constexpr double kRaiseAirBase = 0.1;        // Air raises at bluff_mult x this
+// The raise share cap scales by clamp(this / (1 + s), min, max) for a bet of s pots:
+// 1 at half pot, less against big bets, more against small ones.
+constexpr double kRaiseScaleNumerator = 1.5;
+constexpr double kRaiseScaleMin = 0.4;
+constexpr double kRaiseScaleMax = 1.25;
 constexpr double kMinRangeCombos = 0.01 * kComboCount;
 constexpr double kMinActionChance = 0.05;
 
@@ -126,9 +131,18 @@ BetBreakdown bet_breakdown_at(const WeightedRange& range, const StreetStrength& 
     return out;
 }
 
-// P(raise | combo) facing a bet, already scaled to raise_share.
+}  // namespace
+
+double raise_share_scale(double size_pots) {
+    return std::clamp(kRaiseScaleNumerator / (1.0 + safe_size(size_pots)), kRaiseScaleMin, kRaiseScaleMax);
+}
+
+namespace {
+
+// P(raise | combo) facing a bet of `size` pots, already scaled to the size's
+// raise share cap.
 std::array<double, kComboCount> raise_probabilities(const WeightedRange& range, const StreetStrength& s,
-                                                    const Shares& t, const ArchetypeParams& p) {
+                                                    const Shares& t, double size, const ArchetypeParams& p) {
     std::array<double, kComboCount> q{};
     const double v = p.value_bet_top / 2.0;
     const double hold_back = 1.0 - clamp01(p.slowplay);
@@ -145,7 +159,7 @@ std::array<double, kComboCount> raise_probabilities(const WeightedRange& range, 
         mass += range.weight(combo);
         raising += range.weight(combo) * q[i];
     }
-    const double share = std::max(0.0, p.raise_share);
+    const double share = std::max(0.0, p.raise_share) * raise_share_scale(size);
     const double k = mass > 0.0 && raising > share * mass ? share * mass / raising : 1.0;
     for (double& value : q) value *= k;
     return q;
@@ -182,7 +196,7 @@ struct Answer {
 Answer answer_probabilities(const WeightedRange& range, const StreetStrength& s, const Shares& t, Street street,
                             double size, double pot_odds, const ArchetypeParams& p) {
     Answer out;
-    out.raise = raise_probabilities(range, s, t, p);
+    out.raise = raise_probabilities(range, s, t, size, p);
     const double mdf = 1.0 / (1.0 + size);
     const double target = std::min(std::max(p.continue_mult * mdf, p.continue_floor), kContinueCap);
     const auto first = continue_probabilities(s, t, street, target, pot_odds, p);
@@ -237,8 +251,8 @@ WeightedRange call_likelihood_at(const WeightedRange& range, const StreetStrengt
 }
 
 WeightedRange raise_likelihood_at(const WeightedRange& range, const StreetStrength& s, const Shares& t,
-                                  const ArchetypeParams& p) {
-    const auto raise = raise_probabilities(range, s, t, p);
+                                  double size, const ArchetypeParams& p) {
+    const auto raise = raise_probabilities(range, s, t, size, p);
     WeightedRange out;
     for (int combo = 0; combo < kComboCount; ++combo) {
         const auto i = static_cast<std::size_t>(combo);
@@ -573,7 +587,7 @@ private:
                     const double size = pot_before > 0 ? static_cast<double>(a.chips_added) / pot_before : 1.0;
                     return bet_breakdown_at(t.range, s, shares, safe_size(size), p_).likelihood;
                 }
-                return raise_likelihood_at(t.range, s, shares, p_);
+                return raise_likelihood_at(t.range, s, shares, safe_size(last_aggression_size_), p_);
             case ActionType::Call: {
                 const double odds = static_cast<double>(a.chips_added) / std::max(1, pot_before + a.chips_added);
                 return call_likelihood_at(t.range, s, shares, street_, safe_size(last_aggression_size_), odds, p_);
@@ -780,9 +794,9 @@ WeightedRange call_likelihood(const WeightedRange& range, const StreetStrength& 
                               params);
 }
 
-WeightedRange raise_likelihood(const WeightedRange& range, const StreetStrength& strength,
+WeightedRange raise_likelihood(const WeightedRange& range, const StreetStrength& strength, double size_pots,
                                const ArchetypeParams& params) {
-    return raise_likelihood_at(range, strength, top_share(range, strength), params);
+    return raise_likelihood_at(range, strength, top_share(range, strength), safe_size(size_pots), params);
 }
 
 Response predict_postflop_response(const WeightedRange& range, const StreetStrength& strength, Street street,
