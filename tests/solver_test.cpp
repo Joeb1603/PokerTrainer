@@ -281,6 +281,15 @@ TEST(BettingTree, MinimumRaiseAndClosingChecks) {
     const BettingTree tree = build_betting_tree(checked, BetAbstraction{});
     EXPECT_EQ(tree.nodes[static_cast<std::size_t>(tree.child(0, 0))].kind, NodeKind::Showdown);
     EXPECT_THROW(build_betting_tree(river_root(200, 0), BetAbstraction{}), std::invalid_argument);
+
+    // A size far past the stack is all-in, even where size x pot overflows a 32-bit long.
+    BetAbstraction huge;
+    huge.streets[2].bets = {1e12};
+    huge.add_all_in = false;
+    const BettingTree shove = build_betting_tree(river_root(200, 1000), huge);
+    ASSERT_EQ(shove.actions_of(0).size(), 2u);
+    EXPECT_EQ(shove.actions_of(0)[1].type, ActionType::AllIn);
+    EXPECT_EQ(shove.actions_of(0)[1].to, 1000);
 }
 
 TEST(BettingTree, TurnTreeDealsEveryRiver) {

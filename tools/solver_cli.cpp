@@ -345,7 +345,8 @@ int main(int argc, char** argv) {
 
     std::optional<PostflopSolver> solver;
     try {
-        std::cout << "Estimated memory: " << bytes_text(PostflopSolver::estimate_bytes(spot, abstraction)) << '\n';
+        const std::size_t estimate = PostflopSolver::estimate_bytes(spot, abstraction);
+        std::cout << "Estimated memory: " << bytes_text(estimate) << '\n';
         solver.emplace(spot, abstraction);
     } catch (const SolverMemoryError& error) {
         spot_error(error.what());

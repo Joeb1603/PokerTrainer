@@ -172,7 +172,9 @@ private:
                                                                                      : street.raises;
         std::vector<int> totals;
         for (const double size : sizes) {
-            int to = current + static_cast<int>(std::lround(size * pot_after_call));
+            // Compared in double first: a huge size would overflow lround's long (32 bits on MSVC).
+            const double raw = size * static_cast<double>(pot_after_call);
+            int to = raw >= static_cast<double>(s.cap - current) ? s.cap : current + static_cast<int>(std::lround(raw));
             to = std::max(to, min_to);
             if (to >= s.cap || static_cast<double>(to - s.bet[p]) >= abstraction_.all_in_merge * behind) to = s.cap;
             totals.push_back(to);

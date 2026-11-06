@@ -150,6 +150,22 @@ At SPR 3.3, exploitability is 0.051% of pot after 300 iterations.
 
 **Tests:** 385 pass in Release (about 3 s) and Debug (about 12 s).
 
+**Stage 2 review**
+- **No maths defects found.** An independent brute-force solver was run on 80 random spots: river, turn and flop; first to act, facing a bet, facing a raise; all-in runouts; overlapping ranges. Its results matched:
+  - Best response values to within 1.3e-7 of the pot.
+  - Root EVs to within 2e-7.
+  - DCFR training to within 6e-7, except where the per-hand values were round-off noise (see below).
+- **Hand-checked toy spot:** pot 100, KK + J9 against 33, one pot-sized bet.
+  - Against a uniform strategy: BR₀ = 50, BR₁ = 75, exploitability 12.5%.
+  - Solved: J9 bluffs 50% of the time, the caller calls 50%, and EVs are 75 and 25.
+  - Both cases match exactly.
+- **Facing a bet at the root:** u₀ + u₁ = root pot holds.
+- **Fixes:**
+  - Bet sizes now compare in double before rounding. MSVC's 32-bit `long` made `lround` unsafe for huge sizes, which could have turned a shove into a minimum bet. A regression assertion was added.
+  - solver_cli now computes the memory estimate before printing it.
+- **Caveat 1, root action EVs:** `RootSolution::ev` assumes the hand keeps playing its own average strategy after the root action. For actions a hand almost never takes (under 5% of the time), that undervalues the action by 1.7 chips on average and up to 16 chips (0.8 BB) in a pot of 300, and more iterations don't fix it. For actions taken at least 5%, the gap is 0.06 chips. **Stage 3 adds a best-continuation EV and measures regret on it.**
+- **Caveat 2, zero-reach hands:** where a hand faces no opponent combos with any reach, round-off of about 1e-17 drives an arbitrary strategy for that hand. It doesn't affect values, but displayed frequencies must be weighted by reach.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
