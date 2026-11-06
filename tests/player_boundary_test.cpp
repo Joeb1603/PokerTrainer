@@ -13,6 +13,10 @@
 #include "range/hand_vs_range.h"
 #include "range/preflop_matrix.h"
 #include "range/weighted_range.h"
+#include "solver/betting_tree.h"
+#include "solver/dcfr.h"
+#include "solver/postflop_solver.h"
+#include "solver/showdown.h"
 #include "strategy/preflop_charts.h"
 
 namespace poker {

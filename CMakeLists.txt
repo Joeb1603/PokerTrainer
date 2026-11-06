@@ -77,6 +77,9 @@ add_library(poker_core STATIC
     src/range/hand_vs_range.cpp
     src/range/preflop_matrix.cpp
     src/range/weighted_range.cpp
+    src/solver/betting_tree.cpp
+    src/solver/postflop_solver.cpp
+    src/solver/showdown.cpp
     src/strategy/preflop_charts.cpp
 )
 find_package(Threads REQUIRED)
@@ -170,6 +173,7 @@ if(POKER_BUILD_TESTS)
         tests/equity_test.cpp
         tests/preflop_charts_test.cpp
         tests/range_test.cpp
+        tests/solver_test.cpp
         tests/bots_test.cpp
         tests/training_advisor_test.cpp
         tests/hand_logger_test.cpp
