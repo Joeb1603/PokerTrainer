@@ -503,6 +503,45 @@ TEST(RiverSolver, ExploitabilityFalls) {
     }
 }
 
+// ev_best lets the root player best-respond after its root action, so it bounds ev
+// from above, matches it for actions a converged hand actually takes, and its
+// per-hand maximum is the best-response value.
+TEST(RiverSolver, BestContinuationEvBoundsAverageEv) {
+    for (const int to_act : {0, 1}) {
+        SCOPED_TRACE(to_act);
+        SolveSpot spot = realistic_spot();
+        spot.to_act = to_act;
+        PostflopSolver solver(spot, river_default_abstraction());
+        solver.run(600);
+        ASSERT_LT(solver.exploitability_pct_pot(), 0.3);
+
+        const RootSolution root = solver.root();
+        ASSERT_EQ(root.ev_best.size(), root.actions.size());
+        double br = 0.0;
+        double gap = 0.0;  // Share-weighted ev_best - ev over actions taken at least 5%
+        double gap_mass = 0.0;
+        for (std::size_t h = 0; h < root.hands.size(); ++h) {
+            float best = -1e9f;
+            for (std::size_t a = 0; a < root.actions.size(); ++a) {
+                ASSERT_EQ(root.ev_best[a].size(), root.hands.size());
+                EXPECT_GE(root.ev_best[a][h], root.ev[a][h] - 1e-3f) << "hand " << h << " action " << a;
+                best = std::max(best, root.ev_best[a][h]);
+                if (root.freq[a][h] >= 0.05f) {
+                    EXPECT_NEAR(root.ev_best[a][h], root.ev[a][h], 1.0) << "hand " << h << " action " << a;
+                    gap += root.share[h] * (root.ev_best[a][h] - root.ev[a][h]);
+                    gap_mass += root.share[h];
+                }
+            }
+            br += root.share[h] * best;
+            // A hand's average strategy is near a best response, so its EV is close to the maximum.
+            EXPECT_LE(root.hand_ev[h], best + 1e-3f);
+        }
+        EXPECT_LT(gap / gap_mass, 0.1);  // Measured 0.02 chips in a pot of 300
+        const std::array<double, 2> values = solver.best_response_values();
+        EXPECT_NEAR(br, values[static_cast<std::size_t>(root.player)], 1e-2);
+    }
+}
+
 // Whether no combo of the other range `combo` can face beats it (`nuts`), or none
 // is worse than it (air: calling can at best split the pot with the same hand).
 bool beats_all(int combo, const WeightedRange& other, const std::vector<Card>& board, bool nuts) {

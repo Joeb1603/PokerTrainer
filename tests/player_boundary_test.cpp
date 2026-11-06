@@ -17,6 +17,7 @@
 #include "solver/dcfr.h"
 #include "solver/postflop_solver.h"
 #include "solver/showdown.h"
+#include "solver/spot_from_view.h"
 #include "strategy/preflop_charts.h"
 
 namespace poker {

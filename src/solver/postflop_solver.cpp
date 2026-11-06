@@ -378,6 +378,7 @@ RootSolution PostflopSolver::root() const {
     const std::vector<float> average = average_strategy(0);
     solution.freq.assign(actions, std::vector<float>(n));
     solution.ev.assign(actions, std::vector<float>(n));
+    solution.ev_best.assign(actions, std::vector<float>(n));
     solution.hand_ev.assign(n, 0.0f);
 
     Walker walker;
@@ -402,6 +403,16 @@ RootSolution PostflopSolver::root() const {
         }
     }
     for (std::size_t h = 0; h < n; ++h) solution.hand_ev[h] = static_cast<float>(hand_ev[h]);
+
+    // The same children again with the root player best-responding below the root.
+    walker.pass = Pass::BestResponse;
+    for (std::size_t a = 0; a < actions; ++a) {
+        walker.walk(tree_.child(0, static_cast<int>(a)), weights_[me].data(), weights_[1 - me].data(), values,
+                    scratch_.data() + 3 * widest);
+        for (std::size_t h = 0; h < n; ++h) {
+            solution.ev_best[a][h] = static_cast<float>(faced[h] > 0.0 ? values[h] / faced[h] : 0.0);
+        }
+    }
     return solution;
 }
 

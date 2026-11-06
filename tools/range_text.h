@@ -3,9 +3,11 @@
 // Text forms of boards, weighted ranges and numbers for the command-line tools.
 // Header-only and tools-only: the trainer itself never parses these.
 
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -81,10 +83,38 @@ inline std::vector<Card> parse_board(std::string_view text) {
     return board;
 }
 
+// The suit of a suit letter (c, d, h, s; either case), or nothing.
+inline std::optional<Suit> parse_suit(char letter) {
+    switch (letter) {
+        case 'c': case 'C': return Suit::Clubs;
+        case 'd': case 'D': return Suit::Diamonds;
+        case 'h': case 'H': return Suit::Hearts;
+        case 's': case 'S': return Suit::Spades;
+        default: return std::nullopt;
+    }
+}
+
+// Whether a combo passes an "@suit" filter: both cards of that suit for a suited
+// class, at least one card of it for an offsuit class or a pair.
+inline bool combo_has_suit(int combo, HandClass hand, Suit suit) {
+    const std::array<Card, 2> cards = combo_cards(combo);
+    const bool first = cards[0].suit() == suit;
+    const bool second = cards[1].suit() == suit;
+    return hand.suited ? first && second : first || second;
+}
+
 // HandRange syntax where each comma-separated token may end in ":weight", e.g.
 // "QQ+, AKs, AKo:0.5, A5s-A2s:0.25". A token without one has weight 1. Weights
 // must be finite and non-negative; a later token overrides an earlier one for the
-// classes they share, so "TT+, AA:0" is TT-KK. Throws std::invalid_argument.
+// combos they share, so "TT+, AA:0" is TT-KK.
+//
+// Two token forms reach single combos, for flush draws and flushes:
+// - "<classes>@<suit>" keeps only the combos of those classes with that suit: both
+//   cards for suited classes, at least one card for offsuit classes and pairs.
+//   "A2s+@h" is the ace-high heart flushes, "AKo@h" the AK offsuit with a heart.
+// - Four characters naming two cards, such as "AhKh", is that one combo.
+// For example "KQs:0.25, KQs@h" holds KhQh at 1 and the other KQs at 0.25. Throws
+// std::invalid_argument.
 inline WeightedRange parse_weighted_range(std::string_view text) {
     WeightedRange range;
     if (trim_text(text).empty()) return range;
@@ -103,15 +133,43 @@ inline WeightedRange parse_weighted_range(std::string_view text) {
             token = trim_text(token.substr(0, colon));
         }
 
+        const std::string bad = "bad range token '" + std::string(token) + "'";
+        if (token.size() == 4 && token.find('@') == std::string_view::npos) {
+            const std::optional<Card> first = Card::parse(token.substr(0, 2));
+            const std::optional<Card> second = Card::parse(token.substr(2, 2));
+            if (first && second) {
+                if (*first == *second) throw std::invalid_argument(bad);
+                range.set(combo_index(*first, *second), weight);
+                if (comma == std::string_view::npos) return range;
+                text = text.substr(comma + 1);
+                continue;
+            }
+        }
+
+        std::optional<Suit> suit;
+        if (const std::size_t at = token.find('@'); at != std::string_view::npos) {
+            const std::string_view letter = trim_text(token.substr(at + 1));
+            suit = letter.size() == 1 ? parse_suit(letter[0]) : std::nullopt;
+            if (!suit) throw std::invalid_argument(bad);
+            token = trim_text(token.substr(0, at));
+        }
+
         HandRange classes;
         try {
             classes = HandRange::parse(token);
         } catch (const std::invalid_argument&) {
-            throw std::invalid_argument("bad range token '" + std::string(token) + "'");
+            throw std::invalid_argument(bad);
         }
-        if (classes.empty()) throw std::invalid_argument("bad range token '" + std::string(token) + "'");
+        if (classes.empty()) throw std::invalid_argument(bad);
         for (const HandClass hand : hand_classes_by_strength()) {
-            if (classes.contains(hand)) range.set_class(hand, weight);
+            if (!classes.contains(hand)) continue;
+            if (!suit) {
+                range.set_class(hand, weight);
+                continue;
+            }
+            for (const std::uint16_t combo : class_combos(hand).view()) {
+                if (combo_has_suit(combo, hand, *suit)) range.set(combo, weight);
+            }
         }
 
         if (comma == std::string_view::npos) return range;

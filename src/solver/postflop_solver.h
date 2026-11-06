@@ -52,7 +52,18 @@ struct RootSolution {
     // players following the average strategy afterwards. Chips are relative to the
     // root: received from the final pot minus added after the root, so a fold
     // there is 0 and the pot already in the middle counts as winnable.
+    //
+    // For an action the hand rarely takes, `ev` reads the hand's own average strategy
+    // at later nodes it seldom reaches, which early iterations dominate, so it can
+    // undervalue the action by most of a big blind. Use `ev_best` to compare actions.
     std::vector<std::vector<float>> ev;
+    // [action][hand]: the same, except that after the action the root player plays a
+    // best response to the opponent's average strategy (the opponent still plays its
+    // average). So ev_best >= ev, nearly equal for actions the hand takes often once
+    // converged, and the largest ev_best of a hand is its best-response value: the
+    // share-weighted sum of those maxima is best_response_values()[player]. The
+    // regret of choosing action a with hand h is max_b ev_best[b][h] - ev_best[a][h].
+    std::vector<std::vector<float>> ev_best;
     std::vector<float> hand_ev;  // [hand]: sum over actions of freq x ev
 };
 

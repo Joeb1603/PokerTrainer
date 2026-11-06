@@ -80,6 +80,7 @@ add_library(poker_core STATIC
     src/solver/betting_tree.cpp
     src/solver/postflop_solver.cpp
     src/solver/showdown.cpp
+    src/solver/spot_from_view.cpp
     src/strategy/preflop_charts.cpp
 )
 find_package(Threads REQUIRED)
@@ -96,6 +97,11 @@ target_compile_options(poker_cli PRIVATE ${POKER_WARNINGS})
 add_executable(solver_cli tools/solver_cli.cpp)
 target_link_libraries(solver_cli PRIVATE poker_core)
 target_compile_options(solver_cli PRIVATE ${POKER_WARNINGS})
+
+# Scores the Training Advisor against the river solver on tools/bench/river_spots.json.
+add_executable(advisor_bench tools/advisor_bench.cpp)
+target_link_libraries(advisor_bench PRIVATE poker_core nlohmann_json::nlohmann_json)
+target_compile_options(advisor_bench PRIVATE ${POKER_WARNINGS})
 
 # Regenerates src/range/generated/preflop_equity_data.cpp; run from the repo root.
 add_executable(gen_preflop_tables tools/gen_preflop_tables.cpp)
@@ -179,6 +185,7 @@ if(POKER_BUILD_TESTS)
         tests/preflop_charts_test.cpp
         tests/range_test.cpp
         tests/solver_test.cpp
+        tests/bench_test.cpp
         tests/bots_test.cpp
         tests/training_advisor_test.cpp
         tests/hand_logger_test.cpp
@@ -186,6 +193,8 @@ if(POKER_BUILD_TESTS)
     )
     target_link_libraries(core_tests PRIVATE poker_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_compile_options(core_tests PRIVATE ${POKER_WARNINGS})
+    # Bench.SpotFileParsesAndEverySpotIsLegal reads tools/bench/river_spots.json.
+    target_compile_definitions(core_tests PRIVATE POKER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     if(POKER_BUILD_APP)
         target_sources(core_tests PRIVATE tests/trainer_ui_test.cpp)
         target_link_libraries(core_tests PRIVATE trainer_ui)
@@ -204,6 +213,10 @@ if(POKER_BUILD_TESTS)
                      --ip "22+, A2s+, K9s+, QTs+, JTs, T9s, 98s, 87s, 76s, ATo+, KTo+, QJo:0.5"
                      --iterations 50 --no-timing)
 
+    # One bench spot end to end: replay, solve, advisor, scoring.
+    add_test(NAME advisor_bench_smoke
+             COMMAND advisor_bench --spots ${CMAKE_SOURCE_DIR}/tools/bench/river_spots.json
+                     --only co_btn-paired-bx --combos 8 --advisor-rollouts 500)
     # Bots and the advisor must see the table only through PlayerView.
     add_test(NAME no_engine_access_in_players
              COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/check_no_engine_access.cmake)

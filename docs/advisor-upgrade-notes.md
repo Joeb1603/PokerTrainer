@@ -166,6 +166,43 @@ At SPR 3.3, exploitability is 0.051% of pot after 300 iterations.
 - **Caveat 1, root action EVs:** `RootSolution::ev` assumes the hand keeps playing its own average strategy after the root action. For actions a hand almost never takes (under 5% of the time), that undervalues the action by 1.7 chips on average and up to 16 chips (0.8 BB) in a pot of 300, and more iterations don't fix it. For actions taken at least 5%, the gap is 0.06 chips. **Stage 3 adds a best-continuation EV and measures regret on it.**
 - **Caveat 2, zero-reach hands:** where a hand faces no opponent combos with any reach, round-off of about 1e-17 drives an arbitrary strategy for that hand. It doesn't affect values, but displayed frequencies must be weighted by reach.
 
+### Stage 3 (river bench): the baseline to beat
+
+**The bench**
+- `tools/advisor_bench` uses `tools/bench/river_spots.json`, produced by `gen_river_spots.py`: 36 river spots in 100 BB pots.
+  - 3 pot types: BTN vs BB, CO vs BTN, and SB 3-bets BTN.
+  - × 4 board families: dry, wet, paired, monotone.
+  - × 3 lines: check-check, bet then check, bet-bet.
+  - Hero is either first to act out of position, or in position facing a 33% or 75% bet.
+- The ranges are hand-written assumptions, not solved. Each bettor's share of air was checked to be plausible: 27-41% for 75% bets and 4-20% for 33% bets.
+- Every spot is solved to ≤ 0.3% of pot exploitability, with at least 200 iterations.
+- **Hero combos:** up to 80 per spot, sampled evenly across river hand strength.
+- **Regret:** the best `ev_best` minus the `ev_best` of the advisor's action, in BB. `ev_best` is the best-continuation EV.
+- **Size mapping:** the solver tree uses `all_in_merge = 1.0`, so every advisor size maps exactly.
+- **Cost:** a full run takes 2.1 s, of which 1.0 s is solving. The advisor takes p50 0.35 ms and p95 0.40 ms per river decision.
+
+**Baseline: the current random-hand advisor, measured at `dd9e9ed` plus the bench**
+
+| Group | Regret (BB) | % of pot | Regret > 0.5 BB | Regret > 1 BB | Agrees with solver's top action | Solver's frequency for advised action | Advised action used < 10% |
+|---|---|---|---|---|---|---|---|
+| **Overall (36)** | **1.992** | 5.60 | 50% | 40% | 28% | 28% | 66% |
+| BTN vs BB | 1.009 | 4.79 | 46% | 32% | 26% | 25% | 67% |
+| CO vs BTN | 1.439 | 5.85 | 50% | 40% | 26% | 26% | 68% |
+| SB vs BTN 3-bet | 3.527 | 6.16 | 53% | 48% | 33% | 32% | 62% |
+| Dry / wet / paired / monotone | 1.76 / 1.78 / 2.28 / 2.15 | | | | 30 / 20 / 32 / 30% | | |
+| OOP first to act | 1.046 | 3.97 | 42% | 29% | 23% | 22% | 68% |
+| IP facing 33% | 1.905 | 5.68 | 45% | 36% | 32% | 31% | 61% |
+| IP facing 75% | 3.024 | 7.16 | 62% | 55% | 30% | 30% | 68% |
+
+By line, regret is 1.41 BB for check-check, 1.33 for bet then check, and 3.24 for bet-bet.
+
+**Patterns, consistent with random-hand equity overrating hands on the river**
+- **It bets too often when first to act, and too big.** On one monotone board the solver checks 92% and the advisor bets 84%.
+- **It raises with bluff-catchers when facing bets.** On a paired board in the 3-bet pot it raises 67% where the solver raises 2%, and QQ raises for −7.2 BB where calling is worth +8.8 BB. On one wet bet-bet line it shoves every hand where the solver folds 49%.
+- **It rarely folds.** One spot has the solver folding 73% and the advisor 21%.
+- **Agreeing is nearly free:** when the advisor matches the solver's top action, its mean regret is 0.002 BB. That supports measuring regret on `ev_best`.
+- **The plan's acceptance target for Stage 5:** mean regret ≤ 1.49 BB (0.75 × the baseline), and agreement ≥ 38%.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
