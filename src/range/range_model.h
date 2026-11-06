@@ -131,7 +131,8 @@ namespace poker {
 // against the hands that call: if the callers are the top C of a range, that is
 // u <= C / 2. C is a standard player's continue share whatever the types,
 // Cref(s) = clamp(0.95 / (1 + s), 0.10, 0.95), so a type's aggression enters only
-// through the shift a = value_bet_top - 0.33 (Maniac +0.12, Nit -0.11).
+// through the shift a = value_bet_top - 0.33 (Baseline -0.05, Maniac +0.12, Nit
+// -0.11).
 //
 // Own-range rule: the public functions given no opponent range (a null pointer)
 // read u as t and use the old thresholds, value_bet_top x (1.6 for s <= 0.4, 1.0
@@ -156,10 +157,10 @@ namespace poker {
 // aggressor on the flop or turn (a c-bet or barrel: its air has equity and its
 // story fold equity) and 1 otherwise. While b < 0.9 the bluff share of the
 // polarised part, M_a / (M_a + M_v), is m * r / (1 + m * r) with r = s / (1 + s),
-// m = g * bluff_mult: s / (1 + 2s) for the Baseline on the river, the toy game's
-// indifference share. The cap 0.9 keeps some air checking, so a check never
-// removes air outright. Draws and medium hands bet on top of that and are not
-// counted as either part.
+// m = g * bluff_mult: s / (1 + 2s) at bluff_mult 1 on the river, the toy game's
+// indifference share (the Baseline's 1.2 bluffs a little more). The cap 0.9
+// keeps some air checking, so a check never removes air outright. Draws and
+// medium hands bet on top of that and are not counted as either part.
 //
 // Check, not facing a bet:  1 - P(bet of 0.5 pot). Value hands keep sp x (1 -
 // the medium rate) (sp, then the medium rate's bet on the rest). Checking to the
@@ -225,7 +226,10 @@ constexpr std::string_view to_string(Archetype archetype) {
     return names[static_cast<std::size_t>(archetype)];
 }
 
-// The defaults are Baseline's.
+// The defaults are Baseline's. Its continue_mult, value_bet_top and bluff_mult
+// (0.85, 0.28, 1.2; first 0.95, 0.33, 1.0) come from Stage 5's one-round grid
+// search on the river bench (docs/advisor-upgrade-notes.md, "Stage 5 tuning"):
+// tuned on hand-written bench ranges, so a fit to assumptions, not to play.
 struct ArchetypeParams {
     // Preflop widths, as multiples of the charts' combos.
     double open_width = 1.00;
@@ -238,13 +242,13 @@ struct ArchetypeParams {
     double four_bet_width = 1.00;
 
     // Postflop.
-    double continue_mult = 0.95;   // Continue share facing a bet = this x MDF ...
+    double continue_mult = 0.85;   // Continue share facing a bet = this x MDF ...
     double continue_floor = 0.10;  // ... at least this, at most 0.95
     bool pairs_and_draws_continue = false;
     double pairs_and_draws_prob = 0.9;
     double raise_share = 0.10;     // Most of a range that raises a half-pot bet (see raise_share_scale)
-    double value_bet_top = 0.33;   // Value thresholds shift by this - 0.33 (own-range rule: the top share)
-    double bluff_mult = 1.0;       // Air : value = bluff_mult * s / (1 + s), x4 when barrelling
+    double value_bet_top = 0.28;   // Value thresholds shift by this - 0.33 (own-range rule: the top share)
+    double bluff_mult = 1.2;       // Air : value = bluff_mult * s / (1 + s), x4 when barrelling
     double draw_bet = 0.5;         // Strong draws bet this often
     double slowplay = 0.20;        // Value hands that check or flat instead
     double softness = 0.06;        // Edge width w, in top_share: each edge spans 4w

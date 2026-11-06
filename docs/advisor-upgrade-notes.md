@@ -51,6 +51,8 @@ Each stage is committed to `main` when its tests pass.
 16. **Stage 5: preflop all-in only short, cheap, or as the only raise.** With ranges, the single-street model valued a 100 BB UTG open-shove with AA at 258 chips against 93 for a 3.5 BB open, because only the strong part of each range calls a shove and `implied` is capped at half a tiny preflop pot. Preflop, all-in is now advised only with an effective stack of at most 15 BB, within 1.5 pots, or as the only raise left; its `ev` is capped at the advice and `base_ev` keeps the model number. This matches CLAUDE.md section 11's size-rule limit, which had been applied only postflop.
 17. **Stage 5: impossible multiway deals fall back to independent villains.** When narrowed ranges can almost never be dealt together (seen in random play: two villains' ranges reduced to the same three JJ combos), `equity_vs_ranges` throws. The advisor then multiplies the heads-up equities instead of failing.
 18. **Stage 5: `TrainingAdvisor(seed, rollouts)` keeps working:** it sets `rollouts` and `range_rollouts = max(100, rollouts / 5 * 3)`, so 5,000 gives the default 3,000. The flop is exact, threads are automatic.
+19. **Stage 5 batch D: Baseline's postflop defaults are now continue_mult 0.85, value_bet_top 0.28 and bluff_mult 1.2** (were 0.95, 0.33 and 1.0), from the one-round grid search under "Stage 5 tuning". The rule: adopt only if it beats the old defaults by at least 0.03 BB overall and makes no pot-type or hero-role group worse by more than 0.1 BB. It won by 0.124 BB and improved all six groups. The other types' rows are unchanged. The tuning hook is `TrainingAdvisor(seed, options, baseline_params)`, used by `advisor_bench --baseline-params`.
+20. **Stage 5 batch D: decision 14 re-measured for raises alone.** Narrowing Hero's range by its raise (not its bets) before the villains answer gave 0.872 BB against 0.867 (old defaults) and 0.751 against 0.743 (new). It was not kept.
 
 ## Deviations from the spec or earlier statements
 
@@ -447,6 +449,127 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 
 **Tests:** 428 pass in Release (424 + 4 new) and Debug. Release suite about 6 s, Debug 23.7 s. `ArchetypeLinesAreLegalAndDeterministic` takes 1.6 s in Release and about 10 s in Debug (3 random games, fast options with lines on). GCC Release/Debug and clang build with zero warnings; `strict.sh` clean on `training_advisor.cpp`. River bench unchanged: overall 0.867 BB, 54% agree.
 
+### Stage 5 tuning (batch D), uncommitted, on top of `a052525`
+
+**The hook.** `TrainingAdvisor(seed, options, baseline_params)` runs the Baseline line (the hint's own fields: the opponents' ranges, their answers, and Hero's range as they read it) with the given `ArchetypeParams` instead of `archetype_params(Baseline)`; the Nit, Station and Maniac lines keep their rows. It is a constructor rather than an `AdvisorOptions` field because a new trailing field makes every brace-initialised `AdvisorOptions{...}` warn under `-Wmissing-field-initializers`. `advisor_bench --baseline-params C,V,B` uses it (C = `continue_mult`, V = `value_bet_top`, B = `bluff_mult`, the other Baseline fields unchanged). The trainer never calls it. `--baseline-params 0.95,0.33,1.0` reproduced the old defaults exactly (the same tables; the CSVs differed only in the timing column).
+
+**Grid, one round only** (river bench, defaults otherwise, 2000 or more solver iterations; 27 runs, 4 at a time, about 2 minutes). Sorted by overall regret, BB. The old defaults are in bold, the adopted row in italics.
+
+| continue_mult | value_bet_top | bluff_mult | Overall | Agree | BTN vs BB | CO vs BTN | SB vs BTN 3-bet | IP vs 33% | IP vs 75% | OOP first |
+|---|---|---|---|---|---|---|---|---|---|---|
+| *0.85* | *0.28* | *1.2* | *0.743* | *56%* | *0.288* | *0.435* | *1.507* | *0.354* | *1.464* | *0.410* |
+| 0.85 | 0.33 | 1.2 | 0.758 | 57% | 0.284 | 0.384 | 1.604 | 0.426 | 1.391 | 0.456 |
+| 0.95 | 0.28 | 1.2 | 0.789 | 56% | 0.328 | 0.398 | 1.642 | 0.484 | 1.484 | 0.399 |
+| 0.85 | 0.40 | 1.0 | 0.797 | 52% | 0.327 | 0.398 | 1.665 | 0.389 | 1.422 | 0.579 |
+| 0.95 | 0.33 | 1.2 | 0.797 | 57% | 0.327 | 0.495 | 1.569 | 0.445 | 1.500 | 0.445 |
+| 0.85 | 0.40 | 1.2 | 0.802 | 53% | 0.335 | 0.349 | 1.722 | 0.493 | 1.337 | 0.576 |
+| 0.85 | 0.28 | 1.0 | 0.819 | 55% | 0.296 | 0.524 | 1.638 | 0.373 | 1.671 | 0.414 |
+| 0.95 | 0.40 | 1.2 | 0.841 | 51% | 0.486 | 0.373 | 1.663 | 0.562 | 1.397 | 0.563 |
+| 0.95 | 0.28 | 1.0 | 0.843 | 56% | 0.315 | 0.488 | 1.725 | 0.379 | 1.755 | 0.394 |
+| 0.85 | 0.33 | 1.0 | 0.859 | 53% | 0.291 | 0.486 | 1.799 | 0.517 | 1.587 | 0.472 |
+| **0.95** | **0.33** | **1.0** | **0.867** | **54%** | **0.324** | **0.530** | **1.748** | **0.433** | **1.719** | **0.450** |
+| 0.95 | 0.40 | 1.0 | 0.871 | 52% | 0.478 | 0.413 | 1.720 | 0.402 | 1.613 | 0.597 |
+| 1.05 | 0.28 | 1.2 | 0.876 | 56% | 0.369 | 0.578 | 1.681 | 0.441 | 1.641 | 0.547 |
+| 0.95 | 0.33 | 0.8 | 0.889 | 54% | 0.313 | 0.537 | 1.818 | 0.345 | 1.813 | 0.510 |
+| 0.85 | 0.33 | 0.8 | 0.893 | 53% | 0.294 | 0.484 | 1.901 | 0.603 | 1.591 | 0.485 |
+| 0.85 | 0.40 | 0.8 | 0.908 | 50% | 0.325 | 0.452 | 1.948 | 0.342 | 1.748 | 0.634 |
+| 1.05 | 0.28 | 1.0 | 0.930 | 55% | 0.360 | 0.613 | 1.819 | 0.346 | 1.922 | 0.524 |
+| 0.95 | 0.28 | 0.8 | 0.937 | 55% | 0.331 | 0.517 | 1.962 | 0.599 | 1.810 | 0.401 |
+| 1.05 | 0.33 | 1.2 | 0.939 | 55% | 0.395 | 0.644 | 1.778 | 0.518 | 1.708 | 0.592 |
+| 1.05 | 0.28 | 0.8 | 0.962 | 55% | 0.377 | 0.562 | 1.949 | 0.494 | 1.865 | 0.528 |
+| 1.05 | 0.33 | 1.0 | 0.989 | 52% | 0.399 | 0.703 | 1.866 | 0.442 | 1.885 | 0.641 |
+| 1.05 | 0.33 | 0.8 | 1.006 | 51% | 0.404 | 0.674 | 1.940 | 0.325 | 1.955 | 0.738 |
+| 0.85 | 0.28 | 0.8 | 1.013 | 54% | 0.289 | 0.516 | 2.232 | 0.885 | 1.739 | 0.414 |
+| 0.95 | 0.40 | 0.8 | 1.015 | 49% | 0.506 | 0.509 | 2.029 | 0.404 | 2.004 | 0.636 |
+| 1.05 | 0.40 | 1.2 | 1.134 | 48% | 0.558 | 0.652 | 2.191 | 0.858 | 1.817 | 0.727 |
+| 1.05 | 0.40 | 1.0 | 1.147 | 48% | 0.548 | 0.677 | 2.215 | 0.705 | 1.952 | 0.783 |
+| 1.05 | 0.40 | 0.8 | 1.175 | 46% | 0.555 | 0.683 | 2.288 | 0.486 | 2.194 | 0.845 |
+
+**Rule and decision.** Adopt the lowest-regret config only if it beats the old defaults by at least 0.03 BB overall and no pot-type or hero-role group gets worse by more than 0.1 BB. {0.85, 0.28, 1.2} is 0.124 BB better overall (0.867 → 0.743) and better in all six of those groups, so it is now Baseline's default (`ArchetypeParams` defaults in `range_model.h`). The Nit, Station and Maniac rows set all three fields explicitly and are unchanged. `kReferenceValueTop` (0.33) and the standard continue share `Cref` (0.95 × MDF), which the value thresholds use, are unchanged too, so Baseline's value threshold now shifts by a = −0.05.
+- **Outside the rule:** wet boards get 0.111 BB worse (0.271 → 0.382), and the worst single spot, sb_btn_3bet-monotone-xx, goes from 5.9 to 6.8 BB (all-in 37% where the solver calls 92%).
+- **Overfitting caveat:** the bench ranges are hand-written assumptions, and the winner sits at a corner of the grid on all three axes (lowest continue, lowest value_bet_top, highest bluff_mult), so the bench would probably prefer going further. It was not extended (one round only). Stage 8's turn spots are the planned holdout.
+- **Direction:** the bench rewards a Baseline that folds more to bets (0.85 × MDF), value-bets a little tighter and bluffs more (a more polarised bettor). bluff_mult 1.2 beats 1.0 in 8 of the 9 (continue_mult, value_bet_top) pairs, all but (0.85, 0.40).
+
+**Hold-out checks** (Stage 4 range-plausibility tests, not part of the bench; old defaults → new):
+
+| Check | Bound in the test | Old | New |
+|---|---|---|---|
+| AQ vs BB flop check-raise (`CheckRaiseRangesAreStrong`) | 45-60% | 56.8% | 47.7% |
+| AQ vs BB river check-raise, x/x turn | ≤ 40% | 27.5% | 31.1% |
+| ... after calls on every street | ≤ 40% | 25.4% | 29.0% |
+| AQ vs the BB's river lead (plausible about 55-65%) | < 80% | 72.8% | 67.5% |
+| C-bet a third, 3-bet pot K83r (`CbetFrequenciesArePlausible`) | ≥ 85% | 89% | 89% |
+| C-bet a third, BTN vs BB K72r | 60-80% | 71% | 66% |
+
+`RangeModelReport.DISABLED_ThreeSpots`, Baseline rows only (the other types are identical):
+
+| Spot | Old: mass, pair / air, folds to 33/75/125% | New |
+|---|---|---|
+| 1. BB's range, K72r c-bet/call, turn checked | 215.9, 45.7% / 51.0%, 28/46/58% | 207.5, 55.1% / 41.3%, 36/51/62% |
+| 2a. BTN's river bet after bet-bet-bet | 66.3, 2 pair+ 18.4%, air 20.7%; Kc9c 26.8% | 45.9, 2 pair+ 25.1%, air 21.2%; Kc9c 27.6% |
+| 2b. BB's check-call ×2, check | 100.9, pair 90.7%; AsQd 93.0% | 87.5, pair 91.7%; AsQd 93.4% |
+| 3. CO calls a 3-bet, checks J83 | 51.1; AhKc 41.4%; folds 16/33/45% | 52.0; AhKc 41.3%; folds 25/38/49% |
+
+- Every bound still holds, and every test passes unchanged. Check-raises are a little weaker (more bluffs at bluff_mult 1.2), and the flop check-raise is now near its lower bound (47.7% against 45%). The river lead moves toward the plausible 55-65%. Defending ranges are a little stronger (more folds), and fold shares to bets rise by 4-9 pp.
+
+**The worst group: IP facing 75% in the 3-bet pot (diagnosis, nothing tuned or fixed).** On sb_btn_3bet-dry-xx (Kc8h3d2s6c, pot 665 including the SB's 285 lead, 1820 behind for the BTN, 1535 for the SB; pot odds 30%), with the old defaults:
+
+| Combo | Range equity | Call EV | Best raise EV | Advice | Solver |
+|---|---|---|---|---|---|
+| JJ | 78.3% | 459.0 | 572.7 (to 998) | Raise to 998 | Call; regret 7.1 BB |
+| KQo | 91.8% | 586.7 | 917.8 (to 1235); 898.6 (to 998) | Raise to 998 (size rule) | Call; regret 7.3 BB |
+| AQo | 16.3% | −129.7 | −232.5 or less | Fold | Call; regret 5.7 BB |
+
+- **The arithmetic is right.** Call = e × 950 − 285 (JJ: 0.783 × 950 − 285 = 459.0). JJ's raise to 998 = F·665 + P_call·(e_c·2376 − 998) + P_raise·(e_r·4020 − 1820), with F 45.4%, P_raise 8.6%, P_call 46.0%, e_c 57.8% and e_r 73.7%: 301.9 + 172.6 + 98.3 = 572.8. The re-raise is all in (1820), costing Hero 1820 and the SB 1535. KQo to 998: 314.5 + 435.8 + 148.8 = 899.1 (listed 898.6, from rounded shares).
+- **Main cause: the inferred lead range, an assumption.** The model's SB range after it checked twice and led 75% is 4.6 combos: AQo 24%, 99 12.5%, TT 8.9%, A8s and A3s 8.4% each, AQs 8.1%, then KQo, AKo, QQ and AA at 2.5-3.8%. Kx, overpairs and sets are about 19%. The bench's range for the same lead is about 60% Kx, AA, KK, 88 and QQ and 40% missed draws (A5s, A4s, QJs, QTs, JTs, T9s and others), so, counted by hand from the spot's weights, JJ has about 37% there, not 78%, and AQ about 38%, not 16%. Two assumptions produce the model's range:
+  - Checking keeps only slowplay × (1 − 0.15) = 17% of value per street, so a 3-bettor that checked flop and turn keeps about 3% of its value hands.
+  - Value at the river lead is judged against the BTN's checked-back range (mostly AQ, AJ, AT and suited broadways), so 99 and TT count as value, and AQ bets as a medium hand (15%). AQ ties itself and loses to every pair, so its 16% equity follows.
+  The bench's ranges tell the opposite story ("SB leads big with slowplayed Kx, overpairs and sets against missed wheel and straight draws"). Neither is solved. This is the Stage 4 weakness on river bets after passive play, not an EV bug, so it is logged, not tuned.
+- **Second cause: the re-raise branch, against Hero's range before the raise.** The SB's re-raise range against JJ's raise has the same shape as its lead range (AQo 16.9%, 99 14.8%, TT 10.8% ...), because its value re-raises are judged against the BTN's capped checked-back range (decision 14), so e_r is 73.7% and the branch adds +98 chips. A test run narrowed Hero's range by `raise_likelihood` against the last aggressor, only when Hero raises. Then the re-raise range is mostly KK and sets plus a few weak-ace bluffs, the raise share falls from 8.6% to 2.2%, e_r falls to 27.3%, and JJ's raise falls to 528.3 (304.6 + 239.7 − 15.9). It still beats the call (459.0), on fold equity and the call branch. On the whole bench that test run gave 0.872 BB and 53% (old defaults; 0.867 and 54% without it), and 0.751 and 55% with the new defaults (0.743 and 56% without). IP vs 75% went from 1.719 to 1.730. 99 switched from raise to call, and the spot's regret fell from 3.9 to 3.4 BB, but other spots got worse. It is arguably more faithful to the range model's own rule ("for a raise the bettor's range includes its bet"), but it is no better on the bench, so it was not kept. Decision 14 stands, now measured for raises alone.
+- **So:** the advice in this group follows from the model's belief that a 3-bettor's check-check-lead is medium-strength. Fixing that means changing slowplay and medium-bet assumptions in `src/range`, which is a range-model question for later stages with a holdout, not this tuning round.
+
+**Final river bench** (new defaults; overall agrees with the grid row), against the Stage 3 baseline and batch A:
+
+| Group | Stage 3 regret (BB) | Batch A | Now | Stage 3 agree | Batch A | Now |
+|---|---|---|---|---|---|---|
+| **Overall (36)** | **1.946** | **0.867** | **0.743** | **28%** | **54%** | **56%** |
+| BTN vs BB | 0.939 | 0.324 | 0.288 | 27% | 59% | 61% |
+| CO vs BTN | 1.422 | 0.530 | 0.435 | 26% | 53% | 52% |
+| SB vs BTN 3-bet | 3.478 | 1.748 | 1.507 | 32% | 51% | 54% |
+| Dry | 1.68 | 0.700 | 0.723 | 30% | 50% | 51% |
+| Wet | 1.68 | 0.271 | 0.382 | 21% | 63% | 61% |
+| Paired | 2.26 | 1.197 | 0.545 | 33% | 54% | 60% |
+| Monotone | 2.17 | 1.300 | 1.322 | 30% | 50% | 51% |
+| Check-check line | 1.38 | 1.118 | 1.094 | | 54% | 51% |
+| Bet then check | 1.27 | 0.741 | 0.462 | | 49% | 55% |
+| Bet-bet | 3.18 | 0.744 | 0.672 | | 59% | 61% |
+| OOP first to act | 0.966 | 0.450 | 0.410 | 24% | 40% | 37% |
+| IP facing 33% | 1.856 | 0.433 | 0.354 | 31% | 67% | 73% |
+| IP facing 75% | 3.016 | 1.719 | 1.464 | 30% | 55% | 58% |
+
+- Overall regret is 0.38× the Stage 3 baseline (target ≤ 0.75×), and agreement is +28 pp (target +10 pp). Regret as a share of the pot is 2.11% (5.38% at Stage 3, 2.52% at batch A). Regret above 1 BB covers 16% of hands (39% at Stage 3, 17% at batch A).
+- **Worst spots now:** sb_btn_3bet-monotone-xx 6.8 BB, sb_btn_3bet-dry-xx 3.4, sb_btn_3bet-paired-bx 2.1 (was 4.9), sb_btn_3bet-paired-bb 1.7, btn_bb-monotone-bb 1.4, co_btn-wet-xx 1.3.
+- **Advisor time per bench decision:** p50 1.99 ms and p95 2.60 ms (batch A: 2.25 and 3.23 ms, on a different container). Full run 12.5 s, 6.7 s of it solving.
+
+**Hint latency** (`Advisor.DISABLED_LatencyByStreet`, Release, default options, ms, p50 / p95 / max, run alone):
+
+| Spot | Lines off, auto threads | Lines on, auto threads | Lines off, 1 thread | Lines on, 1 thread |
+|---|---|---|---|---|
+| Preflop 3+ way (2010) | 2.6 / 3.3 / 7.2 | 5.6 / 7.7 / 66 | 4.2 / 5.3 / 18 | 12.6 / 17.1 / 50 |
+| Flop 3+ way (1774) | 4.6 / 8.6 / 19 | 7.6 / 11.0 / 24 | 8.0 / 19.9 / 47 | 19.9 / 28.8 / 57 |
+| Flop heads-up (300) | 3.8 / 4.2 / 5.0 | 4.8 / 6.5 / 10 | 11.2 / 16.6 / 22 | 13.8 / 14.7 / 17 |
+| Turn 3+ way (1588) | 3.9 / 6.3 / 98 | 5.4 / 10.5 / 100 | 4.8 / 10.0 / 237 | 10.4 / 21.5 / 242 |
+| Turn heads-up (300) | 1.5 / 1.7 / 2.2 | 2.1 / 2.8 / 8.6 | 1.5 / 1.9 / 2.5 | 2.6 / 2.9 / 6.9 |
+| River 3+ way (1434) | 3.9 / 8.4 / 161 | 5.1 / 14.9 / 158 | 4.6 / 14.6 / 447 | 10.4 / 29.2 / 489 |
+| River heads-up (300) | 1.3 / 1.4 / 1.8 | 1.8 / 2.2 / 7.3 | 1.3 / 1.6 / 2.1 | 2.8 / 3.0 / 8.6 |
+
+- With automatic threads the targets hold: multiway flop worst case 24 ms (≤ 50), turn p95 10.5 ms and river p95 14.9 ms (≤ 15), heads-up turn and river p95 under 3 ms. On one thread river 3+ way p95 is 29.2 ms, as in batch B.
+- The 3+ way maxima moved (turn about 100 ms, up from 33-42; river about 160 ms, down from about 255). The new parameters change which random-play ranges become nearly impossible to deal together, where the multiway redraw spikes come from (decision 17). The p95 values barely moved.
+
+**Earlier numbers:** the batch A and B examples and tables above were measured with the old defaults; Baseline's shares in them (for example "Baseline 24%" folds in the 5c4d `why`) are now different. The archetype-line tests still pass.
+
+**Tests:** all 428 pass in Release (5.7 s) and Debug (23.3 s), with no assertion changed. GCC Release/Debug and clang build with zero warnings, and `strict.sh` is clean on `training_advisor.cpp`, `range_model.cpp` and `advisor_bench.cpp`.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -464,6 +587,8 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 - Stage 5 batch B: the line Monte Carlo budget (a third of the rollouts, 150,000 deals, 512 trial deals) was chosen for latency; its effect on line advice was not measured beyond the 1-2 pp noise estimate. Spots where no trial deal fits use the independence product, whose error there is unmeasured.
 - Stage 5 batch B: Hero's Baseline-read range as the bettor range for every line was not compared with a per-type reading.
 - Stage 5 batch B: the threads used for the lines were not run under ThreadSanitizer.
+- Stage 5 batch D: the tuned Baseline parameters were fitted to the river bench's hand-written ranges. The winner sits at a corner of the grid, the grid was not extended, and the turn holdout (Stage 8) does not exist yet. Their effect on flop and turn advice was checked only through the Stage 4 plausibility tests and the unchanged test suite. (The three parameters are postflop only, so preflop advice does not change.)
+- Stage 5 batch D: the diagnosis of the 3-bet-pot spots compares the model's inferred lead range with the bench's assumed range. Neither range is solved, so which story is closer to real play is unverified.
 
 ## Test changes
 
@@ -526,3 +651,5 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
   - `Advisor.ThreadCountDoesNotChangeTheHint`: also compares every line's action, range equity, two EV rows and `why` between 1 thread (serial lines) and 3 (parallel). Nothing relaxed.
   - `Advisor.DISABLED_LatencyByStreet`: now loops lines off and on, each with automatic threads and one thread.
   - **New tests:** `ArchetypeLinesAreLegalAndDeterministic`, `BaselineHintUnchangedByArchetypeLines` (four views, every Baseline field compared with `==`), `VsStationBluffsLessAndValueBetsThinner` (5c4d flop: Baseline bets, Station checks with ≥ 10 pp fewer folds; As3d river: Station bets, Nit checks; KsQh flop: Station 150, Nit 50, Baseline 100), `VsNitFoldsMoreToBigBets` (As3d river: Nit folds more to every size; facing a pot bet Baseline calls, Nit folds below pot odds), and the report `DISABLED_PrintArchetypeLines`.
+
+- **Stage 5 batch D:** no test assertion changed. With the new Baseline defaults all 428 tests pass in Release and Debug, including the archetype and range-model tests. The Stage 4 plausibility numbers moved within their bounds (see "Stage 5 tuning"); the closest is `CheckRaiseRangesAreStrong`'s flop check-raise, 47.7% against a lower bound of 45%.

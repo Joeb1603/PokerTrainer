@@ -237,6 +237,13 @@ public:
     // least 100), so the default 5000 gives the default 3000; the rest default.
     explicit TrainingAdvisor(std::uint64_t seed = 0, int rollouts = kDefaultRollouts);
 
+    // Tuning hook, for tools such as advisor_bench's --baseline-params: the
+    // Baseline line (the hint's own fields) uses `baseline_params` instead of
+    // archetype_params(Baseline), for the opponents' ranges, their answers and
+    // Hero's range as they read it. The Nit, Station and Maniac lines keep their
+    // own rows. The trainer never uses it. Throws as the constructor above.
+    TrainingAdvisor(std::uint64_t seed, AdvisorOptions options, const ArchetypeParams& baseline_params);
+
     // The result depends only on the seed and the view, so a GUI can call this every
     // frame and the hint will not flicker. Throws std::invalid_argument unless the
     // view's seat holds cards and is the one to act.
@@ -247,6 +254,7 @@ public:
 private:
     std::uint64_t seed_;
     AdvisorOptions options_;
+    std::optional<ArchetypeParams> baseline_params_;  // Empty: archetype_params(Baseline)
 };
 
 }  // namespace poker

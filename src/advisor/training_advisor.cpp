@@ -776,6 +776,11 @@ TrainingAdvisor::TrainingAdvisor(std::uint64_t seed, int rollouts)
     : TrainingAdvisor(seed, AdvisorOptions{.rollouts = rollouts,
                                            .range_rollouts = std::max(kMinRangeRollouts, rollouts / 5 * 3)}) {}
 
+TrainingAdvisor::TrainingAdvisor(std::uint64_t seed, AdvisorOptions options, const ArchetypeParams& baseline_params)
+    : TrainingAdvisor(seed, options) {
+    baseline_params_ = baseline_params;
+}
+
 HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
     if (!view.own_hole || view.legal.mask == 0) {
         throw std::invalid_argument("TrainingAdvisor::analyze: seat is not the one to act");
@@ -835,14 +840,20 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
     // The range walks: one per line, and Hero's own range as Baseline opponents
     // would read it, which every line uses as the bettor's range (the types differ
     // in how they answer a bet, not in how they read Hero).
+    // baseline_params_, when set, replaces Baseline's row (a tuning hook).
+    const ArchetypeParams& baseline_params =
+        baseline_params_ ? *baseline_params_ : archetype_params(Archetype::Baseline);
+    const auto line_params = [&](std::size_t i) -> const ArchetypeParams& {
+        return i == 0 ? baseline_params : archetype_params(kLines[i]);
+    };
     std::array<std::array<std::optional<WeightedRange>, kMaxSeats>, kArchetypeCount> ranges;
     WeightedRange hero_range;
     run_tasks(line_count + (wants_hero_range ? 1 : 0), parallel, [&](std::size_t i) {
         if (i < line_count) {
-            ranges[i] = infer_ranges(view, kLines[i]);
+            ranges[i] = infer_ranges(view, line_params(i));
             return;
         }
-        hero_range = infer_range_for(view, view.seat, Archetype::Baseline, false);
+        hero_range = infer_range_for(view, view.seat, baseline_params, false);
         if (!(hero_range.total() > 0.0)) {
             hero_range = WeightedRange::uniform();
             hero_range.remove_cards(card_mask(std::span<const Card>(view.board)));
@@ -866,7 +877,7 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
 
     std::array<LineResult, kArchetypeCount> lines;
     run_tasks(line_count, parallel, [&](std::size_t i) {
-        const ArchetypeParams& params = archetype_params(kLines[i]);
+        const ArchetypeParams& params = line_params(i);
         RangeEquityOptions line_options = range_options;
         double acceptance = 1.0;
         if (i > 0) {

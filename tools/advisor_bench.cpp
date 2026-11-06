@@ -3,7 +3,7 @@
 //
 //   advisor_bench [--spots PATH] [--iterations N] [--min-iterations N] [--target PCT]
 //                 [--combos N] [--advisor-rollouts N] [--seed S] [--timing] [--only ID]
-//                 [--csv PATH] [--stability]
+//                 [--csv PATH] [--stability] [--baseline-params C,V,B]
 //
 // For each spot: replay the script through GameEngine, solve the river from the
 // spot's assumed ranges, then ask the advisor about a sample of hero combos and
@@ -25,6 +25,10 @@
 // much the sampled combos' regrets move: a check that ev_best has converged off
 // the solver's own path. (The solver is deterministic, so continuing a solve is the
 // same as re-solving at twice the iterations.)
+//
+// --baseline-params is a tuning hook (Stage 5's one-round grid search): it runs the
+// advisor with Baseline's continue_mult, value_bet_top and bluff_mult replaced, the
+// other Baseline parameters unchanged (TrainingAdvisor's baseline_params constructor).
 
 #include <algorithm>
 #include <array>
@@ -61,7 +65,7 @@ constexpr int kCheckEvery = 25;  // Iterations between exploitability checks
 constexpr std::string_view kUsage =
     "Usage: advisor_bench [--spots PATH] [--iterations N] [--min-iterations N] [--target PCT]\n"
     "                     [--combos N] [--advisor-rollouts N] [--seed S] [--timing] [--only ID]\n"
-    "                     [--csv PATH] [--stability]\n"
+    "                     [--csv PATH] [--stability] [--baseline-params C,V,B]\n"
     "  --spots             spot file (default tools/bench/river_spots.json)\n"
     "  --iterations        solver iteration cap per spot (default 3000)\n"
     "  --min-iterations    iterations before the target may stop a solve (default 2000, at\n"
@@ -75,7 +79,9 @@ constexpr std::string_view kUsage =
     "  --only              run one spot by id\n"
     "  --csv               write one row per sampled combo\n"
     "  --stability         re-solve each spot at twice its iterations and report the change\n"
-    "                      in per-combo regret\n";
+    "                      in per-combo regret\n"
+    "  --baseline-params   tuning: Baseline continue_mult,value_bet_top,bluff_mult for the\n"
+    "                      advisor (default: the built-in Baseline row)\n";
 
 struct Options {
     std::string spots = "tools/bench/river_spots.json";
@@ -89,6 +95,7 @@ struct Options {
     bool stability = false;
     std::optional<std::string> only;
     std::optional<std::string> csv;
+    std::optional<ArchetypeParams> baseline_params;
 };
 
 [[noreturn]] void usage_error(const std::string& message) {
@@ -102,6 +109,27 @@ int int_flag(std::string_view flag, std::string_view value, int minimum) {
         usage_error(std::string(flag) + " needs an integer of at least " + std::to_string(minimum));
     }
     return *parsed;
+}
+
+// "C,V,B": Baseline with continue_mult C, value_bet_top V and bluff_mult B.
+ArchetypeParams baseline_params_flag(std::string_view value) {
+    std::array<double, 3> numbers{};
+    std::size_t start = 0;
+    for (std::size_t k = 0; k < numbers.size(); ++k) {
+        const std::size_t comma = value.find(',', start);
+        const bool last = k + 1 == numbers.size();
+        if (last != (comma == std::string_view::npos)) usage_error("--baseline-params needs three numbers, C,V,B");
+        const std::optional<double> parsed =
+            tools::parse_double(value.substr(start, last ? std::string_view::npos : comma - start));
+        if (!parsed || !(*parsed >= 0.0)) usage_error("--baseline-params needs three non-negative numbers");
+        numbers[k] = *parsed;
+        start = comma + 1;
+    }
+    ArchetypeParams params = archetype_params(Archetype::Baseline);
+    params.continue_mult = numbers[0];
+    params.value_bet_top = numbers[1];
+    params.bluff_mult = numbers[2];
+    return params;
 }
 
 Options parse_options(int argc, char** argv) {
@@ -142,6 +170,8 @@ Options parse_options(int argc, char** argv) {
             options.only = std::string(value);
         } else if (arg == "--csv") {
             options.csv = std::string(value);
+        } else if (arg == "--baseline-params") {
+            options.baseline_params = baseline_params_flag(value);
         } else {
             usage_error("unknown flag: " + std::string(arg));
         }
@@ -328,7 +358,10 @@ SpotResult run_spot(const bench::BenchFile& file, const bench::BenchSpot& spot, 
     double mass = 0.0;
     for (const std::size_t h : sample) mass += root.share[h];
 
-    const TrainingAdvisor advisor(options.seed, options.rollouts);
+    const TrainingAdvisor advisor =
+        options.baseline_params
+            ? TrainingAdvisor(options.seed, TrainingAdvisor(options.seed, options.rollouts).options(), *options.baseline_params)
+            : TrainingAdvisor(options.seed, options.rollouts);
     for (const std::size_t h : sample) {
         const int combo = root.hands[h];
         const GameEngine engine = bench::replay_spot(file, spot, combo_cards(combo), villain_for(combo));
@@ -450,6 +483,13 @@ double percentile(std::vector<double> values, double q) {
 
 }  // namespace
 
+std::string baseline_text(const Options& options) {
+    if (!options.baseline_params) return {};
+    const ArchetypeParams& p = *options.baseline_params;
+    return ", Baseline params " + fixed(p.continue_mult, 2) + "," + fixed(p.value_bet_top, 2) + "," +
+           fixed(p.bluff_mult, 2);
+}
+
 int main(int argc, char** argv) {
     const Options options = parse_options(argc, argv);
     const auto started = std::chrono::steady_clock::now();
@@ -480,7 +520,7 @@ int main(int argc, char** argv) {
     std::cout << "## Advisor vs river solver\n\n"
               << "Solver: target " << options.target << "% of pot, " << options.min_iterations << " to "
               << options.iterations << " iterations. Advisor: seed " << options.seed << ", " << options.rollouts
-              << " rollouts. Up to " << options.combos << " hero combos per spot, weighted by root share.\n"
+              << " rollouts" << baseline_text(options) << ". Up to " << options.combos << " hero combos per spot, weighted by root share.\n"
               << "Regret uses best-continuation EVs (ev_best). Ranges are assumed, not solved.\n\n"
               << "| spot | hero | hands | sampled | iters | expl % pot | regret bb | > 0.5 bb | > 1 bb | agree | freq"
               << " | < 10% | inexact maps |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
