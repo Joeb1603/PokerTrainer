@@ -387,6 +387,66 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 - **The same bet with 88 on Kd8s3c (a set):** 97.2% against the calls and 94.9% against the raises; EV 446.4 against 194.2 for checking.
 - **K9o facing 150 into 200 on the flop:** 74.4% against the estimated range and 85.9% against a random hand. The advice is to raise to 400.
 
+### Stage 5 batch B (archetype lines), uncommitted, on top of `4b7b985`
+
+**What it adds:** `hint.versus[0..2]` for Nit, Station and Maniac when `AdvisorOptions::archetype_lines` is on (the default). The model is documented in `training_advisor.h` under "Archetype lines". No change in `src/range`, the bots or the JSONL schema; mistakes stay on Baseline `base_ev`.
+
+**Decisions**
+- **Same pipeline per line.** Each line runs `infer_ranges(view, type)` for every opponent and that type's `archetype_params` for their answers, through the same `evaluate_line` code as Baseline (check/call/raise EVs, chart prior, size rule, fit, all-in rules). Each line has its own `ev` with fit; there is no per-line `base_ev`.
+- **Shared per-combo vector.** E is computed once over the union of all four lines' combos. Each entry depends only on its own combo (river and turn exact, flop sample seeded per decision, preflop matrix), so Baseline is bit-identical with lines on or off (`BaselineHintUnchangedByArchetypeLines`; bench unchanged).
+- **Bettor range = Hero's range as Baseline reads it,** for every line. The types differ in how they answer a bet, not in how they read Hero, and a fixed bettor range keeps each line's difference to the opponents' answers. (Not compared against a per-type reading of Hero.)
+- **Value-size shift:** a value bet is the size rule's own "solid" or "very strong" hand (`SizeChoice::value`). Only then, and only where betting already beats the passive options, does the chosen rung move by `value_size_shift` (Nit −1, Station +1, Maniac 0), clamped to the ladder. A shifted size that would take the whole stack is used only when all-in is in range (≤ 1.5 pots); otherwise the unshifted size stays. Probes, thin value and draws never shift. Preflop has no shift (EV picks the size there).
+- **Preflop chart prior: full weight in the lines** (`kArchetypePriorScale = 1.0`). Measured over all 169 classes in six spots (lines that change Fold/Call/Raise against Baseline at full prior):
+
+| Spot | Line prior 1.0 (Nit/Station/Maniac) | Line 0.5, Baseline 1.0 | Both 0.5 (control) |
+|---|---|---|---|
+| BTN first in | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| CO first in | 0 / 0 / 0 | 11 / 1 / 0 | 11 / 1 / 0 |
+| SB first in | 0 / 2 / 1 | 80 / 4 / 4 | 62 / 14 / 15 |
+| BB vs CO open | 66 / 0 / 0 | 1 / 23 / 36 | 36 / 20 / 5 |
+| BTN vs CO open | 2 / 3 / 11 | 66 / 152 / 154 | 88 / 2 / 0 |
+| SB vs BTN open | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+  - At half weight the lines 3-bet 152 (Station) and 154 (Maniac) of 169 classes on the BTN against a CO open, but only 2 and 0 against a Baseline at the same half weight: the change comes from weakening the prior, not from the type. The preflop model alone is loose (it opens K4o, Q7o, T7o and 65o from the BTN at positive raw EV, and 3-bets nearly everything), so a weaker prior lets that looseness through and would teach it as an exploit.
+  - The exploit differences are small next to the prior. BTN first in with K4o, a 2.5x open to 40: model EV vs Nit blinds −16.7 + 30 prior = +13.3 raw, vs Baseline +7.6 raw, so the Nit edge is 5.7 chips (0.29 BB) against a 30-chip (1.5 BB) prior for a rejected raise. Stealing K4o vs Nits would need a prior weight below 0.44, where Baseline-strength looseness starts too (Baseline's own K4o flips below 0.25).
+  - At full weight the lines still differ where the type matters most: BB vs a Nit's CO open drops 66 light 3-bets to folds (the Nit folds 55% to the min 3-bet against Baseline's 72%); BTN vs a Maniac's CO open 3-bets 11 more hands (A2o-A9o, K9s, A7s, KTo).
+  - **Side finding, Baseline (not changed here):** Baseline BB 3-bets nearly every hand against a CO open, including 72o (raw raise EV about +50 from 72% folds to a min 3-bet, against a 35-chip prior). That is batch A's preflop model plus the non-positional vs-3-bet charts; Stage 6's charts should be checked against it.
+- **`why`:** one sentence from the numbers, labels shortened ("BET 150"), at most 140 characters (tested on every random state). Cases: same action ("Same as Baseline: folds 44% to BET 50 (Baseline 24%); 11% equity when called." or range equity vs pot odds); a bet where Baseline is passive (fold share up by ≥ 5 pp → "betting profits", else equity when called → "bets thinner for value"); passive where Baseline bets (continue share, raise share, or equity when called at Baseline's size); both betting at different sizes ("value bets go bigger/smaller" when shifted); otherwise range equity against pot odds.
+
+**Performance.** The first version (serial, full Monte Carlo per line) took river 3+ way p95 46 ms and turn 29 ms. The cost was not the walks (about 1.2 ms each) but the Nit line's multiway Monte Carlo: narrowed Nit ranges collide, and `equity_vs_ranges` redrew up to 1.3 million deals (25-120 ms) in about 10% of multiway river spots. Fixes, all inside the advisor:
+- The walks (four types plus Hero's range) and then the four lines run on threads (`run_tasks`), unless `threads == 1`; results are bit-identical either way (`ThreadCountDoesNotChangeTheHint` now compares the lines too).
+- Postflop the lines' multiway Monte Carlo uses a third of `range_rollouts` (1000 by default; Baseline's seed, so the first chunk's deals match), and fewer where a 512-deal trial finds most deals clash: rollouts = clamp(150,000 × acceptance, 100, 1000). If no trial deal fits, the line uses the independent-opponents product directly. Preflop keeps the full count.
+- Rejected alternative: a calibrated independence product (line product + Baseline's Monte Carlo minus Baseline's product) for all lines. Against a 40,000-rollout reference on 477 multiway turn/river line spots its error was mean 1.6 pp, p95 6.1 pp, max 23 pp; plain 3000-rollout Monte Carlo was 0.3 / 1.1 / 2.2 pp.
+
+**Hint latency** (`Advisor.DISABLED_LatencyByStreet`, Release, default options, ms, p50 / p95 / max; this container was faster than batch A's, so the "off" rows are the comparison):
+
+| Spot | Lines off, auto threads | Lines on, auto threads | Lines off, 1 thread | Lines on, 1 thread |
+|---|---|---|---|---|
+| Preflop 3+ way (2010) | 2.6 / 3.4 / 7.7 | 5.9 / 8.1 / 20 | 4.1 / 5.4 / 17 | 12.6 / 17.0 / 47 |
+| Flop 3+ way (1774) | 4.7 / 8.5 / 20 | 8.0 / 11.4 / 27 | 8.1 / 20.1 / 43 | 19.6 / 27.1 / 56 |
+| Flop heads-up (300) | 3.8 / 4.3 / 5.0 | 4.7 / 5.6 / 7.4 | 11.7 / 14.0 / 19 | 14.3 / 16.3 / 24 |
+| Turn 3+ way (1588) | 3.9 / 6.2 / 33 | 5.6 / 11.3 / 42 | 4.8 / 8.9 / 84 | 10.3 / 20.0 / 97 |
+| Turn heads-up | 1.5 / 1.6 / 2.0 | 2.1 / 2.6 / 4.5 | 1.5 / 1.8 / 3.7 | 2.7 / 3.1 / 4.6 |
+| River 3+ way (1434) | 3.9 / 7.7 / 254 | 5.3 / 14.7 / 258 | 4.5 / 13.6 / 624 | 10.2 / 27.6 / 633 |
+| River heads-up | 1.3 / 1.4 / 1.7 | 1.7 / 2.0 / 3.0 | 1.3 / 1.5 / 2.2 | 2.9 / 3.3 / 4.9 |
+
+- Targets with automatic threads: multiway flop worst case 27 ms (≤ 50), turn p95 11.3 ms and river p95 14.7 ms (≤ 15). The river maxima (about 250 ms) are Baseline's own redraw spikes (decision 17), present with lines off too. On one thread the targets are missed (river 3+ way p95 27.6 ms).
+
+**Three example spots** (heads-up, Kd8s3c2hJd, pot 200, 1900 behind; Hero is the BB; default options, seed 60)
+
+| Spot | Baseline | vs Nit | vs Station | vs Maniac |
+|---|---|---|---|---|
+| 5c4d, flop, first to act (air) | BET 50 (24% folds) | BET 50 | CHECK | CHECK |
+| KsQh, flop, first to act (top pair) | BET 100 | BET 50 | BET 150 | BET 100 |
+| As3d, river, faces a pot bet after two checked streets (third pair) | CALL 200 (39% vs range, 33% odds) | FOLD | FOLD | CALL 200 |
+
+- 5c4d, Station: "vs Station: continues 95% vs BET 50 (Baseline 76%): too little fold equity, so CHECK." Nit: "Same as Baseline: folds 44% to BET 50 (Baseline 24%); 11% equity when called." (stab EV 76 vs check 33).
+- KsQh, Nit: "vs Nit: BET 50, not BET 100: folds 53% to BET 100 (Baseline 37%), so value bets go smaller." Station: "vs Station: BET 150, not BET 100: folds 20% to BET 150 (Baseline 46%), so value bets go bigger."
+- As3d facing pot, Nit: "vs Nit: 22% vs the range (Baseline 39%) against 33% pot odds, so FOLD." Station: "vs Station: 29% vs the range (Baseline 39%) against 33% pot odds, so FOLD." Maniac: "Same as Baseline: 54% vs the range (Baseline 39%) against 33% pot odds." The Station folds because its river bets after two checks are mostly value in this model (bluff_mult 0.4); a real station's bets may be lighter.
+- Also: As3d first to act on the river is thin value. Baseline and Station BET 50; Nit CHECKs ("vs Nit: only 36% equity when called at BET 50 (Baseline 72%), so CHECK."); Maniac CHECKs (continues 86%).
+
+**Tests:** 428 pass in Release (424 + 4 new) and Debug. Release suite about 6 s, Debug 23.7 s. `ArchetypeLinesAreLegalAndDeterministic` takes 1.6 s in Release and about 10 s in Debug (3 random games, fast options with lines on). GCC Release/Debug and clang build with zero warnings; `strict.sh` clean on `training_advisor.cpp`. River bench unchanged: overall 0.867 BB, 54% agree.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -400,6 +460,10 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 
 - Stage 5: the preflop all-in rule's 15 BB line was chosen to match the range model's short-stack threshold and Stage 6's push/fold range; it was not measured.
 - Stage 5: the 3+ way hint latencies come from random play, whose lines are not representative of real games.
+- Stage 5 batch B: the archetype lines are not checked against a solver or against the bots; the river bench scores Baseline only. The exploit directions in the examples are judgment.
+- Stage 5 batch B: the line Monte Carlo budget (a third of the rollouts, 150,000 deals, 512 trial deals) was chosen for latency; its effect on line advice was not measured beyond the 1-2 pp noise estimate. Spots where no trial deal fits use the independence product, whose error there is unmeasured.
+- Stage 5 batch B: Hero's Baseline-read range as the bettor range for every line was not compared with a per-type reading.
+- Stage 5 batch B: the threads used for the lines were not run under ThreadSanitizer.
 
 ## Test changes
 
@@ -453,3 +517,12 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
     - `ThreadCountDoesNotChangeTheHint`: 1 and 3 threads on a multiway flop give bit-identical hints.
     - `DISABLED_LatencyByStreet`: a report.
     - Each new test takes ≤ 0.03 s in Release.
+
+- **Stage 5 batch B** (`tests/training_advisor_test.cpp`):
+  - `expect_consistent_outcomes` (used by `OutcomesAreConsistent`, `FieldsInRangeAndBestActionLegalAcrossRandomStates` and `EverySizeIsUsedAndAdviceStaysSane`):
+    - **Old:** `versus` is empty.
+    - **New:** `expect_consistent_lines`: either no lines or all three in order (Nit, Station, Maniac); each line's action legal and its listed best; bets on the hint's ladder; EV rows and outcomes present exactly where Baseline's are; shares and equities in range; `why` ≤ 140 characters and starting "Same as Baseline: " or "vs <Type>: ".
+    - **Reason:** default options now fill the lines (`OutcomesAreConsistent` uses them); the fast-options loops still have lines off.
+  - `Advisor.ThreadCountDoesNotChangeTheHint`: also compares every line's action, range equity, two EV rows and `why` between 1 thread (serial lines) and 3 (parallel). Nothing relaxed.
+  - `Advisor.DISABLED_LatencyByStreet`: now loops lines off and on, each with automatic threads and one thread.
+  - **New tests:** `ArchetypeLinesAreLegalAndDeterministic`, `BaselineHintUnchangedByArchetypeLines` (four views, every Baseline field compared with `==`), `VsStationBluffsLessAndValueBetsThinner` (5c4d flop: Baseline bets, Station checks with ≥ 10 pp fewer folds; As3d river: Station bets, Nit checks; KsQh flop: Station 150, Nit 50, Baseline 100), `VsNitFoldsMoreToBigBets` (As3d river: Nit folds more to every size; facing a pot bet Baseline calls, Nit folds below pot odds), and the report `DISABLED_PrintArchetypeLines`.

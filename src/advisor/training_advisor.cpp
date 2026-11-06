@@ -6,10 +6,14 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <exception>
 #include <limits>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -38,6 +42,8 @@ constexpr double kVeryStrongBar = 0.5;
 constexpr double kSolidBar = 0.3;
 constexpr double kChartPriorBigBlinds = 1.0;
 constexpr double kChartPriorCallShare = 0.25;
+// The chart prior's weight in the archetype lines (training_advisor.h).
+constexpr double kArchetypePriorScale = 1.0;
 
 // The chart bots' preflop sizes (preflop_size in gto_heuristic_engine.cpp).
 constexpr double kOpenBigBlinds = 2.5;
@@ -45,6 +51,13 @@ constexpr int kIsoMultiple = 3;
 constexpr double kFourBetMultiple = 2.3;
 
 constexpr int kMinRangeRollouts = 100;
+// The archetype lines' multiway Monte Carlo: postflop, this many times fewer
+// rollouts than Baseline's (with its seed, so the first chunk's deals are the
+// same), and fewer still where narrow ranges make most deals collide, so
+// that about kLineDealBudget deals are drawn in all (rejected ones included).
+constexpr int kLineRolloutDivisor = 3;
+constexpr double kLineDealBudget = 150000.0;
+constexpr int kAcceptanceTrials = 512;
 constexpr std::uint64_t kRangeSeedSalt = 0xD1B54A32D192ED03ULL;
 
 std::size_t at(int index) { return static_cast<std::size_t>(index); }
@@ -110,33 +123,73 @@ double standard_raise_to(const PlayerView& view, const PreflopLevels& pre) {
     }
 }
 
-// Range equities for one decision: the per-combo vector against every opponent's
-// range, and Monte Carlo results for sets of several opponents.
+// Every range in `ranges` with the cards Hero can see removed. A range the model
+// emptied would make every number undefined, so it is read as any hand. Returns
+// the combos the ranges hold, which the per-combo vector must cover.
+std::bitset<kComboCount> prepare_ranges(const PlayerView& view, std::array<std::optional<WeightedRange>, kMaxSeats>& ranges) {
+    const CardMask dead = card_mask(std::span<const Card>(view.board)) | card_mask(std::span<const Card>(*view.own_hole));
+    std::bitset<kComboCount> needed;
+    for (std::optional<WeightedRange>& range : ranges) {
+        if (!range) continue;
+        WeightedRange live = *range;
+        live.remove_cards(dead);
+        if (!(live.total() > 0.0)) {
+            live = WeightedRange::uniform();
+            live.remove_cards(dead);
+        }
+        range = live;
+        needed |= combos_in(*range);
+    }
+    return needed;
+}
+
+// The share of joint deals, one combo from each range by weight, in which no two
+// opponents hold the same card: what equity_vs_ranges' redraws pay for. Estimated
+// from kAcceptanceTrials deals with the given seed.
+double deal_acceptance(const std::array<std::optional<WeightedRange>, kMaxSeats>& ranges, std::uint64_t seed) {
+    std::vector<std::vector<double>> cumulative;
+    for (const std::optional<WeightedRange>& range : ranges) {
+        if (!range) continue;
+        std::vector<double> sums(kComboCount);
+        double running = 0.0;
+        for (int combo = 0; combo < kComboCount; ++combo) {
+            running += std::max(0.0f, range->weight(combo));
+            sums[at(combo)] = running;
+        }
+        if (!(running > 0.0)) return 0.0;
+        cumulative.push_back(std::move(sums));
+    }
+    if (cumulative.size() < 2) return 1.0;
+    std::mt19937_64 rng(seed);
+    int accepted = 0;
+    for (int trial = 0; trial < kAcceptanceTrials; ++trial) {
+        CardMask held = 0;
+        bool clash = false;
+        for (const std::vector<double>& sums : cumulative) {
+            const double u = static_cast<double>(rng() >> 11) * 0x1.0p-53 * sums.back();
+            const auto it = std::upper_bound(sums.begin(), sums.end(), u);
+            const int combo = std::min(static_cast<int>(it - sums.begin()), kComboCount - 1);
+            const CardMask mask = combo_mask(combo);
+            clash = clash || (held & mask) != 0;
+            held |= mask;
+        }
+        if (!clash) ++accepted;
+    }
+    return static_cast<double>(accepted) / kAcceptanceTrials;
+}
+
+// Range equities for one decision and one set of opponent ranges (prepared by
+// prepare_ranges): the shared per-combo vector, and Monte Carlo results for sets
+// of several opponents. Each entry of the vector depends only on its own combo,
+// so one vector over the union of every line's ranges serves them all.
 class RangeEquities {
 public:
     RangeEquities(const PlayerView& view, std::array<std::optional<WeightedRange>, kMaxSeats> ranges,
-                  const RangeEquityOptions& options)
-        : view_(view), ranges_(std::move(ranges)), options_(options) {
-        const CardMask dead = card_mask(std::span<const Card>(view.board)) |
-                              card_mask(std::span<const Card>(*view.own_hole));
-        std::bitset<kComboCount> needed;
-        for (std::optional<WeightedRange>& range : ranges_) {
-            if (!range) continue;
-            // A range the model emptied would make every number undefined: read it as any hand.
-            WeightedRange live = *range;
-            live.remove_cards(dead);
-            if (!(live.total() > 0.0)) {
-                live = WeightedRange::uniform();
-                live.remove_cards(dead);
-            }
-            range = live;
-            needed |= combos_in(*range);
-        }
-        combos_ = hero_vs_each_combo(*view.own_hole, view.board, needed, options_);
-    }
+                  const ComboEquities& combos, const RangeEquityOptions& options)
+        : view_(view), ranges_(std::move(ranges)), options_(options), combos_(&combos) {}
 
     const std::optional<WeightedRange>& range(int index) const { return ranges_[at(index)]; }
-    const ComboEquities& combos() const { return combos_; }
+    const ComboEquities& combos() const { return *combos_; }
 
     // Asks for the sets of several opponents in one Monte Carlo run. Call before equity().
     void prepare(std::span<const std::uint8_t> sets) {
@@ -148,6 +201,7 @@ public:
         std::vector<LayerRequest> requests;
         for (const std::uint8_t set : multi_sets_) requests.push_back(LayerRequest{set});
         try {
+            if (independent_) throw std::invalid_argument("dealing together is not tried");
             multi_ = equity_vs_ranges(*view_.own_hole, view_.board, ranges_, requests, options_).equity;
         } catch (const std::invalid_argument&) {
             // Ranges narrowed to a few colliding combos (a villain can hold the only
@@ -174,15 +228,20 @@ public:
         return multi_[static_cast<std::size_t>(found - multi_sets_.begin())];
     }
 
-    double against(int index) const { return equity_vs_range(combos_, *ranges_[at(index)]).value_or(0.0); }
+    double against(int index) const { return equity_vs_range(*combos_, *ranges_[at(index)]).value_or(0.0); }
+
+    // Skips the Monte Carlo for the fallback below: for ranges that a trial run
+    // found could not be dealt together at all.
+    void treat_as_independent() { independent_ = true; }
 
 private:
     const PlayerView& view_;
     std::array<std::optional<WeightedRange>, kMaxSeats> ranges_;
     RangeEquityOptions options_;
-    ComboEquities combos_;
+    const ComboEquities* combos_;
     std::vector<std::uint8_t> multi_sets_;
     std::vector<double> multi_;
+    bool independent_ = false;
 };
 
 std::uint8_t all_in_set(const PlayerView& view, std::uint8_t set) {
@@ -308,6 +367,9 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
 struct SizeChoice {
     double fraction;
     const char* reason;
+    // A solid or very strong hand by the rule's own bars: the value bets an
+    // archetype line may resize. Probes, thin value and draws are not.
+    bool value;
 };
 
 // The postflop size for a hand worth betting. The table is in training_advisor.h.
@@ -322,15 +384,15 @@ SizeChoice preferred_size(const BoardTexture& texture, const HandRead& read, std
     const bool very_strong = made_big && equity >= bar(kVeryStrongBar);
     const bool solid = very_strong || equity >= bar(kSolidBar);
 
-    if (street == Street::River && very_strong) return {1.0, "a very strong river hand wants the biggest value bet"};
-    if (texture.monotone) return {0.25, "a monotone board favors small bets"};
+    if (street == Street::River && very_strong) return {1.0, "a very strong river hand wants the biggest value bet", true};
+    if (texture.monotone) return {0.25, "a monotone board favors small bets", solid};
     if (texture.paired || !texture.wet) {
-        return solid ? SizeChoice{0.5, "a standard value bet on a static board"}
-                     : SizeChoice{0.25, "a cheap probe or thin value bet on a static board"};
+        return solid ? SizeChoice{0.5, "a standard value bet on a static board", true}
+                     : SizeChoice{0.25, "a cheap probe or thin value bet on a static board", false};
     }
-    if (very_strong && texture.dynamic) return {1.0, "heavy protection on a dynamic board"};
-    if (solid || read.strong_draw()) return {0.75, "charges the draws on a wet board"};
-    return {0.5, "medium protection for thin value on a wet board"};
+    if (very_strong && texture.dynamic) return {1.0, "heavy protection on a dynamic board", true};
+    if (solid || read.strong_draw()) return {0.75, "charges the draws on a wet board", solid};
+    return {0.5, "medium protection for thin value on a wet board", false};
 }
 
 std::string percent_of_pot_label(const PlayerView& view, ActionType type, int to, int clean_to, double fraction) {
@@ -359,6 +421,346 @@ std::string hand_summary(const PlayerView& view, const HandRead& read) {
     return text + ")";
 }
 
+// Runs task(i) for every i below count: on threads of its own when `parallel`
+// (task 0 on the calling thread), else in order. Each task writes only its own
+// slot, so the result is the same either way. The first failure, by index, is
+// rethrown once every task has finished.
+template <class Task>
+void run_tasks(std::size_t count, bool parallel, const Task& task) {
+    std::vector<std::exception_ptr> errors(count);
+    const auto guarded = [&](std::size_t i) {
+        try {
+            task(i);
+        } catch (...) {
+            errors[i] = std::current_exception();
+        }
+    };
+    std::vector<std::thread> workers;
+    for (std::size_t i = 1; parallel && i < count; ++i) {
+        try {
+            workers.emplace_back(guarded, i);
+        } catch (const std::system_error&) {
+            guarded(i);  // No thread to be had: run it here
+        }
+    }
+    guarded(0);
+    if (!parallel) {
+        for (std::size_t i = 1; i < count; ++i) guarded(i);
+    }
+    for (std::thread& worker : workers) worker.join();
+    for (const std::exception_ptr& error : errors) {
+        if (error) std::rethrow_exception(error);
+    }
+}
+
+// Everything about one decision that does not depend on the opponents' type.
+struct Decision {
+    const PlayerView* view = nullptr;
+    PotMath math;
+    double equity = 0.0;  // Against random hands: the size rule's input
+    bool preflop = false;
+    bool may_raise = false;
+    BoardTexture texture;
+    HandRead read;
+    std::vector<PotLayer> layers;
+    PreflopResponse chart_choice = PreflopResponse::Fold;
+    RaiseInputs inputs;  // Without equities, params and pot_kept_share, which each line sets
+};
+
+// One line's advice: Baseline's, or one archetype's.
+struct LineResult {
+    EvEstimates ev;
+    EvEstimates base_ev;
+    std::array<std::optional<int>, kLadder.size()> tos;
+    std::array<std::optional<BetOutcome>, kOutcomeCount> outcomes;
+    Action action{};
+    std::string label;
+    std::string size_reason;
+    double range_equity = 0.0;
+    bool value_shifted = false;  // The size rule's value bet moved by value_shift
+};
+
+// The model, the chart prior and the size rule for one set of opponent ranges and
+// params. value_shift moves a postflop value bet that many ladder rungs (Baseline
+// 0); prior_scale multiplies the preflop chart prior (Baseline 1).
+LineResult evaluate_line(const Decision& d, RangeEquities& equities, const ArchetypeParams& params, int value_shift,
+                         double prior_scale) {
+    const PlayerView& view = *d.view;
+    const LegalActions& legal = view.legal;
+    const PotMath& math = d.math;
+    const bool preflop = d.preflop;
+    const bool may_raise = d.may_raise;
+
+    std::uint8_t everyone = 0;
+    for (int i = 0; i < kMaxSeats; ++i) {
+        if (i != view.seat && contesting(view.seats[at(i)]) && equities.range(i)) {
+            everyone = static_cast<std::uint8_t>(everyone | (1u << i));
+        }
+    }
+    std::vector<std::uint8_t> sets{everyone};
+    for (const PotLayer& layer : d.layers) {
+        sets.push_back(layer.opponent_seats);
+        sets.push_back(all_in_set(view, layer.opponent_seats));
+    }
+    equities.prepare(sets);
+
+    double layered = 0.0;
+    double kept = 0.0;
+    int layer_chips = 0;
+    for (const PotLayer& layer : d.layers) {
+        layered += layer.amount * equities.equity(layer.opponent_seats);
+        kept += layer.amount * equities.equity(all_in_set(view, layer.opponent_seats));
+        layer_chips += layer.amount;
+    }
+    const double layered_equity = layer_chips > 0 ? layered / layer_chips : 0.0;
+
+    LineResult r;
+    r.range_equity = equities.equity(everyone);
+
+    RaiseInputs inputs = d.inputs;
+    if (may_raise) {
+        inputs.equities = &equities;
+        inputs.params = &params;
+        inputs.pot_kept_share = layer_chips > 0 ? kept / layer_chips : 1.0;
+    }
+
+    // The chart prior. A free check costs nothing, so it is left alone. Rejected
+    // options lose more the more they risk: the chart says most, and the all-in
+    // equity of the model least, about the big ones. An approved call gains the
+    // same, but an approved raise only the flat amount, or every chart raise would
+    // become all in.
+    const auto prior = [&](PreflopResponse option, int risked) {
+        if (!preflop) return 0.0;
+        const double flat = kChartPriorBigBlinds * view.big_blind * prior_scale;
+        const double scaled = kChartPriorCallShare * risked * prior_scale;
+        if (d.chart_choice != option) return -(flat + scaled);
+        return option == PreflopResponse::Call ? flat + scaled : flat;
+    };
+    const auto raise_risk = [&](int to) { return clamp_raise_to(view, to) - view.seats[at(view.seat)].street_bet; };
+
+    // Later options must beat earlier ones outright, so ties settle on the cheaper play.
+    double best_ev = 0.0;
+    bool have_best = false;
+    const auto consider = [&](double ev, Action action, std::string label) {
+        if (have_best && ev <= best_ev) return;
+        best_ev = ev;
+        r.action = action;
+        r.label = std::move(label);
+        have_best = true;
+    };
+
+    if (legal.allows(ActionType::Check)) {
+        const double ev = layered_equity * math.contestable;
+        r.ev.check_call = ev;
+        consider(ev, {ActionType::Check, 0}, "CHECK");
+        r.ev.fold = 0.0;  // Listed for completeness; a free card always beats it
+    } else {
+        r.ev.fold = 0.0;
+        consider(0.0, {ActionType::Fold, 0}, "FOLD");
+        if (legal.allows(ActionType::Call)) {
+            const double ev = layered_equity * (math.contestable + math.to_call) - math.to_call +
+                              prior(PreflopResponse::Call, math.to_call);
+            r.ev.check_call = ev;
+            consider(ev, {ActionType::Call, 0}, "CALL " + std::to_string(math.to_call));
+        }
+    }
+
+    const ActionType raise_type = legal.allows(ActionType::Bet) ? ActionType::Bet : ActionType::Raise;
+    std::array<std::string, kLadder.size()> rung_labels;
+    std::optional<double> best_rung_ev;
+    if (may_raise) {
+        for (std::size_t i = 0; i < kLadder.size(); ++i) {
+            const SizeRung& rung = kLadder[i];
+            const int clean_to = raise_to_for_pot_fraction(view, rung.fraction);
+            // Sized for what somebody can match, as raise_value values it.
+            const int to = clamp_raise_to(view, clean_to);
+            if (to >= legal.max_raise_to) continue;  // That is the all-in option below
+            const bool repeated = std::any_of(r.tos.begin(), r.tos.begin() + static_cast<std::ptrdiff_t>(i),
+                                              [&](const std::optional<int>& earlier) { return earlier == to; });
+            if (repeated) continue;  // Sizes clamped to the same bet
+            const RaiseValue value = raise_value(view, inputs, to);
+            const double ev = value.ev + prior(PreflopResponse::Raise, raise_risk(to));
+            r.ev.*rung.ev = ev;
+            r.tos[i] = to;
+            r.outcomes[i] = value.outcome;
+            rung_labels[i] = percent_of_pot_label(view, raise_type, to, clean_to, rung.fraction);
+            best_rung_ev = std::max(best_rung_ev.value_or(ev), ev);
+            if (preflop) consider(ev, {raise_type, to}, rung_labels[i]);
+        }
+    }
+
+    const PublicSeat& me = view.seats[at(view.seat)];
+    const std::string all_in_label = "ALL-IN " + std::to_string(me.street_bet + me.stack);
+    if (legal.allows(ActionType::AllIn)) {
+        // Without raising rights an all-in is just the call, already considered.
+        if (may_raise) {
+            const RaiseValue value = raise_value(view, inputs, legal.max_raise_to);
+            r.ev.all_in = value.ev + prior(PreflopResponse::Raise, raise_risk(legal.max_raise_to));
+            r.outcomes[kOutcomeAllIn] = value.outcome;
+        } else {
+            r.ev.all_in = r.ev.check_call.value_or(0.0);
+        }
+    }
+    // Preflop, a single-street model overrates deep shoves with strong hands: the
+    // callers are the strong part of each range, but a normal raise keeps the rest
+    // in for later streets, which `implied` barely counts at a preflop pot's size.
+    // So all-in is advised preflop only short (kPreflopShoveMaxBigBlinds effective),
+    // within kShoveMaxPots of the pot, or as the only raise left.
+    bool preflop_shove_ok = false;
+    if (preflop && legal.allows(ActionType::AllIn)) {
+        int deepest_total = 0;
+        for (int i = 0; i < kMaxSeats; ++i) {
+            const PublicSeat& s = view.seats[at(i)];
+            if (i != view.seat && s.status == SeatStatus::Active) deepest_total = std::max(deepest_total, s.street_bet + s.stack);
+        }
+        const int effective = std::min(me.street_bet + me.stack, deepest_total);
+        preflop_shove_ok = !may_raise || !best_rung_ev || effective <= kPreflopShoveMaxBigBlinds * view.big_blind ||
+                           raise_risk(legal.max_raise_to) <= kShoveMaxPots * view.total_pot;
+    }
+    if (legal.allows(ActionType::AllIn) && (preflop_shove_ok || !may_raise)) {
+        consider(*r.ev.all_in, {ActionType::AllIn, 0}, all_in_label);
+    }
+    r.base_ev = r.ev;
+    // A deep shove is not on offer, so it must not out-list the advice.
+    if (preflop && legal.allows(ActionType::AllIn) && !preflop_shove_ok) r.ev.all_in = std::min(*r.ev.all_in, best_ev);
+
+    if (!preflop && may_raise) {
+        const bool can_shove = legal.allows(ActionType::AllIn);
+        const bool shove_in_range =
+            can_shove && (!best_rung_ev || raise_risk(legal.max_raise_to) <= kShoveMaxPots * view.total_pot);
+        double best_bet = best_rung_ev.value_or(-std::numeric_limits<double>::infinity());
+        if (shove_in_range) best_bet = std::max(best_bet, *r.ev.all_in);
+
+        if (best_bet > best_ev) {  // Betting beats the passive options, on the model alone
+            const SizeChoice size = preferred_size(d.texture, d.read, view.board, view.street, d.equity,
+                                                   std::max(1, view.opponents_in_hand()));
+            double fraction = size.fraction;
+            // A value bet moves along the ladder for the type, never past its ends,
+            // and onto all-in only where all-in may be chosen anyway.
+            if (value_shift != 0 && size.value) {
+                const int rung = static_cast<int>(std::lround(fraction * 4.0)) - 1;
+                const int shifted = std::clamp(rung + value_shift, 0, static_cast<int>(kLadder.size()) - 1);
+                const double shifted_fraction = kLadder[at(shifted)].fraction;
+                const int shifted_to = clamp_raise_to(view, raise_to_for_pot_fraction(view, shifted_fraction));
+                const bool listed = std::find(r.tos.begin(), r.tos.end(), std::optional<int>(shifted_to)) != r.tos.end();
+                if (shifted != rung && (listed || shove_in_range)) {
+                    fraction = shifted_fraction;
+                    r.value_shifted = true;
+                }
+            }
+            const int target = clamp_raise_to(view, raise_to_for_pot_fraction(view, fraction));
+            const auto chosen = std::find(r.tos.begin(), r.tos.end(), std::optional<int>(target));
+            const bool shoves_on_ev = shove_in_range && (!best_rung_ev || *r.ev.all_in > *best_rung_ev);
+            if (shoves_on_ev || chosen == r.tos.end()) {
+                // The chosen size would take the whole stack, or all-in is simply best.
+                if (can_shove) {
+                    r.ev.all_in = best_bet;
+                    consider(best_bet, {ActionType::AllIn, 0}, all_in_label);
+                }
+            } else {
+                const std::size_t index = static_cast<std::size_t>(chosen - r.tos.begin());
+                r.ev.*kLadder[index].ev = best_bet;
+                consider(best_bet, {raise_type, target}, rung_labels[index]);
+                r.size_reason = size.reason;
+            }
+        }
+        // A deep shove is not on offer, so it must not out-list the advice.
+        if (can_shove && !shove_in_range) r.ev.all_in = std::min(*r.ev.all_in, best_ev);
+    }
+    return r;
+}
+
+// The outcomes row of a bet or raise this line advises, if it has one.
+std::optional<std::size_t> outcome_index(const LineResult& r, const Action& action) {
+    if (action.type == ActionType::AllIn) {
+        return r.outcomes[kOutcomeAllIn] ? std::optional<std::size_t>(kOutcomeAllIn) : std::nullopt;
+    }
+    if (action.type != ActionType::Bet && action.type != ActionType::Raise) return std::nullopt;
+    for (std::size_t i = 0; i < r.tos.size(); ++i) {
+        if (r.tos[i] == action.amount && r.outcomes[i]) return i;
+    }
+    return std::nullopt;
+}
+
+bool aggressive(const Action& action) {
+    return action.type == ActionType::Bet || action.type == ActionType::Raise || action.type == ActionType::AllIn;
+}
+
+int pct(double value) { return static_cast<int>(std::lround(value)); }
+
+// "BET 150 (75% Pot)" as "BET 150": the why text is short.
+std::string short_label(const std::string& label) { return label.substr(0, label.find(" (")); }
+
+// One sentence from the numbers: what drives this line's advice away from
+// Baseline's, or why it stays.
+std::string line_why(Archetype versus, const LineResult& base, const LineResult& line, const PotMath& math) {
+    char text[256];
+    const std::string name(to_string(versus));
+    const std::string mine_label = short_label(line.label);
+    const std::string base_label = short_label(base.label);
+    const bool same = line.action.type == base.action.type && line.action.amount == base.action.amount;
+    const std::optional<std::size_t> mine = outcome_index(line, line.action);
+    const std::optional<std::size_t> theirs = outcome_index(base, base.action);
+    const int line_eq = pct(100.0 * line.range_equity);
+    const int base_eq = pct(100.0 * base.range_equity);
+    const auto fold_at = [](const LineResult& r, std::size_t i) { return pct(r.outcomes[i]->fold_pct); };
+
+    if (same && mine && theirs) {
+        std::snprintf(text, sizeof text, "Same as Baseline: folds %d%% to %s (Baseline %d%%); %d%% equity when called.",
+                      fold_at(line, *mine), mine_label.c_str(), fold_at(base, *theirs),
+                      pct(line.outcomes[*mine]->equity_called_pct));
+    } else if (same && math.to_call > 0) {
+        std::snprintf(text, sizeof text, "Same as Baseline: %d%% vs the range (Baseline %d%%) against %d%% pot odds.",
+                      line_eq, base_eq, pct(100.0 * math.pot_odds));
+    } else if (same) {
+        std::snprintf(text, sizeof text, "Same as Baseline: %d%% vs the range (Baseline %d%%), and no bet beats checking.",
+                      line_eq, base_eq);
+    } else if (aggressive(line.action) && aggressive(base.action) && mine && theirs && base.outcomes[*mine] &&
+               line.outcomes[*theirs]) {
+        // Both bet or raise, at different sizes.
+        const bool bigger = *mine > *theirs;
+        const std::size_t at_size = bigger ? *mine : *theirs;  // The bigger of the two sizes
+        const char* why = !line.value_shifted ? "the better size" : bigger ? "value bets go bigger" : "value bets go smaller";
+        std::snprintf(text, sizeof text, "vs %s: %s, not %s: folds %d%% to %s (Baseline %d%%), so %s.", name.c_str(),
+                      mine_label.c_str(), base_label.c_str(), fold_at(line, at_size),
+                      short_label(bigger ? line.label : base.label).c_str(), fold_at(base, at_size), why);
+    } else if (aggressive(line.action) && mine && base.outcomes[*mine]) {
+        // Betting or raising where Baseline does not.
+        const BetOutcome& o = *line.outcomes[*mine];
+        const BetOutcome& b = *base.outcomes[*mine];
+        if (o.fold_pct >= b.fold_pct + 5.0) {
+            std::snprintf(text, sizeof text, "vs %s: folds %d%% to %s (Baseline %d%%), so betting profits; %d%% equity when called.",
+                          name.c_str(), pct(o.fold_pct), mine_label.c_str(), pct(b.fold_pct), pct(o.equity_called_pct));
+        } else {
+            std::snprintf(text, sizeof text, "vs %s: %d%% equity when called at %s (Baseline %d%%), so it bets thinner for value.",
+                          name.c_str(), pct(o.equity_called_pct), mine_label.c_str(), pct(b.equity_called_pct));
+        }
+    } else if (aggressive(base.action) && theirs && line.outcomes[*theirs]) {
+        // Baseline bets or raises and this line does not: what changed at that size.
+        const BetOutcome& o = *line.outcomes[*theirs];
+        const BetOutcome& b = *base.outcomes[*theirs];
+        if (o.fold_pct <= b.fold_pct - 5.0) {
+            std::snprintf(text, sizeof text, "vs %s: continues %d%% vs %s (Baseline %d%%): too little fold equity, so %s.",
+                          name.c_str(), pct(100.0 - o.fold_pct), base_label.c_str(), pct(100.0 - b.fold_pct),
+                          mine_label.c_str());
+        } else if (o.raise_pct >= b.raise_pct + 3.0) {
+            std::snprintf(text, sizeof text, "vs %s: raises %d%% vs %s (Baseline %d%%), so %s.", name.c_str(),
+                          pct(o.raise_pct), base_label.c_str(), pct(b.raise_pct), mine_label.c_str());
+        } else {
+            std::snprintf(text, sizeof text, "vs %s: only %d%% equity when called at %s (Baseline %d%%), so %s.",
+                          name.c_str(), pct(o.equity_called_pct), base_label.c_str(), pct(b.equity_called_pct),
+                          mine_label.c_str());
+        }
+    } else if (math.to_call > 0) {
+        std::snprintf(text, sizeof text, "vs %s: %d%% vs the range (Baseline %d%%) against %d%% pot odds, so %s.",
+                      name.c_str(), line_eq, base_eq, pct(100.0 * math.pot_odds), mine_label.c_str());
+    } else {
+        std::snprintf(text, sizeof text, "vs %s: %d%% vs the range (Baseline %d%%), so %s.", name.c_str(), line_eq,
+                      base_eq, mine_label.c_str());
+    }
+    return text;
+}
+
 }  // namespace
 
 TrainingAdvisor::TrainingAdvisor(std::uint64_t seed, AdvisorOptions options) : seed_(seed), options_(options) {
@@ -381,11 +783,19 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
 
     const std::array<Card, 2>& cards = *view.own_hole;
     const LegalActions& legal = view.legal;
-    const PotMath math = pot_math(view);
     const int opponents = std::clamp(view.opponents_in_hand(), 1, kMaxOpponents);
     const std::uint64_t seed = decision_seed(seed_, view);
-    const bool preflop = view.street == Street::Preflop;
-    const ArchetypeParams& params = archetype_params(Archetype::Baseline);
+
+    Decision d;
+    d.view = &view;
+    d.math = pot_math(view);
+    d.preflop = view.street == Street::Preflop;
+    d.may_raise = legal.allows(ActionType::Bet) || legal.allows(ActionType::Raise);
+    d.texture = classify_board(view.board);
+    d.read = read_hand(cards, view.board);
+    d.layers = pot_layers(view);
+    const PotMath& math = d.math;
+    const bool preflop = d.preflop;
 
     // Random-hand equity: the spec's raw equity, the log's `eq` and the size rule's input.
     EquityOptions options;
@@ -393,224 +803,114 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
     options.seed = seed;
     options.threads = options_.threads;
     EquityTable random_equities(cards, view.board, options);
-    const double equity = random_equities.against(opponents);
+    d.equity = random_equities.against(opponents);
 
     RangeEquityOptions range_options;
     range_options.seed = mix(seed ^ kRangeSeedSalt);
     range_options.flop_rivers_per_turn = options_.flop_rivers_per_turn;
     range_options.threads = options_.threads;
     range_options.multiway_rollouts = options_.range_rollouts;
-    RangeEquities equities(view, infer_ranges(view, Archetype::Baseline), range_options);
 
-    std::uint8_t everyone = 0;
-    for (int i = 0; i < kMaxSeats; ++i) {
-        if (i != view.seat && contesting(view.seats[at(i)]) && equities.range(i)) {
-            everyone = static_cast<std::uint8_t>(everyone | (1u << i));
-        }
-    }
-    const std::vector<PotLayer> layers = pot_layers(view);
-    std::vector<std::uint8_t> sets{everyone};
-    for (const PotLayer& layer : layers) {
-        sets.push_back(layer.opponent_seats);
-        sets.push_back(all_in_set(view, layer.opponent_seats));
-    }
-    equities.prepare(sets);
+    // Baseline first, then Nit, Station and Maniac when the lines are wanted. The
+    // lines run on threads of their own unless one thread is asked for.
+    constexpr std::array<Archetype, kArchetypeCount> kLines{Archetype::Baseline, Archetype::Nit, Archetype::Station,
+                                                            Archetype::Maniac};
+    const std::size_t line_count = options_.archetype_lines ? kLines.size() : 1;
+    const bool parallel = options_.threads != 1 && line_count > 1;
 
-    double layered = 0.0;
-    double kept = 0.0;
-    int layer_chips = 0;
-    for (const PotLayer& layer : layers) {
-        layered += layer.amount * equities.equity(layer.opponent_seats);
-        kept += layer.amount * equities.equity(all_in_set(view, layer.opponent_seats));
-        layer_chips += layer.amount;
-    }
-    const double layered_equity = layer_chips > 0 ? layered / layer_chips : 0.0;
-    const double range_equity = equities.equity(everyone);
-
-    const bool may_raise = legal.allows(ActionType::Bet) || legal.allows(ActionType::Raise);
-
-    RaiseInputs inputs;
-    std::optional<StreetStrength> strength;
-    WeightedRange hero_range;
-    if (may_raise) {
-        inputs.equities = &equities;
-        inputs.params = &params;
-        inputs.pot_kept_share = layer_chips > 0 ? kept / layer_chips : 1.0;
-        inputs.pre = preflop_levels(view);
-        inputs.standard_to = standard_raise_to(view, inputs.pre);
+    if (d.may_raise) {
+        d.inputs.pre = preflop_levels(view);
+        d.inputs.standard_to = standard_raise_to(view, d.inputs.pre);
         for (int i = 0; i < kMaxSeats; ++i) {
-            if (view.seats[at(i)].position) ++inputs.players_dealt;
+            if (view.seats[at(i)].position) ++d.inputs.players_dealt;
         }
-        if (preflop && inputs.pre.raises == 0) {
+        if (preflop && d.inputs.pre.raises == 0) {
             for (const ActionRecord& a : view.actions) {
-                if (a.type == ActionType::Call) inputs.limpers = static_cast<std::uint8_t>(inputs.limpers | (1u << a.seat));
+                if (a.type == ActionType::Call) d.inputs.limpers = static_cast<std::uint8_t>(d.inputs.limpers | (1u << a.seat));
             }
         }
-        if (!preflop) {
-            strength = street_strength(view.board);
-            inputs.strength = &*strength;
-            hero_range = infer_range_for(view, view.seat, Archetype::Baseline, false);
-            if (!(hero_range.total() > 0.0)) {
-                hero_range = WeightedRange::uniform();
-                hero_range.remove_cards(card_mask(std::span<const Card>(view.board)));
-            }
-            inputs.hero_range = &hero_range;
+    }
+    const bool wants_hero_range = d.may_raise && !preflop;
+
+    // The range walks: one per line, and Hero's own range as Baseline opponents
+    // would read it, which every line uses as the bettor's range (the types differ
+    // in how they answer a bet, not in how they read Hero).
+    std::array<std::array<std::optional<WeightedRange>, kMaxSeats>, kArchetypeCount> ranges;
+    WeightedRange hero_range;
+    run_tasks(line_count + (wants_hero_range ? 1 : 0), parallel, [&](std::size_t i) {
+        if (i < line_count) {
+            ranges[i] = infer_ranges(view, kLines[i]);
+            return;
         }
+        hero_range = infer_range_for(view, view.seat, Archetype::Baseline, false);
+        if (!(hero_range.total() > 0.0)) {
+            hero_range = WeightedRange::uniform();
+            hero_range.remove_cards(card_mask(std::span<const Card>(view.board)));
+        }
+    });
+    // One per-combo vector covers every line's ranges.
+    std::bitset<kComboCount> needed;
+    for (std::size_t i = 0; i < line_count; ++i) needed |= prepare_ranges(view, ranges[i]);
+    const ComboEquities combos = hero_vs_each_combo(cards, view.board, needed, range_options);
+
+    std::optional<StreetStrength> strength;
+    if (wants_hero_range) {
+        strength = street_strength(view.board);
+        d.inputs.strength = &*strength;
+        d.inputs.hero_range = &hero_range;
     }
 
     // Where the raise a chart wants is not legal, the call is that same choice.
-    PreflopResponse chart_choice = preflop ? chart_response(view) : PreflopResponse::Fold;
-    if (chart_choice == PreflopResponse::Raise && !may_raise) chart_choice = PreflopResponse::Call;
+    d.chart_choice = preflop ? chart_response(view) : PreflopResponse::Fold;
+    if (d.chart_choice == PreflopResponse::Raise && !d.may_raise) d.chart_choice = PreflopResponse::Call;
 
-    // The chart prior. A free check costs nothing, so it is left alone. Rejected
-    // options lose more the more they risk: the chart says most, and the all-in
-    // equity of the model least, about the big ones. An approved call gains the
-    // same, but an approved raise only the flat amount, or every chart raise would
-    // become all in.
-    const auto prior = [&](PreflopResponse option, int risked) {
-        if (!preflop) return 0.0;
-        const double flat = kChartPriorBigBlinds * view.big_blind;
-        const double scaled = kChartPriorCallShare * risked;
-        if (chart_choice != option) return -(flat + scaled);
-        return option == PreflopResponse::Call ? flat + scaled : flat;
-    };
-    const auto raise_risk = [&](int to) { return clamp_raise_to(view, to) - view.seats[at(view.seat)].street_bet; };
+    std::array<LineResult, kArchetypeCount> lines;
+    run_tasks(line_count, parallel, [&](std::size_t i) {
+        const ArchetypeParams& params = archetype_params(kLines[i]);
+        RangeEquityOptions line_options = range_options;
+        double acceptance = 1.0;
+        if (i > 0) {
+            const int divisor = preflop ? 1 : kLineRolloutDivisor;  // Preflop it is cheap
+            const int rollouts = std::max(kMinRangeRollouts, range_options.multiway_rollouts / divisor);
+            acceptance = deal_acceptance(ranges[i], mix(range_options.seed ^ i));
+            line_options.multiway_rollouts = std::clamp(static_cast<int>(std::min<double>(rollouts, kLineDealBudget * acceptance)),
+                                                        kMinRangeRollouts, rollouts);
+        }
+        RangeEquities equities(view, std::move(ranges[i]), combos, line_options);
+        if (!(acceptance > 0.0)) equities.treat_as_independent();
+        const double prior_scale = i == 0 ? 1.0 : kArchetypePriorScale;
+        lines[i] = evaluate_line(d, equities, params, i == 0 ? 0 : params.value_size_shift, prior_scale);
+    });
+    const LineResult& base = lines[0];
 
     HintRecommendation hint;
-    hint.equity_pct = equity * 100.0;
-    hint.range_equity_pct = range_equity * 100.0;
+    hint.equity_pct = d.equity * 100.0;
+    hint.range_equity_pct = base.range_equity * 100.0;
     hint.pot_odds_pct = math.pot_odds * 100.0;
     hint.mdf_pct = math.mdf * 100.0;
     hint.spr = math.spr;
+    hint.ev = base.ev;
+    hint.base_ev = base.base_ev;
+    for (std::size_t i = 0; i < kLadder.size(); ++i) hint.*kLadder[i].to = base.tos[i];
+    hint.outcomes = base.outcomes;
+    hint.best_action = base.label;
+    hint.action = base.action;
 
-    // Later options must beat earlier ones outright, so ties settle on the cheaper play.
-    Action best_action{};
-    std::string best_label;
-    double best_ev = 0.0;
-    bool have_best = false;
-    const auto consider = [&](double ev, Action action, std::string label) {
-        if (have_best && ev <= best_ev) return;
-        best_ev = ev;
-        best_action = action;
-        best_label = std::move(label);
-        have_best = true;
-    };
-
-    if (legal.allows(ActionType::Check)) {
-        const double ev = layered_equity * math.contestable;
-        hint.ev.check_call = ev;
-        consider(ev, {ActionType::Check, 0}, "CHECK");
-        hint.ev.fold = 0.0;  // Listed for completeness; a free card always beats it
-    } else {
-        hint.ev.fold = 0.0;
-        consider(0.0, {ActionType::Fold, 0}, "FOLD");
-        if (legal.allows(ActionType::Call)) {
-            const double ev = layered_equity * (math.contestable + math.to_call) - math.to_call +
-                              prior(PreflopResponse::Call, math.to_call);
-            hint.ev.check_call = ev;
-            consider(ev, {ActionType::Call, 0}, "CALL " + std::to_string(math.to_call));
-        }
+    for (std::size_t i = 1; i < line_count; ++i) {
+        const LineResult& r = lines[i];
+        AdviceLine line;
+        line.versus = kLines[i];
+        line.best_action = r.label;
+        line.action = r.action;
+        line.ev = r.ev;
+        line.range_equity_pct = r.range_equity * 100.0;
+        line.outcomes = r.outcomes;
+        line.why = line_why(kLines[i], base, r, math);
+        hint.versus[i - 1] = std::move(line);
     }
-
-    const BoardTexture texture = classify_board(view.board);
-    const HandRead read = read_hand(cards, view.board);
-
-    const ActionType raise_type = legal.allows(ActionType::Bet) ? ActionType::Bet : ActionType::Raise;
-    std::array<std::string, kLadder.size()> rung_labels;
-    std::optional<double> best_rung_ev;
-    if (may_raise) {
-        for (std::size_t i = 0; i < kLadder.size(); ++i) {
-            const SizeRung& rung = kLadder[i];
-            const int clean_to = raise_to_for_pot_fraction(view, rung.fraction);
-            // Sized for what somebody can match, as raise_value values it.
-            const int to = clamp_raise_to(view, clean_to);
-            if (to >= legal.max_raise_to) continue;  // That is the all-in option below
-            const bool repeated = std::any_of(kLadder.begin(), kLadder.begin() + static_cast<std::ptrdiff_t>(i),
-                                              [&](const SizeRung& earlier) { return hint.*earlier.to == to; });
-            if (repeated) continue;  // Sizes clamped to the same bet
-            const RaiseValue value = raise_value(view, inputs, to);
-            const double ev = value.ev + prior(PreflopResponse::Raise, raise_risk(to));
-            hint.ev.*rung.ev = ev;
-            hint.*rung.to = to;
-            hint.outcomes[i] = value.outcome;
-            rung_labels[i] = percent_of_pot_label(view, raise_type, to, clean_to, rung.fraction);
-            best_rung_ev = std::max(best_rung_ev.value_or(ev), ev);
-            if (preflop) consider(ev, {raise_type, to}, rung_labels[i]);
-        }
-    }
-
-    const PublicSeat& me = view.seats[at(view.seat)];
-    const std::string all_in_label = "ALL-IN " + std::to_string(me.street_bet + me.stack);
-    if (legal.allows(ActionType::AllIn)) {
-        // Without raising rights an all-in is just the call, already considered.
-        if (may_raise) {
-            const RaiseValue value = raise_value(view, inputs, legal.max_raise_to);
-            hint.ev.all_in = value.ev + prior(PreflopResponse::Raise, raise_risk(legal.max_raise_to));
-            hint.outcomes[kOutcomeAllIn] = value.outcome;
-        } else {
-            hint.ev.all_in = hint.ev.check_call.value_or(0.0);
-        }
-    }
-    // Preflop, a single-street model overrates deep shoves with strong hands: the
-    // callers are the strong part of each range, but a normal raise keeps the rest
-    // in for later streets, which `implied` barely counts at a preflop pot's size.
-    // So all-in is advised preflop only short (kPreflopShoveMaxBigBlinds effective),
-    // within kShoveMaxPots of the pot, or as the only raise left.
-    bool preflop_shove_ok = false;
-    if (preflop && legal.allows(ActionType::AllIn)) {
-        int deepest_total = 0;
-        for (int i = 0; i < kMaxSeats; ++i) {
-            const PublicSeat& s = view.seats[at(i)];
-            if (i != view.seat && s.status == SeatStatus::Active) deepest_total = std::max(deepest_total, s.street_bet + s.stack);
-        }
-        const int effective = std::min(me.street_bet + me.stack, deepest_total);
-        preflop_shove_ok = !may_raise || !best_rung_ev || effective <= kPreflopShoveMaxBigBlinds * view.big_blind ||
-                           raise_risk(legal.max_raise_to) <= kShoveMaxPots * view.total_pot;
-    }
-    if (legal.allows(ActionType::AllIn) && (preflop_shove_ok || !may_raise)) {
-        consider(*hint.ev.all_in, {ActionType::AllIn, 0}, all_in_label);
-    }
-    hint.base_ev = hint.ev;
-    // A deep shove is not on offer, so it must not out-list the advice.
-    if (preflop && legal.allows(ActionType::AllIn) && !preflop_shove_ok) hint.ev.all_in = std::min(*hint.ev.all_in, best_ev);
-
-    std::string size_reason;
-    if (!preflop && may_raise) {
-        const bool can_shove = legal.allows(ActionType::AllIn);
-        const bool shove_in_range =
-            can_shove && (!best_rung_ev || raise_risk(legal.max_raise_to) <= kShoveMaxPots * view.total_pot);
-        double best_bet = best_rung_ev.value_or(-std::numeric_limits<double>::infinity());
-        if (shove_in_range) best_bet = std::max(best_bet, *hint.ev.all_in);
-
-        if (best_bet > best_ev) {  // Betting beats the passive options, on the model alone
-            const SizeChoice size =
-                preferred_size(texture, read, view.board, view.street, equity, std::max(1, view.opponents_in_hand()));
-            const int target = clamp_raise_to(view, raise_to_for_pot_fraction(view, size.fraction));
-            const auto chosen = std::find_if(kLadder.begin(), kLadder.end(),
-                                             [&](const SizeRung& rung) { return hint.*rung.to == target; });
-            const bool shoves_on_ev = shove_in_range && (!best_rung_ev || *hint.ev.all_in > *best_rung_ev);
-            if (shoves_on_ev || chosen == kLadder.end()) {
-                // The chosen size would take the whole stack, or all-in is simply best.
-                if (can_shove) {
-                    hint.ev.all_in = best_bet;
-                    consider(best_bet, {ActionType::AllIn, 0}, all_in_label);
-                }
-            } else {
-                hint.ev.*chosen->ev = best_bet;
-                consider(best_bet, {raise_type, target},
-                         rung_labels[static_cast<std::size_t>(chosen - kLadder.begin())]);
-                size_reason = size.reason;
-            }
-        }
-        // A deep shove is not on offer, so it must not out-list the advice.
-        if (can_shove && !shove_in_range) hint.ev.all_in = std::min(*hint.ev.all_in, best_ev);
-    }
-
-    hint.best_action = best_label;
-    hint.action = best_action;
 
     const std::string_view position = view.position ? to_string(*view.position) : std::string_view("Unknown");
-    const std::string_view board_name = texture_name(texture, !view.board.empty());
+    const std::string_view board_name = texture_name(d.texture, !view.board.empty());
 
     char numbers[200];
     if (math.to_call > 0 && !math.facing_aggression) {
@@ -628,15 +928,15 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
                       hint.range_equity_pct, hint.equity_pct);
     }
     // A fold above the price must say why, or the numbers appear to argue against it.
-    std::string verdict = best_label + " has the highest estimated EV.";
-    if (!size_reason.empty()) {
-        verdict = "Betting beats the passive options, and " + best_label + " fits: " + size_reason + ".";
-    } else if (best_action.type == ActionType::Fold && hint.equity_pct > hint.pot_odds_pct) {
+    std::string verdict = base.label + " has the highest estimated EV.";
+    if (!base.size_reason.empty()) {
+        verdict = "Betting beats the passive options, and " + base.label + " fits: " + base.size_reason + ".";
+    } else if (base.action.type == ActionType::Fold && hint.equity_pct > hint.pot_odds_pct) {
         verdict = preflop ? "FOLD: the positional chart rejects this hand here, as raw equity overstates it."
                           : "FOLD: equity against random hands overstates this hand against the ranges that bet "
                             "and call here.";
     }
-    hint.rationale = std::string(position) + " with " + hand_summary(view, read) + " on a " +
+    hint.rationale = std::string(position) + " with " + hand_summary(view, d.read) + " on a " +
                      std::string(board_name == "no board" ? "preflop table with no board" : board_name) +
                      (board_name == "no board" ? "" : " board") + ": " + numbers + ". " + verdict;
     return hint;

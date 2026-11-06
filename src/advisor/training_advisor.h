@@ -43,15 +43,15 @@ inline constexpr std::size_t kOutcomeAllIn = 4;
 inline constexpr std::size_t kOutcomeCount = 5;
 
 // The advice against one player type (Nit, Station or Maniac): the same model run
-// with that type's ranges and parameters. Reserved: not filled in yet.
+// with that type's ranges and parameters (see "Archetype lines" below).
 struct AdviceLine {
     Archetype versus = Archetype::Nit;
     std::string best_action;
     Action action;
-    EvEstimates ev;
+    EvEstimates ev;  // With the size-fit adjustment; there is no base_ev per line
     double range_equity_pct = 0.0;
-    std::array<std::optional<BetOutcome>, kOutcomeCount> outcomes;
-    std::string why;
+    std::array<std::optional<BetOutcome>, kOutcomeCount> outcomes;  // Rows as the hint's
+    std::string why;  // One sentence, at most 140 characters, on what differs from Baseline
 };
 
 struct HintRecommendation {
@@ -71,7 +71,8 @@ struct HintRecommendation {
     // The predicted answers behind each listed raise row (25/50/75/100%, all-in).
     // The all-in entry is absent when the all-in is only a call.
     std::array<std::optional<BetOutcome>, kOutcomeCount> outcomes;
-    // Against Nit, Station and Maniac. Reserved: always empty for now.
+    // Against Nit, Station and Maniac, in that order; empty when
+    // AdvisorOptions::archetype_lines is off. The fields above are Baseline's.
     std::array<std::optional<AdviceLine>, 3> versus;
     std::string rationale;
 };
@@ -82,7 +83,7 @@ struct AdvisorOptions {
     // Flop range equity: river cards per turn card; 0 (or 23 and above) is exact.
     int flop_rivers_per_turn = 0;
     int threads = 0;  // 0 = automatic; otherwise at most this many
-    bool archetype_lines = true;  // Reserved for the versus lines; unused yet
+    bool archetype_lines = true;  // Fill HintRecommendation::versus
 };
 
 // Coaching for one decision, computed from the player's sanitized view alone.
@@ -187,6 +188,39 @@ struct AdvisorOptions {
 // shoves with strong hands, as their callers are the top of each range while a
 // normal raise keeps the rest in for later streets. Its `ev` is then capped at the
 // advice, as postflop; `base_ev` keeps the model's number.
+//
+// --- Archetype lines ------------------------------------------------------------
+//
+// With archetype_lines, each of Nit, Station and Maniac gets the whole pipeline
+// above again, with infer_ranges(view, type) for every opponent and that type's
+// archetype_params for their answers (one type for all opponents). Shared with
+// Baseline, so the lines differ only by the opponents' type:
+//   - the per-combo vector E, computed once over the union of every line's
+//     ranges (each entry depends only on its own combo, so Baseline's numbers are
+//     bit-identical with the lines on or off). The multiway Monte Carlo runs per
+//     line with Baseline's seed; postflop with a third of range_rollouts, and
+//     fewer where a 512-deal trial finds most deals of the narrowed ranges clash
+//     (about 150,000 deals in all, at least 100 rollouts), or none, when no trial
+//     deal fits: then the independent-opponents product above. Line equities
+//     multiway are therefore noisier than Baseline's, by about 1-2 pp.
+//   - Hero's range as the bettor's range: as Baseline opponents read it. The
+//     types differ in how they answer a bet, not in how they read Hero, and a
+//     fixed bettor range keeps each line's difference to the answers alone.
+//   - the full chart prior preflop. A weaker prior was measured and rejected: at
+//     half weight the lines 3-bet 152 (Station) and 154 (Maniac) of 169 classes
+//     on the button against a cutoff open, though only 2 and 0 of them when
+//     Baseline uses the same half weight, so the change came from the weaker
+//     prior, not from the type (docs/advisor-upgrade-notes.md, Stage 5 batch B).
+// Postflop, a value bet moves value_size_shift rungs along the ladder (Nit -1,
+// Station +1, Maniac 0), within its ends. A value bet is one the size rule calls
+// solid or very strong; probes, thin value and draws keep their size. The move
+// happens only where betting already beats the passive options, so it never
+// turns a check, call or fold into a bet, and it lands on all-in only where
+// all-in may be chosen anyway (within 1.5 pots). Preflop has no shift: the EV
+// chooses the size there. `why` is generated from the numbers: the fold share,
+// equity when called, or range equity against pot odds, set against Baseline's.
+// The lines run on threads of their own unless options.threads is 1; the result
+// is the same either way. Mistakes and the log use Baseline only.
 //
 // --- Limits ---------------------------------------------------------------------
 //

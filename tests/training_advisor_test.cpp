@@ -141,6 +141,60 @@ double ev_of_action(const HintRecommendation& hint) {
     return 0.0;
 }
 
+// The EV a line lists for its own advice; its sizes are the hint's ladder.
+double line_ev_of_action(const HintRecommendation& hint, const AdviceLine& line) {
+    switch (line.action.type) {
+        case ActionType::Fold: return line.ev.fold.value();
+        case ActionType::Check:
+        case ActionType::Call: return line.ev.check_call.value();
+        case ActionType::AllIn: return line.ev.all_in.value();
+        case ActionType::Bet:
+        case ActionType::Raise:
+            if (hint.raise_25_to == line.action.amount) return line.ev.raise_25.value();
+            if (hint.raise_50_to == line.action.amount) return line.ev.raise_50.value();
+            if (hint.raise_75_to == line.action.amount) return line.ev.raise_75.value();
+            if (hint.raise_100_to == line.action.amount) return line.ev.raise_100.value();
+            ADD_FAILURE() << "line bet off the ladder: " << line.best_action;
+    }
+    return 0.0;
+}
+
+// The archetype lines, when present: all three, in order, each legal and the
+// highest option it lists, with outcomes for exactly Baseline's raise rows.
+void expect_consistent_lines(const PlayerView& view, const HintRecommendation& hint) {
+    const bool present = hint.versus[0].has_value();
+    constexpr std::array<Archetype, 3> kOrder{Archetype::Nit, Archetype::Station, Archetype::Maniac};
+    for (std::size_t i = 0; i < hint.versus.size(); ++i) {
+        ASSERT_EQ(hint.versus[i].has_value(), present) << i;
+        if (!present) continue;
+        const AdviceLine& line = *hint.versus[i];
+        EXPECT_EQ(line.versus, kOrder[i]);
+        EXPECT_TRUE(is_legal(view.legal, line.action)) << line.best_action;
+        EXPECT_FALSE(line.best_action.empty());
+        EXPECT_DOUBLE_EQ(line_ev_of_action(hint, line), best_listed_ev(line.ev)) << line.best_action;
+        EXPECT_EQ(line.ev.fold.has_value(), hint.ev.fold.has_value());
+        EXPECT_EQ(line.ev.check_call.has_value(), hint.ev.check_call.has_value());
+        EXPECT_EQ(line.ev.all_in.has_value(), hint.ev.all_in.has_value());
+        EXPECT_EQ(line.ev.raise_25.has_value(), hint.ev.raise_25.has_value());
+        EXPECT_EQ(line.ev.raise_100.has_value(), hint.ev.raise_100.has_value());
+        for (std::size_t o = 0; o < kOutcomeCount; ++o) {
+            ASSERT_EQ(line.outcomes[o].has_value(), hint.outcomes[o].has_value()) << o;
+            if (!line.outcomes[o]) continue;
+            EXPECT_GE(line.outcomes[o]->fold_pct, 0.0);
+            EXPECT_GE(line.outcomes[o]->raise_pct, 0.0);
+            EXPECT_LE(line.outcomes[o]->fold_pct + line.outcomes[o]->raise_pct, 100.0 + 1e-9);
+            EXPECT_GE(line.outcomes[o]->equity_called_pct, 0.0);
+            EXPECT_LE(line.outcomes[o]->equity_called_pct, 100.0 + 1e-9);
+        }
+        EXPECT_GE(line.range_equity_pct, 0.0);
+        EXPECT_LE(line.range_equity_pct, 100.0 + 1e-9);
+        EXPECT_LE(line.why.size(), 140u) << line.why;
+        const bool same = line.action.type == hint.action.type && line.action.amount == hint.action.amount;
+        const std::string lead = same ? "Same as Baseline: " : "vs " + std::string(to_string(line.versus)) + ": ";
+        EXPECT_EQ(line.why.rfind(lead, 0), 0u) << line.why;
+    }
+}
+
 // The predicted answers are listed for exactly the raise rows listed, and are shares.
 void expect_consistent_outcomes(const PlayerView& view, const HintRecommendation& hint) {
     const std::array<std::optional<double>, 4> rows{hint.base_ev.raise_25, hint.base_ev.raise_50, hint.base_ev.raise_75,
@@ -160,7 +214,7 @@ void expect_consistent_outcomes(const PlayerView& view, const HintRecommendation
     }
     EXPECT_GE(hint.range_equity_pct, 0.0);
     EXPECT_LE(hint.range_equity_pct, 100.0 + 1e-9);
-    for (const std::optional<AdviceLine>& line : hint.versus) EXPECT_FALSE(line.has_value());
+    expect_consistent_lines(view, hint);
 }
 
 TEST(Advisor, PotOddsAndMdfAreExactInAKnownSpot) {
@@ -680,6 +734,16 @@ TEST(Advisor, ThreadCountDoesNotChangeTheHint) {
     EXPECT_EQ(one.base_ev.check_call, three.base_ev.check_call);
     EXPECT_EQ(one.base_ev.raise_50, three.base_ev.raise_50);
     EXPECT_EQ(one.best_action, three.best_action);
+    // One thread runs the lines in order, more run them side by side.
+    for (std::size_t i = 0; i < one.versus.size(); ++i) {
+        ASSERT_TRUE(one.versus[i].has_value());
+        ASSERT_TRUE(three.versus[i].has_value());
+        EXPECT_EQ(one.versus[i]->best_action, three.versus[i]->best_action);
+        EXPECT_EQ(one.versus[i]->range_equity_pct, three.versus[i]->range_equity_pct);
+        EXPECT_EQ(one.versus[i]->ev.check_call, three.versus[i]->ev.check_call);
+        EXPECT_EQ(one.versus[i]->ev.raise_50, three.versus[i]->ev.raise_50);
+        EXPECT_EQ(one.versus[i]->why, three.versus[i]->why);
+    }
 }
 
 // Every field, in every state random play reaches.
@@ -959,13 +1023,214 @@ TEST(AdvisorSizing, QuickBetsMatchAdvisorSizes) {
     EXPECT_EQ(quick_bet_to(capped.legal, capped.current_bet, capped.total_pot, 1.0, clamp_raise_to(capped, capped.legal.max_raise_to)), 100);
 }
 
+// --- Archetype lines -------------------------------------------------------------
+
+const AdviceLine& versus(const HintRecommendation& hint, Archetype type) {
+    for (const std::optional<AdviceLine>& line : hint.versus) {
+        if (line && line->versus == type) return *line;
+    }
+    throw std::logic_error("no line for that type");
+}
+
+void expect_same_optional(const std::optional<double>& a, const std::optional<double>& b, const char* what) {
+    ASSERT_EQ(a.has_value(), b.has_value()) << what;
+    if (a) { EXPECT_EQ(*a, *b) << what; }  // Bit-identical, not merely close
+}
+
+void expect_same_baseline(const HintRecommendation& a, const HintRecommendation& b) {
+    EXPECT_EQ(a.best_action, b.best_action);
+    EXPECT_EQ(a.action.type, b.action.type);
+    EXPECT_EQ(a.action.amount, b.action.amount);
+    EXPECT_EQ(a.equity_pct, b.equity_pct);
+    EXPECT_EQ(a.range_equity_pct, b.range_equity_pct);
+    EXPECT_EQ(a.pot_odds_pct, b.pot_odds_pct);
+    EXPECT_EQ(a.mdf_pct, b.mdf_pct);
+    EXPECT_EQ(a.spr, b.spr);
+    for (const auto& [x, y] : {std::pair{&a.ev, &b.ev}, std::pair{&a.base_ev, &b.base_ev}}) {
+        expect_same_optional(x->fold, y->fold, "fold");
+        expect_same_optional(x->check_call, y->check_call, "check_call");
+        expect_same_optional(x->raise_25, y->raise_25, "raise_25");
+        expect_same_optional(x->raise_50, y->raise_50, "raise_50");
+        expect_same_optional(x->raise_75, y->raise_75, "raise_75");
+        expect_same_optional(x->raise_100, y->raise_100, "raise_100");
+        expect_same_optional(x->all_in, y->all_in, "all_in");
+    }
+    EXPECT_EQ(a.raise_25_to, b.raise_25_to);
+    EXPECT_EQ(a.raise_50_to, b.raise_50_to);
+    EXPECT_EQ(a.raise_75_to, b.raise_75_to);
+    EXPECT_EQ(a.raise_100_to, b.raise_100_to);
+    for (std::size_t i = 0; i < kOutcomeCount; ++i) {
+        ASSERT_EQ(a.outcomes[i].has_value(), b.outcomes[i].has_value()) << i;
+        if (!a.outcomes[i]) continue;
+        EXPECT_EQ(a.outcomes[i]->fold_pct, b.outcomes[i]->fold_pct) << i;
+        EXPECT_EQ(a.outcomes[i]->raise_pct, b.outcomes[i]->raise_pct) << i;
+        EXPECT_EQ(a.outcomes[i]->equity_called_pct, b.outcomes[i]->equity_called_pct) << i;
+        EXPECT_EQ(a.outcomes[i]->equity_raised_pct, b.outcomes[i]->equity_raised_pct) << i;
+    }
+    EXPECT_EQ(a.rationale, b.rationale);
+}
+
+// Random play with the lines on: every line legal and its own best, the same view
+// giving the same lines, and no lines when they are switched off.
+TEST(Advisor, ArchetypeLinesAreLegalAndDeterministic) {
+    constexpr AdvisorOptions kLinesOn{100, 500, 1, 1, true};
+    const TrainingAdvisor advisor(70, kLinesOn);
+    const TrainingAdvisor again(70, kLinesOn);
+    const TrainingAdvisor off(70, kFastOptions);
+    std::mt19937_64 rng(7070);
+    int checked = 0;
+    int differing = 0;
+    for (int game = 0; game < 3; ++game) {
+        GameConfig config;
+        config.seed = rng();
+        config.hero_seat = std::nullopt;
+        GameEngine engine(config);
+        for (int hand = 0; hand < 3 && engine.state().phase == GamePhase::BetweenHands; ++hand) {
+            engine.start_hand();
+            while (engine.state().to_act) {
+                const PlayerView view = engine.player_view(*engine.state().to_act);
+                const HintRecommendation hint = advisor.analyze(view);
+                ++checked;
+                for (const std::optional<AdviceLine>& line : hint.versus) ASSERT_TRUE(line.has_value());
+                expect_consistent_lines(view, hint);
+                for (const std::optional<AdviceLine>& line : hint.versus) {
+                    if (line->action.type != hint.action.type || line->action.amount != hint.action.amount) ++differing;
+                }
+                if (checked % 8 == 0) {
+                    const HintRecommendation repeat = again.analyze(view);
+                    for (std::size_t i = 0; i < hint.versus.size(); ++i) {
+                        EXPECT_EQ(repeat.versus[i]->best_action, hint.versus[i]->best_action);
+                        EXPECT_EQ(repeat.versus[i]->why, hint.versus[i]->why);
+                        EXPECT_EQ(repeat.versus[i]->range_equity_pct, hint.versus[i]->range_equity_pct);
+                        expect_same_optional(repeat.versus[i]->ev.check_call, hint.versus[i]->ev.check_call, "check_call");
+                        expect_same_optional(repeat.versus[i]->ev.raise_50, hint.versus[i]->ev.raise_50, "raise_50");
+                    }
+                    for (const std::optional<AdviceLine>& line : off.analyze(view).versus) EXPECT_FALSE(line.has_value());
+                }
+                const LegalActions& legal = view.legal;
+                const unsigned roll = static_cast<unsigned>(rng() % 10);
+                Action action{ActionType::Fold, 0};
+                if (roll < 5 && legal.allows(ActionType::Check)) action = {ActionType::Check, 0};
+                else if (roll < 8 && legal.allows(ActionType::Call)) action = {ActionType::Call, 0};
+                else if (legal.allows(ActionType::Bet)) action = {ActionType::Bet, legal.min_raise_to};
+                else if (legal.allows(ActionType::Raise) && roll < 9) action = {ActionType::Raise, legal.min_raise_to};
+                else if (legal.allows(ActionType::Check)) action = {ActionType::Check, 0};
+                ASSERT_TRUE(engine.apply_action(action));
+            }
+        }
+    }
+    EXPECT_GT(checked, 60);
+    EXPECT_GT(differing, 0);  // The lines are not just copies of Baseline
+}
+
+TEST(Advisor, BaselineHintUnchangedByArchetypeLines) {
+    std::vector<PlayerView> views;
+    GameEngine flop = six_max(3, hole("Ac", "Kd"));
+    ASSERT_TRUE(flop.apply_action({ActionType::Raise, 50}));
+    ASSERT_TRUE(flop.apply_action({ActionType::Call, 0}));
+    ASSERT_TRUE(flop.apply_action({ActionType::Call, 0}));
+    views.push_back(flop.player_view(*flop.state().to_act));  // Preflop, facing an open and a call
+    while (flop.state().street == Street::Preflop) ASSERT_TRUE(flop.apply_action({ActionType::Call, 0}));
+    views.push_back(flop.player_view(*flop.state().to_act));  // A multiway flop
+    GameEngine river = heads_up_to_flop(hole("Ac", "Ah"), hole("Qs", "Jd"), board_of("Kd", "8s", "3c", "2h", "Jc"));
+    for (int street = 0; street < 2; ++street) {
+        ASSERT_TRUE(river.apply_action({ActionType::Check, 0}));
+        ASSERT_TRUE(river.apply_action({ActionType::Check, 0}));
+    }
+    views.push_back(river.player_view(1));  // River, checked to
+    ASSERT_TRUE(river.apply_action({ActionType::Bet, 150}));
+    views.push_back(river.player_view(0));  // River, facing a bet
+    for (const PlayerView& view : views) {
+        const HintRecommendation on = TrainingAdvisor(71, AdvisorOptions{kRollouts, 3000, 0, 0, true}).analyze(view);
+        const HintRecommendation off = TrainingAdvisor(71, AdvisorOptions{kRollouts, 3000, 0, 0, false}).analyze(view);
+        ASSERT_TRUE(on.versus[0].has_value());
+        expect_same_baseline(on, off);
+    }
+}
+
+// Kd8s3c2hJd, heads-up after a raise and a call: Hero is the big blind, first to
+// act, after `checked_streets` streets checked through.
+GameEngine kd8s3c_checked_to(const std::array<Card, 2>& mine, int checked_streets) {
+    GameEngine engine = heads_up_to_flop(hole("Ac", "Ah"), mine, board_of("Kd", "8s", "3c", "2h", "Jd"));
+    for (int street = 0; street < checked_streets; ++street) {
+        EXPECT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        EXPECT_TRUE(engine.apply_action({ActionType::Check, 0}));
+    }
+    return engine;
+}
+
+TEST(Advisor, VsStationBluffsLessAndValueBetsThinner) {
+    const TrainingAdvisor advisor(72, kRollouts);
+
+    // Air on the flop: Baseline stabs, but a Station continues too often for that.
+    GameEngine air = kd8s3c_checked_to(hole("5c", "4d"), 0);
+    const HintRecommendation stab = advisor.analyze(air.player_view(1));
+    ASSERT_EQ(stab.action.type, ActionType::Bet) << stab.best_action;
+    const AdviceLine& station_air = versus(stab, Archetype::Station);
+    EXPECT_EQ(station_air.action.type, ActionType::Check) << station_air.best_action << " | " << station_air.why;
+    EXPECT_LT(station_air.outcomes[kOutcome25]->fold_pct, stab.outcomes[kOutcome25]->fold_pct - 10.0);
+    EXPECT_NE(station_air.why.find("fold equity"), std::string::npos) << station_air.why;
+
+    // Ace-high on the river (A3 on Kd8s3c2hJd: a pair of threes): thin value. A
+    // Station calls with worse, so the bet stays; a Nit only calls with better.
+    GameEngine thin = kd8s3c_checked_to(hole("As", "3d"), 2);
+    const HintRecommendation river = advisor.analyze(thin.player_view(1));
+    const AdviceLine& station = versus(river, Archetype::Station);
+    const AdviceLine& nit = versus(river, Archetype::Nit);
+    EXPECT_EQ(station.action.type, ActionType::Bet) << station.best_action << " | " << station.why;
+    EXPECT_EQ(nit.action.type, ActionType::Check) << nit.best_action << " | " << nit.why;
+    EXPECT_GT(station.outcomes[kOutcome25]->equity_called_pct, nit.outcomes[kOutcome25]->equity_called_pct + 20.0);
+
+    // Solid value (top pair, good kicker): a Station's value bet is a rung bigger,
+    // a Nit's a rung smaller, than Baseline's.
+    GameEngine value = kd8s3c_checked_to(hole("Ks", "Qh"), 0);
+    const HintRecommendation top_pair = advisor.analyze(value.player_view(1));
+    ASSERT_EQ(top_pair.action.type, ActionType::Bet) << top_pair.best_action;
+    ASSERT_EQ(top_pair.action.amount, 100) << top_pair.best_action;
+    EXPECT_EQ(versus(top_pair, Archetype::Station).action.amount, 150) << versus(top_pair, Archetype::Station).best_action;
+    EXPECT_EQ(versus(top_pair, Archetype::Nit).action.amount, 50) << versus(top_pair, Archetype::Nit).best_action;
+    EXPECT_NE(versus(top_pair, Archetype::Station).why.find("bigger"), std::string::npos)
+        << versus(top_pair, Archetype::Station).why;
+}
+
+TEST(Advisor, VsNitFoldsMoreToBigBets) {
+    const TrainingAdvisor advisor(73, kRollouts);
+
+    // Every size folds out more of a Nit's range than of Baseline's.
+    GameEngine checked = kd8s3c_checked_to(hole("As", "3d"), 2);
+    const HintRecommendation unfaced = advisor.analyze(checked.player_view(1));
+    const AdviceLine& nit_unfaced = versus(unfaced, Archetype::Nit);
+    for (std::size_t i = 0; i < kOutcomeCount; ++i) {
+        ASSERT_TRUE(unfaced.outcomes[i].has_value()) << i;
+        EXPECT_GT(nit_unfaced.outcomes[i]->fold_pct, unfaced.outcomes[i]->fold_pct) << i;
+    }
+
+    // The same pair of threes facing a pot-sized river bet after two checked
+    // streets: a bluff-catcher against Baseline, beaten by a Nit's betting range.
+    GameEngine facing = heads_up_to_flop(hole("As", "3d"), hole("Ac", "Ah"), board_of("Kd", "8s", "3c", "2h", "Jd"));
+    for (int street = 0; street < 2; ++street) {
+        ASSERT_TRUE(facing.apply_action({ActionType::Check, 0}));
+        ASSERT_TRUE(facing.apply_action({ActionType::Check, 0}));
+    }
+    ASSERT_TRUE(facing.apply_action({ActionType::Bet, 200}));
+    const HintRecommendation catcher = advisor.analyze(facing.player_view(0));
+    EXPECT_EQ(catcher.action.type, ActionType::Call) << catcher.best_action;
+    const AdviceLine& nit = versus(catcher, Archetype::Nit);
+    EXPECT_EQ(nit.action.type, ActionType::Fold) << nit.best_action << " | " << nit.why;
+    EXPECT_LT(nit.range_equity_pct, catcher.pot_odds_pct);
+    EXPECT_GT(catcher.range_equity_pct, catcher.pot_odds_pct);
+    EXPECT_NE(nit.why.find("pot odds"), std::string::npos) << nit.why;
+}
+
 // Run by hand in Release: hint latency by street and opponent count, default
-// options, automatic threading and one thread. Random play with mostly calls and
-// checks, so many flops are multiway.
+// options with and without the archetype lines, automatic threading and one
+// thread. Random play with mostly calls and checks, so many flops are multiway.
 TEST(Advisor, DISABLED_LatencyByStreet) {
+    for (const bool lines : {false, true})
     for (const int threads : {0, 1}) {
         AdvisorOptions options;
         options.threads = threads;
+        options.archetype_lines = lines;
         const TrainingAdvisor advisor(50, options);
         std::array<std::vector<double>, 4> by_street;
         std::array<std::vector<double>, 4> multiway;
@@ -1021,7 +1286,7 @@ TEST(Advisor, DISABLED_LatencyByStreet) {
                 if (street < 3) { ASSERT_TRUE(engine.apply_action({ActionType::Check, 0})); }
             }
         }
-        std::printf("threads=%d\n", threads);
+        std::printf("archetype_lines=%d threads=%d\n", lines ? 1 : 0, threads);
         report("flop HU", heads_up[1]);
         report("turn HU", heads_up[2]);
         report("river HU", heads_up[3]);
@@ -1061,6 +1326,65 @@ TEST(Advisor, DISABLED_PrintSampleHints) {
         GameEngine facing = heads_up_to_flop(h, hole("Ac", "Ah"), b);
         ASSERT_TRUE(facing.apply_action({ActionType::Bet, 150}));
         show("flop, facing 75%", facing.player_view(0));
+    }
+}
+
+// Run by hand: Baseline and the three archetype lines for a spread of spots.
+void print_lines(const char* what, const HintRecommendation& h) {
+    const auto row = [](const char* name, const std::string& best, const EvEstimates& ev, double range_eq,
+                        const std::array<std::optional<BetOutcome>, kOutcomeCount>& outcomes) {
+        std::printf("  %-8s %-24s eq %5.1f  EV f %6.1f c %6.1f r25 %6.1f r50 %6.1f r75 %6.1f r100 %6.1f ai %6.1f | fold",
+                    name, best.c_str(), range_eq, ev.fold.value_or(-1), ev.check_call.value_or(-1),
+                    ev.raise_25.value_or(-1), ev.raise_50.value_or(-1), ev.raise_75.value_or(-1),
+                    ev.raise_100.value_or(-1), ev.all_in.value_or(-1));
+        for (const auto& o : outcomes) std::printf(" %3.0f", o ? o->fold_pct : -1.0);
+        std::printf("\n");
+    };
+    std::printf("%s\n", what);
+    row("Baseline", h.best_action, h.ev, h.range_equity_pct, h.outcomes);
+    for (const std::optional<AdviceLine>& line : h.versus) {
+        if (!line) continue;
+        row(std::string(to_string(line->versus)).c_str(), line->best_action, line->ev, line->range_equity_pct,
+            line->outcomes);
+        std::printf("           why: %s (%zu chars)\n", line->why.c_str(), line->why.size());
+    }
+}
+
+TEST(Advisor, DISABLED_PrintArchetypeLines) {
+    const TrainingAdvisor advisor(60);
+    const auto b = board_of("Kd", "8s", "3c", "2h", "Jd");
+    for (const auto& h : {hole("5c", "4d"), hole("As", "3d"), hole("Qh", "Ts"), hole("9c", "9h"), hole("Ks", "Qh"),
+                          hole("8c", "8d"), hole("As", "Qd")}) {
+        GameEngine checked = heads_up_to_flop(hole("Ac", "Ah"), h, b);
+        print_lines(("flop checked to " + h[0].to_string() + h[1].to_string()).c_str(),
+                    advisor.analyze(checked.player_view(1)));
+        for (int street = 0; street < 2; ++street) {
+            ASSERT_TRUE(checked.apply_action({ActionType::Check, 0}));
+            ASSERT_TRUE(checked.apply_action({ActionType::Check, 0}));
+        }
+        print_lines("  river checked to", advisor.analyze(checked.player_view(1)));
+        GameEngine facing = heads_up_to_flop(h, hole("Ac", "Ah"), b);
+        for (int street = 0; street < 2; ++street) {
+            ASSERT_TRUE(facing.apply_action({ActionType::Check, 0}));
+            ASSERT_TRUE(facing.apply_action({ActionType::Check, 0}));
+        }
+        ASSERT_TRUE(facing.apply_action({ActionType::Bet, 200}));
+        print_lines("  river facing pot", advisor.analyze(facing.player_view(0)));
+    }
+    // Preflop: the button first in, and the big blind facing a cutoff open.
+    for (const char* text : {"K4o", "Q7o", "J6s", "96s", "T7o", "A2o", "K8o", "Q9o", "65o", "J8o"}) {
+        const HandClass hand = HandClass::parse(text).value();
+        GameEngine btn = six_max(0, cards_for(hand));
+        while (btn.state().to_act != 0) ASSERT_TRUE(btn.apply_action({ActionType::Fold, 0}));
+        print_lines((std::string("BTN first in ") + text).c_str(), advisor.analyze(btn.player_view(0)));
+    }
+    for (const char* text : {"A8o", "KTo", "Q9s", "55", "A5s", "K9o", "J9o", "T8s", "A3o", "Q8o"}) {
+        const HandClass hand = HandClass::parse(text).value();
+        GameEngine bb = six_max(2, cards_for(hand));
+        while (bb.state().to_act != 5) ASSERT_TRUE(bb.apply_action({ActionType::Fold, 0}));
+        ASSERT_TRUE(bb.apply_action({ActionType::Raise, 50}));
+        while (bb.state().to_act != 2) ASSERT_TRUE(bb.apply_action({ActionType::Fold, 0}));
+        print_lines((std::string("BB vs CO open ") + text).c_str(), advisor.analyze(bb.player_view(2)));
     }
 }
 
