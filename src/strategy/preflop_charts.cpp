@@ -1,5 +1,6 @@
 #include "strategy/preflop_charts.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace poker {
@@ -294,6 +295,29 @@ PreflopTier preflop_tier(HandClass hand) {
     if (percentile <= 30.0) return PreflopTier::Playable;
     if (percentile <= 55.0) return PreflopTier::Speculative;
     return PreflopTier::Trash;
+}
+
+HandRange resize_range(const HandRange& chart, double width_mult, double cap_pct) {
+    const double mult = width_mult > 0.0 ? width_mult : 0.0;  // NaN fails the test too
+    const double cap = cap_pct >= 0.0 ? std::min(cap_pct, 100.0) * kTotalCombos / 100.0 : 0.0;
+    const double target = std::min(chart.combos() * mult, cap);
+
+    HandRange result;
+    double kept = 0.0;
+    // Inside the chart first, then outside it: so a shrink is a prefix of the
+    // chart, a growth contains all of it, and both nest as the target grows.
+    const auto take = [&](bool inside) {
+        for (const HandClass hand : hand_classes_by_strength()) {
+            if (chart.contains(hand) != inside) continue;
+            const double size = hand.combos();
+            if (kept + 0.5 * size > target || kept + size > cap) return false;
+            result.add(hand);
+            kept += size;
+        }
+        return true;
+    };
+    if (take(true)) take(false);
+    return result;
 }
 
 }  // namespace poker

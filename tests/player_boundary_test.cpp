@@ -12,6 +12,7 @@
 #include "range/combos.h"
 #include "range/hand_vs_range.h"
 #include "range/preflop_matrix.h"
+#include "range/range_model.h"
 #include "range/weighted_range.h"
 #include "solver/betting_tree.h"
 #include "solver/dcfr.h"

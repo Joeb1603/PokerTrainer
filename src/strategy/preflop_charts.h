@@ -116,4 +116,20 @@ constexpr std::string_view to_string(PreflopTier tier) {
 // Tier by strength percentile, for rationale text.
 PreflopTier preflop_tier(HandClass hand);
 
+// `chart` narrowed or widened to about `width_mult` times its combos, keeping its
+// shape: below 1 it drops the chart's weakest classes, above 1 it adds the
+// strongest classes outside it, both in hand_classes_by_strength() order. For the
+// range model's player types; the bots never call it.
+//
+// The target is chart.combos() * width_mult, rounded to the nearest class
+// boundary: walking the classes in that order, a class is kept while the combos
+// before it plus half of its own are within the target. It is also a hard cap:
+// no class is kept that would take the result past cap_pct percent of all 1326
+// combos. So the result is the identity at width_mult 1 whenever the chart fits
+// the cap, is empty once the target is below half the chart's strongest class,
+// and, for a fixed chart and cap, grows by nesting as width_mult grows. An empty
+// chart stays empty. A negative or NaN width_mult counts as 0; cap_pct is
+// clamped to [0, 100].
+HandRange resize_range(const HandRange& chart, double width_mult, double cap_pct = 100.0);
+
 }  // namespace poker

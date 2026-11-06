@@ -203,6 +203,56 @@ By line, regret is 1.41 BB for check-check, 1.33 for bet then check, and 3.24 fo
 - **Agreeing is nearly free:** when the advisor matches the solver's top action, its mean regret is 0.002 BB. That supports measuring regret on `ev_best`.
 - **The plan's acceptance target for Stage 5:** mean regret ≤ 1.49 BB (0.75 × the baseline), and agreement ≥ 38%.
 
+### Stage 4 (range model and player types)
+
+**What it adds:** `src/range/range_model.{h,cpp}`, with the model documented in the header, and `resize_range` in `preflop_charts`. The bots never call either.
+
+**Refinements to the plan's model**
+- **`hs` (hand strength)** is the share of live combos beaten, with ties counted as half. It ignores the hand's own cards blocking other combos, so equal hands tie exactly.
+- **`top_share`** is the midpoint of the hand's tie group within the range.
+- **Bet likelihood:** P = p_v + (1 − p_v)·x, where p_v is the value part.
+  - x is `draw_bet` for strong draws, a medium rate for middling hands, and a bluff weight b for air.
+  - b is calibrated so the air share of the polarised part is m·r/(1+m·r), with r = s/(1+s) and m = `bluff_mult`. A test checks this to 1e-6.
+- **Bluff raises come out of the continue budget,** recomputed once. Without that, the Maniac folds about 7 pp less than intended.
+- **New: checking to the previous street's aggressor** uses 1 − `lead_share` (0.15) × P(bet). Without it, a BB check-call stripped the aces from its range on Ah9s4c, and 88's equity rose from 51.8% to 61.5% instead of falling to 43.1%.
+- **Preflop chart answers are probabilities:** a 3-bet weighs 1 − slowplay, and a flat call keeps the 3-bet hands at the slowplay weight.
+- **Preflop gaps filled:**
+  - SB flats use the in-position call chart.
+  - The BB iso-raise range is Premium plus Strong.
+  - A BB check is exempt from the range cap.
+  - Calls of 4-bets use `call_3bet_width`.
+  - Every all-in over 15 BB uses the commit range (JJ+ and AK).
+- **Temporary short-stack formulas,** until Stage 6 adds push/fold tables:
+  - Shoving ≤ 15 BB: the top clamp(400/BB, 5, 100)%, halved when facing a raise.
+  - Calling such a shove: the top clamp(250/BB, 8, 100)%.
+- **Fallback:** a range falls back to the last action's likelihood only when it drops below 1% of combos *and* below 5% of its prior mass. This keeps small but legitimate ranges, such as a Nit's 4-bet range.
+
+**Speed:** `infer_ranges` on a river view with bets and calls on every street takes p50 0.5 ms and p95 0.6 ms with 2 opponents, and 0.84 / 1.22 ms with 5. `street_strength` takes about 0.15 ms.
+
+**Real-number spot checks** (the implementer's judgment, not solver-verified)
+
+On K72r, BTN vs BB, after a flop c-bet is called and the turn is checked, the viewer holds AQ. Responses are fold / call / raise to a bet of 33 / 75 / 125% of the pot:
+
+| Type | Range size | At 33% | At 75% | At 125% | AQ's equity against the range |
+|---|---|---|---|---|---|
+| Baseline | 218 combos | 28 / 62 / 10% | 46 / 44 / 10% | 58 / 32 / 10% | 50.3% |
+| Nit | 82 | 47% fold at 33% | 60% fold at 75% | 69% fold at 125% | 30.9% |
+| Station | 591 | 4% fold at 33% | | 31% fold at 125% | 52.1% |
+| Maniac | 142 | 20% fold, 25% raise | | | 63.5% |
+
+- **A 3-bet pot on Js8s3d** looks plausible: the caller's range is 10% two pair or better, 44% one pair, 13% draws and 32% air.
+- **8c8d on Ah9s4c:** 51.8% against the Baseline BB defend range (with traps), and 43.1% after the BB check-calls a third-pot bet.
+
+**Known weaknesses, left for Stage 5 tuning and logged**
+1. **Raise share was flat** at `raise_share` for every bet size; 10% raises facing a 125% river bet is too many. Being fixed now (see the Stage 4 follow-up below).
+2. **Few pure bluffs after three barrels:** only 11% of the Baseline's river betting range is no-pair air. The model's bluffs are the bottom of its own betting range, which by the river is mostly weak pairs.
+3. **The Station keeps 46% air after calling two barrels,** because the 0.95 continue cap lets it call almost anything at small sizes. That is roughly what a station does, but it's extreme.
+4. **The Maniac bets almost its whole range at 33%,** because its value threshold, 0.72, overlaps the air region.
+5. **The 33%-bet air-share test passes by only 0.011.**
+6. **Untuned constants:** draw equity thresholds, the medium-hand bet rate, the bluff-raise rate, `lead_share` and the short-stack formulas.
+
+**Tests:** 410 pass, which is 393 plus 15 new tests and 2 disabled reports (`RangeModelReport.DISABLED_ThreeSpots` and `DISABLED_Timing`). Each new test takes ≤ 0.03 s.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
