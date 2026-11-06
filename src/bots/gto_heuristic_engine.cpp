@@ -294,10 +294,15 @@ std::vector<PotLayer> pot_layers(const PlayerView& view) {
             layer.amount += std::min(total, level) - std::min(total, previous);
             if (seat == view.seat) continue;
             // Someone still active can match any level; an all-in is capped at its own.
-            if (s.status == SeatStatus::Active) ++layer.opponents;
+            const auto bit = static_cast<std::uint8_t>(1u << seat);
+            if (s.status == SeatStatus::Active) {
+                ++layer.opponents;
+                layer.opponent_seats = static_cast<std::uint8_t>(layer.opponent_seats | bit);
+            }
             if (s.status == SeatStatus::AllIn && s.total_bet >= level) {
                 ++layer.opponents;
                 ++layer.all_in_opponents;
+                layer.opponent_seats = static_cast<std::uint8_t>(layer.opponent_seats | bit);
             }
         }
         if (layer.amount > 0) layers.push_back(layer);

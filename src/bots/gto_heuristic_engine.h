@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <optional>
 #include <random>
 #include <span>
@@ -76,6 +77,7 @@ struct PotLayer {
     int amount = 0;
     int opponents = 0;
     int all_in_opponents = 0;  // Of `opponents`: these cannot be made to fold
+    std::uint8_t opponent_seats = 0;  // Bit i set when seat index i contests this layer
 };
 
 std::vector<PotLayer> pot_layers(const PlayerView& view);

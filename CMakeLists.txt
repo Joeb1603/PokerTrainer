@@ -72,6 +72,10 @@ add_library(poker_core STATIC
     src/engine/pots.cpp
     src/equity/equity.cpp
     src/logging/hand_logger.cpp
+    src/range/combos.cpp
+    src/range/generated/preflop_equity_data.cpp
+    src/range/preflop_matrix.cpp
+    src/range/weighted_range.cpp
     src/strategy/preflop_charts.cpp
 )
 find_package(Threads REQUIRED)
@@ -83,6 +87,11 @@ target_compile_options(poker_core PRIVATE ${POKER_WARNINGS})
 add_executable(poker_cli tools/poker_cli.cpp)
 target_link_libraries(poker_cli PRIVATE poker_core)
 target_compile_options(poker_cli PRIVATE ${POKER_WARNINGS})
+
+# Regenerates src/range/generated/preflop_equity_data.cpp; run from the repo root.
+add_executable(gen_preflop_tables tools/gen_preflop_tables.cpp)
+target_link_libraries(gen_preflop_tables PRIVATE poker_core)
+target_compile_options(gen_preflop_tables PRIVATE ${POKER_WARNINGS})
 
 # --- Desktop app (GLFW + OpenGL3 + Dear ImGui) ---------------------------------
 option(POKER_BUILD_APP "Build the poker_trainer desktop app" ON)
@@ -159,6 +168,7 @@ if(POKER_BUILD_TESTS)
         tests/player_boundary_test.cpp
         tests/equity_test.cpp
         tests/preflop_charts_test.cpp
+        tests/range_test.cpp
         tests/bots_test.cpp
         tests/training_advisor_test.cpp
         tests/hand_logger_test.cpp

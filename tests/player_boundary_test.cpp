@@ -9,6 +9,9 @@
 #include "bots/gto_heuristic_engine.h"
 #include "engine/player_view.h"
 #include "equity/equity.h"
+#include "range/combos.h"
+#include "range/preflop_matrix.h"
+#include "range/weighted_range.h"
 #include "strategy/preflop_charts.h"
 
 namespace poker {
