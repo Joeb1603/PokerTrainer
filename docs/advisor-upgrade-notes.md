@@ -106,6 +106,50 @@ The machine was noisy: runs differed by up to about 20% at p95.
 
 The review checked the rest and found it correct. That covers the combo and triangle indexing, the claim that the balanced sampler gives every combo exactly K rivers per turn, exact mode counting each runout once, the multiway joint sampling and the anti-cheat words. Its brute-force check of the exact flop over all 1,081 combos was within 3e-8. MSVC /W4 was checked by inspection only.
 
+### Stage 2 (DCFR river solver), commit `c5737a8`
+
+**Solver conventions**
+- **DCFR iteration indexing:** iteration t updates regrets as R ← R·d(t−1) + r_t, with the sign test on R_{t−1}. The strategy sum is S ← S·((t−1)/t)^γ + s_t. This is equivalent to the paper's end-of-iteration scaling.
+  - Each information set is discounted once per iteration, so there is no pruning.
+  - Updates alternate between the players.
+  - Strategy sums are weighted by the player's own reach.
+- **Utility:** u_p is the chips received from the final pot minus the chips added after the root. So u₀ + u₁ = root pot, and folding is worth minus the chips the folder added. Exploitability = (BR₀ + BR₁ − root pot) / 2, as a % of the root pot.
+- **Chance nodes** weight each card 1/(N − 4) and zero the reach of hands that hold the dealt card.
+
+**Known answers checked**
+- Kuhn poker: player 1's value is −1/18.
+- Polarized river toy game, value hands KK against bluffs J9:
+  - The bluff share of the betting range is s/(1+2s): 0.25 at s = 0.5 and 1/3 at s = 1.
+  - The caller calls 1/(1+s) of the time.
+  - The in-position values match the analytic 21.05 and 23.68 chips.
+- A turn check-down matches brute-force river enumeration.
+
+**Default river abstraction**
+- Root bets: the ladder (25/50/75/100%) plus all-in.
+- Deeper bets: 33/75/150% plus all-in.
+- Raises: pot plus all-in, with a cap of 2. Sizes merge into all-in at 67% of the stack.
+- Tree sizes:
+
+  | Spot | Nodes | Decision nodes | (node, action) slots | Memory |
+  |---|---|---|---|---|
+  | SPR 3.3 | 63 | 22 | 62 | 0.25 MB |
+  | SPR 10 | 96 | 33 | 95 | 0.32 MB |
+
+**Speed and convergence** on Kh9d5c3s2h with 273 vs 227 combos, Release, one thread:
+
+| Spot | ms per iteration | Iterations to 0.5% exploitability | Iterations to 0.3% |
+|---|---|---|---|
+| SPR 3.3 | 0.245 | 72 | 97 |
+| SPR 10 | 0.41 | 138 | 186 |
+
+At SPR 3.3, exploitability is 0.051% of pot after 300 iterations.
+
+**Caveat:** a hand's average strategy at a node it rarely reaches is dominated by early iterations. The bench therefore weights hands by their root share and reach, and doesn't read low-reach nodes literally.
+
+**Memory:** the estimate equals the actual allocation exactly on GCC, because it relies on exact `reserve` and `shrink_to_fit` capacities. The test only requires the estimate to be at least the allocation and no more than 1.2 times it.
+
+**Tests:** 385 pass in Release (about 3 s) and Debug (about 12 s).
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -114,6 +158,8 @@ The review checked the rest and found it correct. That covers the combo and tria
 - The combo tables (`combos.cpp`) are built at run time behind a function-local static rather than with `constexpr`, to stay clear of MSVC's constexpr step limit. Whether MSVC would actually hit that limit wasn't tested.
 - The multiway redraw cap (16,384) and the flop threading threshold (64 needed combos) were chosen, not tuned.
 - Timings come only from this container.
+- Solver solves are single-threaded so far. The `threads` limit is validated but not yet used, so thread-count determinism has nothing to test until Stage 8.
+- Flop trees are built before the memory check runs. Stage 8 has to count nodes before building a flop tree.
 
 ## Test changes
 
