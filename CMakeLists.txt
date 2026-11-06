@@ -92,6 +92,11 @@ add_executable(poker_cli tools/poker_cli.cpp)
 target_link_libraries(poker_cli PRIVATE poker_core)
 target_compile_options(poker_cli PRIVATE ${POKER_WARNINGS})
 
+# Solves one heads-up postflop spot and prints the root strategy.
+add_executable(solver_cli tools/solver_cli.cpp)
+target_link_libraries(solver_cli PRIVATE poker_core)
+target_compile_options(solver_cli PRIVATE ${POKER_WARNINGS})
+
 # Regenerates src/range/generated/preflop_equity_data.cpp; run from the repo root.
 add_executable(gen_preflop_tables tools/gen_preflop_tables.cpp)
 target_link_libraries(gen_preflop_tables PRIVATE poker_core)
@@ -192,6 +197,12 @@ if(POKER_BUILD_TESTS)
     gtest_discover_tests(core_tests DISCOVERY_MODE PRE_TEST)
 
     add_test(NAME poker_cli_stress COMMAND poker_cli --games 500 --seed 1)
+    # BB defending against a BTN open on a dry river.
+    add_test(NAME solver_cli_smoke
+             COMMAND solver_cli --board Kh9d5c3s2h --pot 300 --stack 1000
+                     --oop "22-JJ, A2s-AJs, K5s+, Q8s+, J8s+, T8s+, 97s+, 86s+, 74s+, 64s+, 54s, ATo-AQo, KTo+, QTo+, JTo"
+                     --ip "22+, A2s+, K9s+, QTs+, JTs, T9s, 98s, 87s, 76s, ATo+, KTo+, QJo:0.5"
+                     --iterations 50 --no-timing)
 
     # Bots and the advisor must see the table only through PlayerView.
     add_test(NAME no_engine_access_in_players
