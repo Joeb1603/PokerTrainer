@@ -156,6 +156,7 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 ## 13. Working Preferences
 
 - Commit or push only when asked. Plans often say to commit locally and not push.
+- Work directly on `main`. Don't create feature branches or pull requests, even if a session starts on another branch: switch to `main` first and push there.
 - When asked to analyze or plan, don't implement until told to go ahead.
 - Check poker math with real numbers before changing it, and report anything not verified.
 - Release tags should use `vX.Y.Z`. The first release's tag is `v.1.0.0`, with an extra dot, and `project(VERSION)` in `CMakeLists.txt` still says 0.1.0.
