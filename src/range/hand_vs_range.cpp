@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <exception>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -67,8 +69,18 @@ template <typename Work>
 int run_parallel(int items, int threads, const Work& work) {
     threads = std::clamp(threads, 1, std::max(1, items));
     std::atomic<int> next{0};
+    // An exception escaping a helper thread would call std::terminate, so each
+    // worker keeps the first one and it is rethrown here once all have joined.
+    std::exception_ptr failure;
+    std::mutex failure_mutex;
     const auto worker = [&](int id) {
-        for (int item = next.fetch_add(1); item < items; item = next.fetch_add(1)) work(item, id);
+        try {
+            for (int item = next.fetch_add(1); item < items; item = next.fetch_add(1)) work(item, id);
+        } catch (...) {
+            const std::lock_guard lock(failure_mutex);
+            if (!failure) failure = std::current_exception();
+            next.store(items);  // Hand out no more work
+        }
     };
     {
         std::vector<std::jthread> helpers;
@@ -80,6 +92,7 @@ int run_parallel(int items, int threads, const Work& work) {
         }
         worker(0);
     }
+    if (failure) std::rethrow_exception(failure);
     return threads;
 }
 
@@ -124,8 +137,11 @@ void score_river(const HoleCards& hero, const std::array<Card, 5>& board, std::s
 // The turn's river cards, one per item.
 void score_turn(const HoleCards& hero, const std::array<Card, 5>& turn_board, std::span<const Card> rivers,
                 std::span<const ActiveCombo> combos, int threads, ComboTally& total) {
-    std::vector<ComboTally> tallies(static_cast<std::size_t>(std::max(threads, 1)), ComboTally(combos.size()));
-    const int workers = run_parallel(static_cast<int>(rivers.size()), threads, [&](int item, int worker) {
+    const int items = static_cast<int>(rivers.size());
+    // One tally per worker that can run, not per thread requested.
+    threads = std::clamp(threads, 1, std::max(1, items));
+    std::vector<ComboTally> tallies(static_cast<std::size_t>(threads), ComboTally(combos.size()));
+    const int workers = run_parallel(items, threads, [&](int item, int worker) {
         const Card river = rivers[static_cast<std::size_t>(item)];
         std::array<Card, 5> board = turn_board;
         board[4] = river;
@@ -167,7 +183,8 @@ void score_flop(const HoleCards& hero, const std::array<Card, 5>& flop_board, Ca
     // Rivers a turn may need: its K, plus up to two that a combo holds.
     const int window = exact ? per_turn : std::min(per_turn + 2, n - 1);
 
-    std::vector<ComboTally> tallies(static_cast<std::size_t>(std::max(threads, 1)), ComboTally(combos.size()));
+    threads = std::clamp(threads, 1, n);
+    std::vector<ComboTally> tallies(static_cast<std::size_t>(threads), ComboTally(combos.size()));
     const int workers = run_parallel(n, threads, [&](int turn_pos, int worker) {
         const Card turn = unseen[static_cast<std::size_t>(turn_pos)];
         std::array<std::array<Card, 5>, kExactFlopRiversPerTurn + 2> boards{};
@@ -425,6 +442,11 @@ MultiwayRangeEquity equity_vs_ranges(const HoleCards& hero, std::span<const Card
         }
         table_of[static_cast<std::size_t>(s)] = static_cast<int>(scenario.villains.size());
         scenario.villains.push_back(std::move(table));
+    }
+    // Hero holds one seat. Six villains would also make a tie seven ways, which
+    // 60ths cannot split evenly.
+    if (scenario.villains.size() > static_cast<std::size_t>(kMaxSeats - 1)) {
+        throw std::invalid_argument("equity_vs_ranges: more villain ranges than seats beside hero's");
     }
 
     for (const LayerRequest& layer : layers) {

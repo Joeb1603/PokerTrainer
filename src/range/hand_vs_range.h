@@ -26,8 +26,10 @@ inline constexpr int kRangeChunkRollouts = 1024;
 struct RangeEquityOptions {
     std::uint64_t seed = 0;
     // Flop only: river cards sampled per turn card. 0, or kExactFlopRiversPerTurn
-    // and above, enumerates every runout instead.
-    int flop_rivers_per_turn = 8;
+    // and above, enumerates every runout. Exact is the default because it fits the
+    // budget (about 22 ms on one thread); a sample of 8 is about 3x faster but
+    // misses single combos by up to 6 pp, so keep it for cheap test loops.
+    int flop_rivers_per_turn = 0;
     int threads = 0;  // 0 = automatic; otherwise use up to this many threads
     int multiway_rollouts = 3000;
 };
@@ -94,10 +96,10 @@ struct MultiwayRangeEquity {
 // how much each villain's hand blocks the next one's range).
 // Deterministic for a given seed and rollout count, whatever the thread count.
 // Throws std::invalid_argument for duplicate or invalid cards, a bad board size,
-// non-positive rollouts or negative threads, no layers, a layer with no villain or
-// naming a seat index past kMaxSeats or one with no range, a range with no weight
-// left once hero's and the board's cards are removed, and ranges that can almost
-// never be dealt together.
+// non-positive rollouts or negative threads, more than kMaxSeats - 1 ranges, no
+// layers, a layer with no villain or naming a seat index past kMaxSeats or one
+// with no range, a range with no weight left once hero's and the board's cards
+// are removed, and ranges that can almost never be dealt together.
 MultiwayRangeEquity equity_vs_ranges(const HoleCards& hero, std::span<const Card> board,
                                      std::span<const std::optional<WeightedRange>, kMaxSeats> ranges,
                                      std::span<const LayerRequest> layers, const RangeEquityOptions& options = {});

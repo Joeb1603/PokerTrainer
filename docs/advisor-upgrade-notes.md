@@ -42,7 +42,7 @@ Each stage is committed to `main` when its tests pass.
    - The bots already use `uniform_real_distribution`, and that is left alone.
 9. **Stale-result key:** the solver's key includes a `decision_epoch` owned by the controller, because `new_session()` restarts hand numbers.
 10. **Flop equity is exact in the advisor.** The plan proposed sampling the flop as 47 turn cards × 8 river cards. That turned out to be off by up to 1.6 pp on range equity and 5.9 pp on single combos (6 flops × 20 seeds). Exact enumeration of all 1,081 runouts takes about 22 ms on one thread and about 6 ms with automatic threading, which fits the budget, so the advisor uses it.
-    - `RangeEquityOptions::flop_rivers_per_turn` keeps the sampled mode (default 8) for cheap test loops. A value of 0, or 23 or more, means exact.
+    - `RangeEquityOptions::flop_rivers_per_turn` now defaults to 0, which means exact; 23 or more is also exact. Smaller values give the sampled mode, kept for cheap test loops. The Stage 1 review pointed out that a default of 8 would silently hand the sampled mode to any caller that passed `{}`.
 11. **The flop sampler is "balanced":** one seeded shuffle of the 47 unseen cards, with turn i taking the next K river cards. Each card is a turn once and a river K times. Measured against independent per-turn shuffles, this halves the error (K=8: 0.39 pp rms vs 0.77 pp).
 12. **Multiway sampling redraws the whole deal** when two villains' sampled combos collide. Redrawing one villain at a time would bias the joint distribution. For example, villain 1 holding {AA, 72o} and villain 2 holding {AK} should give AA 20% of villain 1's hands; redrawing one villain at a time gives 33%. After 16,384 failed redraws it throws.
 13. **Preflop range equity reads the 169 × 169 class matrix,** so it ignores which suits hero's own cards block. The measured bias is about 0.02 pp.
@@ -99,6 +99,13 @@ The machine was noisy: runs differed by up to about 20% at p95.
 
 **Tests:** 371 pass in Release (about 4 s wall time) and Debug (about 11 s). The GCC and clang builds have zero warnings, and the strict clang check is clean on new files.
 
+**Stage 1 review fixes**
+- Tally buffers were sized by the requested thread count rather than the capped one, so a huge `threads` value could allocate gigabytes.
+- More than 5 villain ranges now throws, because a 7-way split of 60ths is inexact.
+- An exception thrown in a helper thread is now rethrown after the threads join, instead of calling `std::terminate`.
+
+The review checked the rest and found it correct. That covers the combo and triangle indexing, the claim that the balanced sampler gives every combo exactly K rivers per turn, exact mode counting each runout once, the multiway joint sampling and the anti-cheat words. Its brute-force check of the exact flop over all 1,081 combos was within 3e-8. MSVC /W4 was checked by inspection only.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -111,3 +118,6 @@ The machine was noisy: runs differed by up to about 20% at p95.
 ## Test changes
 
 (Each entry gives the test name, the old assertion, the new assertion and the reason.)
+
+- **Stage 1:** no existing test changed; all new tests are in `tests/range_test.cpp`.
+- **Tolerance note:** `PreflopMatrix.SpotChecksAgainstMonteCarlo` uses max(3 combined standard errors, 0.6 pp). Three standard errors is about 0.43 pp there, so the 0.6 pp floor is a little looser than the plan's "within 3 standard errors". It was kept so the test can't be flaky.

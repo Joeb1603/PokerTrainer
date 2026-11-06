@@ -499,6 +499,13 @@ TEST(HandVsRange, RejectsBadInput) {
     no_rollouts.multiway_rollouts = 0;
     EXPECT_THROW(equity_vs_ranges(hero, flop, ranges, good, no_rollouts), std::invalid_argument);
 
+    // A range at every seat index leaves none for hero.
+    {
+        std::array<std::optional<WeightedRange>, kMaxSeats> six{};
+        six.fill(WeightedRange::uniform());
+        EXPECT_THROW(equity_vs_ranges(hero, flop, six, good), std::invalid_argument);
+    }
+
     // Only combos hero or the board block: nothing left to deal.
     ranges[2] = WeightedRange();
     ranges[2]->set(combo_index(card("Ah"), card("Ad")), 1.0f);
