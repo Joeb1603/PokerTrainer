@@ -15,7 +15,7 @@ namespace {
 
 // --- Model constants (see range_model.h) ---------------------------------------
 
-constexpr double kSmallBetMax = 0.4;  // Bets up to this many pots widen value...
+constexpr double kSmallBetMax = 0.4;  // Own-range rule: bets up to this many pots widen value...
 constexpr double kSmallBetValueMult = 1.6;
 constexpr double kMediumBetMax = 0.8;
 constexpr double kLargeBetValueMult = 0.75;  // ... and bigger ones narrow it
@@ -24,22 +24,36 @@ constexpr double kMediumBetBase = 0.15;      // Medium hands bet this at value_b
 constexpr double kReferenceValueTop = 0.33;
 constexpr double kCheckProbeSize = 0.5;      // A check is "did not bet half pot"
 constexpr double kContinueCap = 0.95;
+// Value against the opponents: the continue share assumed for whoever calls is a
+// standard player's, reference_continue(s), whatever the actor's own type.
+constexpr double kReferenceContinueMult = 0.95;
+constexpr double kReferenceContinueFloor = 0.10;
+constexpr double kAggressionShift = 1.0;     // Thresholds move by this x (value_bet_top - 0.33)
+constexpr double kRiverValueMargin = 0.6;    // River value: ahead of 70% of the calls, not half
+constexpr double kRaiseContinueShare = 0.5;  // Facing a raise, a bettor continues half the reference share
+constexpr double kBarrelBluffMult = 4.0;     // The aggressor's flop and turn bluff ratio, x the river's
+constexpr double kMaxBluffWeight = 0.9;      // Some air always gives up
 constexpr double kFlopDrawEquity = 0.35;
 constexpr double kTurnDrawEquity = 0.18;
 constexpr double kDrawPriceSlack = 0.9;      // Draws call when equity >= 0.9 x pot odds
 constexpr double kDrawContinueOtherwise = 0.3;
 constexpr double kRaiseDrawShare = 0.5;      // Strong draws raise at draw_bet x this
-constexpr double kRaiseAirBase = 0.1;        // Air raises at bluff_mult x this
+constexpr double kRaiseAirBase = 0.1;        // Own-range rule: air raises at bluff_mult x this
 // The raise share cap scales by clamp(this / (1 + s), min, max) for a bet of s pots:
 // 1 at half pot, less against big bets, more against small ones.
 constexpr double kRaiseScaleNumerator = 1.5;
 constexpr double kRaiseScaleMin = 0.4;
 constexpr double kRaiseScaleMax = 1.25;
+// Fallback: a product is kept if it holds this many combos or this share of the
+// range before the action.
 constexpr double kMinRangeCombos = 0.01 * kComboCount;
-constexpr double kMinActionChance = 0.05;
+constexpr double kMinActionChance = 0.005;
+constexpr double kEmptyMass = 1e-6;
 
 // Preflop.
 constexpr double kIsoWidth = 0.75;
+constexpr double kLimpCallShare = 0.6;   // A limp-call keeps the strongest 0.6 x flat_width of the window
+constexpr double kLimpRaiseShare = 0.1;  // A limp-raise: traps plus the strongest 0.1 x three_bet_width
 constexpr int kShortAllInBigBlinds = 15;
 constexpr double kPushPercentTimesBigBlinds = 400.0;  // Temporary push/fold stand-ins
 constexpr double kPushMinPercent = 5.0;
@@ -50,11 +64,14 @@ constexpr double kCommitStackShare = 0.40;
 constexpr int kCommitPriceBigBlinds = 10;
 constexpr int kCommitAlwaysBigBlinds = 50;
 
-double logistic(double x) { return 1.0 / (1.0 + std::exp(-x)); }
-
+// A smooth step from 1 (t at least 2 widths below the threshold) to 0 (2 widths
+// above), 0.5 at the threshold: a cubic, so nothing leaks past the edge. With
+// many weak hands and a narrow value region, a logistic's tails outweighed the
+// value region itself.
 double edge(double threshold, double t, const ArchetypeParams& p) {
     const double width = p.softness > 1e-9 ? p.softness : 1e-9;
-    return logistic((threshold - t) / width);
+    const double x = std::clamp((threshold - t) / (4.0 * width) + 0.5, 0.0, 1.0);
+    return x * x * (3.0 - 2.0 * x);
 }
 
 double clamp01(double x) { return std::clamp(x, 0.0, 1.0); }
@@ -67,8 +84,16 @@ double value_top(double size, const ArchetypeParams& p) {
     return p.value_bet_top * mult;
 }
 
-bool is_air(const StreetStrength& s, int combo, float t) {
-    return s.draw[static_cast<std::size_t>(combo)] != kStrongDraw && t > kAirTopShare;
+// The share of a standard player's range that continues facing a bet of `size` pots.
+double reference_continue(double size) {
+    return std::clamp(kReferenceContinueMult / (1.0 + size), kReferenceContinueFloor, kContinueCap);
+}
+
+// A raise to three times a bet of `faced` pots, in pots after calling: 2s / (1 + 2s).
+double assumed_raise_size(double faced) { return 2.0 * faced / (1.0 + 2.0 * faced); }
+
+double aggression_shift(const ArchetypeParams& p) {
+    return kAggressionShift * (p.value_bet_top - kReferenceValueTop);
 }
 
 double draw_equity(Street street) {
@@ -86,28 +111,59 @@ double live_total(const WeightedRange& range, const StreetStrength& s) {
 
 using Shares = std::array<float, kComboCount>;
 
-BetBreakdown bet_breakdown_at(const WeightedRange& range, const StreetStrength& s, const Shares& t, double size,
+// Where each combo stands, for bets and raises. `own` is its top_share in the
+// actor's own range. `vs` is its standing against the opponents, the largest
+// top_share it holds in any of their ranges; under the own-range rule (no opponent
+// range known) it is `own` again and `relative` is set.
+struct Footing {
+    const Shares& own;
+    const Shares& vs;
+    bool relative = false;
+    bool aggressor = false;  // The actor made the last bet or raise of the previous street
+};
+
+// The value threshold on `vs` for a bet of `size` pots on a board of `board_size` cards.
+double bet_value_threshold(double size, int board_size, bool relative, const ArchetypeParams& p) {
+    if (relative) return value_top(size, p);
+    const double margin = board_size >= 5 ? kRiverValueMargin : 1.0;
+    return 0.5 * margin * reference_continue(size) + aggression_shift(p);
+}
+
+// The value threshold on `vs` for a raise of a bet of `faced` pots.
+double raise_value_threshold(double faced, bool relative, const ArchetypeParams& p) {
+    if (relative) return p.value_bet_top / 2.0;
+    return 0.5 * kRaiseContinueShare * reference_continue(assumed_raise_size(faced)) + aggression_shift(p);
+}
+
+BetBreakdown bet_breakdown_at(const WeightedRange& range, const StreetStrength& s, const Footing& f, double size,
                               const ArchetypeParams& p) {
     BetBreakdown out;
-    const double v = value_top(size, p);
+    const double v = bet_value_threshold(size, s.board_size, f.relative, p);
     const double r = size / (1.0 + size);
     const double medium = clamp01(kMediumBetBase * p.value_bet_top / kReferenceValueTop);
+    // The previous street's aggressor, with cards to come, bluffs more than the
+    // river ratio: its air has equity and its story carries fold equity.
+    const bool barrel = !f.relative && f.aggressor && s.board_size < 5;
+    const double air_mult = barrel ? kBarrelBluffMult : 1.0;
     const double draw = clamp01(p.draw_bet);
-    const double hold_back = 1.0 - clamp01(p.slowplay);
+    // A bet under half pot keeps the opponent's range in, so value slowplays less.
+    const double slow = f.relative ? 1.0 : std::min(1.0, size / kCheckProbeSize);
+    const double hold_back = 1.0 - clamp01(p.slowplay) * slow;
+    const auto air = [&](std::size_t i) { return s.draw[i] != kStrongDraw && f.vs[i] > kAirTopShare; };
 
     std::array<double, kComboCount> value{};
     double air_room = 0.0;
     for (int combo = 0; combo < kComboCount; ++combo) {
         const auto i = static_cast<std::size_t>(combo);
         if (!s.live.test(i)) continue;
-        value[i] = edge(v, t[i], p) * hold_back;
+        value[i] = edge(v, f.vs[i], p) * hold_back;
         const double w = range.weight(combo);
         out.range_mass += w;
         out.value_mass += w * value[i];
-        if (is_air(s, combo, t[i])) air_room += w * (1.0 - value[i]);
+        if (air(i)) air_room += w * (1.0 - value[i]);
     }
-    const double target = std::max(0.0, p.bluff_mult) * r * out.value_mass;
-    out.bluff_weight = air_room > 0.0 ? std::min(1.0, target / air_room) : 0.0;
+    const double target = air_mult * std::max(0.0, p.bluff_mult) * r * out.value_mass;
+    out.bluff_weight = air_room > 0.0 ? std::min(f.relative ? 1.0 : kMaxBluffWeight, target / air_room) : 0.0;
 
     for (int combo = 0; combo < kComboCount; ++combo) {
         const auto i = static_cast<std::size_t>(combo);
@@ -117,7 +173,7 @@ BetBreakdown bet_breakdown_at(const WeightedRange& range, const StreetStrength& 
         if (s.draw[i] == kStrongDraw) {
             x = draw;
             mass = &out.draw_mass;
-        } else if (t[i] > kAirTopShare) {
+        } else if (air(i)) {
             x = out.bluff_weight;
             mass = &out.air_mass;
         } else {
@@ -142,26 +198,44 @@ namespace {
 // P(raise | combo) facing a bet of `size` pots, already scaled to the size's
 // raise share cap.
 std::array<double, kComboCount> raise_probabilities(const WeightedRange& range, const StreetStrength& s,
-                                                    const Shares& t, double size, const ArchetypeParams& p) {
-    std::array<double, kComboCount> q{};
-    const double v = p.value_bet_top / 2.0;
+                                                    const Footing& f, double size, const ArchetypeParams& p) {
+    std::array<double, kComboCount> value{};
+    const double v = raise_value_threshold(size, f.relative, p);
     const double hold_back = 1.0 - clamp01(p.slowplay);
     const double draw = clamp01(p.draw_bet * kRaiseDrawShare);
-    const double air = clamp01(kRaiseAirBase * std::max(0.0, p.bluff_mult));
+    // Bluff raises come from the bottom of the raiser's own range.
+    const auto air = [&](std::size_t i) { return s.draw[i] != kStrongDraw && f.own[i] > kAirTopShare; };
     double mass = 0.0;
+    double value_mass = 0.0;
+    double air_room = 0.0;
+    for (int combo = 0; combo < kComboCount; ++combo) {
+        const auto i = static_cast<std::size_t>(combo);
+        if (!s.live.test(i)) continue;
+        value[i] = edge(v, f.vs[i], p) * hold_back;
+        const double w = range.weight(combo);
+        mass += w;
+        value_mass += w * value[i];
+        if (air(i)) air_room += w * (1.0 - value[i]);
+    }
+    double bluff = clamp01(kRaiseAirBase * std::max(0.0, p.bluff_mult));
+    if (!f.relative) {
+        const double raise = assumed_raise_size(size);
+        const double target = std::max(0.0, p.bluff_mult) * raise / (1.0 + raise) * value_mass;
+        bluff = air_room > 0.0 ? std::min(1.0, target / air_room) : 0.0;
+    }
+
+    std::array<double, kComboCount> q{};
     double raising = 0.0;
     for (int combo = 0; combo < kComboCount; ++combo) {
         const auto i = static_cast<std::size_t>(combo);
         if (!s.live.test(i)) continue;
-        const double value = edge(v, t[i], p) * hold_back;
-        const double y = s.draw[i] == kStrongDraw ? draw : t[i] > kAirTopShare ? air : 0.0;
-        q[i] = value + (1.0 - value) * y;
-        mass += range.weight(combo);
+        const double y = s.draw[i] == kStrongDraw ? draw : air(i) ? bluff : 0.0;
+        q[i] = value[i] + (1.0 - value[i]) * y;
         raising += range.weight(combo) * q[i];
     }
     const double share = std::max(0.0, p.raise_share) * raise_share_scale(size);
     const double k = mass > 0.0 && raising > share * mass ? share * mass / raising : 1.0;
-    for (double& value : q) value *= k;
+    for (double& x : q) x *= k;
     return q;
 }
 
@@ -193,13 +267,13 @@ struct Answer {
 // Facing a bet. Bluff raises come out of the continue budget: the threshold is
 // lowered by the share of the range that would fold but raises instead, so the
 // range still continues about C in all (one correction step, not iterated).
-Answer answer_probabilities(const WeightedRange& range, const StreetStrength& s, const Shares& t, Street street,
+Answer answer_probabilities(const WeightedRange& range, const StreetStrength& s, const Footing& f, Street street,
                             double size, double pot_odds, const ArchetypeParams& p) {
     Answer out;
-    out.raise = raise_probabilities(range, s, t, size, p);
+    out.raise = raise_probabilities(range, s, f, size, p);
     const double mdf = 1.0 / (1.0 + size);
     const double target = std::min(std::max(p.continue_mult * mdf, p.continue_floor), kContinueCap);
-    const auto first = continue_probabilities(s, t, street, target, pot_odds, p);
+    const auto first = continue_probabilities(s, f.own, street, target, pot_odds, p);
     double mass = 0.0;
     double folders_raising = 0.0;
     for (int combo = 0; combo < kComboCount; ++combo) {
@@ -209,13 +283,13 @@ Answer answer_probabilities(const WeightedRange& range, const StreetStrength& s,
         folders_raising += range.weight(combo) * (1.0 - first[i]) * out.raise[i];
     }
     const double shift = mass > 0.0 ? folders_raising / mass : 0.0;
-    out.cont = continue_probabilities(s, t, street, std::max(0.0, target - shift), pot_odds, p);
+    out.cont = continue_probabilities(s, f.own, street, std::max(0.0, target - shift), pot_odds, p);
     return out;
 }
 
-Response postflop_response_at(const WeightedRange& range, const StreetStrength& s, const Shares& t, Street street,
+Response postflop_response_at(const WeightedRange& range, const StreetStrength& s, const Footing& f, Street street,
                               double size, double pot_odds, const ArchetypeParams& p) {
-    const Answer answer = answer_probabilities(range, s, t, street, size, pot_odds, p);
+    const Answer answer = answer_probabilities(range, s, f, street, size, pot_odds, p);
     Response out;
     double mass = 0.0;
     double calls = 0.0;
@@ -239,9 +313,9 @@ Response postflop_response_at(const WeightedRange& range, const StreetStrength& 
     return out;
 }
 
-WeightedRange call_likelihood_at(const WeightedRange& range, const StreetStrength& s, const Shares& t, Street street,
+WeightedRange call_likelihood_at(const WeightedRange& range, const StreetStrength& s, const Footing& f, Street street,
                                  double size, double pot_odds, const ArchetypeParams& p) {
-    const Answer answer = answer_probabilities(range, s, t, street, size, pot_odds, p);
+    const Answer answer = answer_probabilities(range, s, f, street, size, pot_odds, p);
     WeightedRange out;
     for (int combo = 0; combo < kComboCount; ++combo) {
         const auto i = static_cast<std::size_t>(combo);
@@ -250,9 +324,9 @@ WeightedRange call_likelihood_at(const WeightedRange& range, const StreetStrengt
     return out;
 }
 
-WeightedRange raise_likelihood_at(const WeightedRange& range, const StreetStrength& s, const Shares& t,
-                                  double size, const ArchetypeParams& p) {
-    const auto raise = raise_probabilities(range, s, t, size, p);
+WeightedRange raise_likelihood_at(const WeightedRange& range, const StreetStrength& s, const Footing& f, double size,
+                                  const ArchetypeParams& p) {
+    const auto raise = raise_probabilities(range, s, f, size, p);
     WeightedRange out;
     for (int combo = 0; combo < kComboCount; ++combo) {
         const auto i = static_cast<std::size_t>(combo);
@@ -262,9 +336,9 @@ WeightedRange raise_likelihood_at(const WeightedRange& range, const StreetStreng
 }
 
 // 1 - scale * P(bet half pot): scale is 1, or lead_share when checking to the aggressor.
-WeightedRange check_likelihood_at(const WeightedRange& range, const StreetStrength& s, const Shares& t, double scale,
+WeightedRange check_likelihood_at(const WeightedRange& range, const StreetStrength& s, const Footing& f, double scale,
                                   const ArchetypeParams& p) {
-    const BetBreakdown bet = bet_breakdown_at(range, s, t, kCheckProbeSize, p);
+    const BetBreakdown bet = bet_breakdown_at(range, s, f, kCheckProbeSize, p);
     const double k = clamp01(scale);
     WeightedRange out;
     for (int combo = 0; combo < kComboCount; ++combo) {
@@ -274,6 +348,17 @@ WeightedRange check_likelihood_at(const WeightedRange& range, const StreetStreng
     }
     return out;
 }
+
+// Footing for the public functions: against `opponent` when given, else the own-range rule.
+struct OwnedFooting {
+    Shares own;
+    Shares vs;
+    bool relative;
+
+    OwnedFooting(const WeightedRange& range, const WeightedRange* opponent, const StreetStrength& s)
+        : own(top_share(range, s)), vs(opponent ? top_share(*opponent, s) : own), relative(opponent == nullptr) {}
+    Footing footing() const { return Footing{own, vs, relative}; }
+};
 
 // --- Preflop charts -------------------------------------------------------------
 
@@ -304,8 +389,15 @@ const ExtraCharts& extra_charts() {
     return charts;
 }
 
+// The cap limits growth only, and never below the chart itself: a width under 1
+// is a plain shrink, and a growth stops at max(max_range_pct, the chart's own %).
+double growth_cap(double chart_percent, double width, const ArchetypeParams& p) {
+    if (!(width > 1.0)) return 100.0;
+    return std::max(p.max_range_pct, chart_percent + 1e-9);  // The margin keeps the chart's last class
+}
+
 HandRange resized(const HandRange& chart, double width, const ArchetypeParams& p) {
-    return resize_range(chart, width, p.max_range_pct);
+    return resize_range(chart, width, growth_cap(chart.percent(), width, p));
 }
 
 // Call and raise probabilities per class for a chart, as in the header table.
@@ -349,7 +441,8 @@ HandRange open_range(Position pos, int players, const ArchetypeParams& p) {
     return resized(rfi_range(pos, players), p.open_width, p);
 }
 
-WeightedRange limp_likelihood(Position pos, int players, const ArchetypeParams& p) {
+// The limp window: the strongest limp_pct % of combos outside the open range.
+HandRange limp_window(Position pos, int players, const ArchetypeParams& p) {
     const HandRange open = open_range(pos, players, p);
     const double window_combos = std::max(0.0, p.limp_pct) * kTotalCombos / 100.0;
     HandRange grown;
@@ -358,42 +451,82 @@ WeightedRange limp_likelihood(Position pos, int players, const ArchetypeParams& 
     } else {
         grown = HandRange::top_percent(std::max(0.0, p.limp_pct));
     }
-    WeightedRange out;
+    HandRange out;
     for (const HandClass hand : hand_classes_by_strength()) {
-        if (grown.contains(hand) && !open.contains(hand)) out.set_class(hand, 1.0f);
-    }
-    // Premiums normally sit inside the open range, so they limp only as traps.
-    const auto trap = static_cast<float>(clamp01(p.limp_trap));
-    for (const HandClass hand : hand_classes_by_strength()) {
-        if (extra_charts().premiums.contains(hand) && out.class_mass(hand) == 0.0) out.set_class(hand, trap);
+        if (grown.contains(hand) && !open.contains(hand)) out.add(hand);
     }
     return out;
 }
 
-WeightedRange top_percent_range(double percent, const ArchetypeParams& p) {
-    return WeightedRange::from_hand_range(HandRange::top_percent(std::min(percent, p.max_range_pct)));
+// Premiums normally sit inside the open range, so they limp only as traps.
+bool limp_trap_class(HandClass hand, const HandRange& window) {
+    return extra_charts().premiums.contains(hand) && !window.contains(hand);
+}
+
+WeightedRange limp_likelihood(Position pos, int players, const ArchetypeParams& p) {
+    const HandRange window = limp_window(pos, players, p);
+    const auto trap = static_cast<float>(clamp01(p.limp_trap));
+    WeightedRange out;
+    for (const HandClass hand : hand_classes_by_strength()) {
+        if (window.contains(hand)) out.set_class(hand, 1.0f);
+        else if (limp_trap_class(hand, window)) out.set_class(hand, trap);
+    }
+    return out;
+}
+
+// A limper facing the first raise. Raise: the traps and the strongest
+// kLimpRaiseShare x three_bet_width of the window, at 1 - sp. Call: sp there, and 1
+// in the strongest kLimpCallShare x flat_width of the window (call_scale scales
+// that width, as for a chart's calls).
+ChartAnswer limper_answer(Position pos, int players, double call_scale, const ArchetypeParams& p) {
+    const HandRange window = limp_window(pos, players, p);
+    const HandRange raising = resize_range(window, clamp01(kLimpRaiseShare * p.three_bet_width), 100.0);
+    const HandRange calling = resize_range(window, clamp01(kLimpCallShare * p.flat_width * call_scale), 100.0);
+    const auto sp = static_cast<float>(clamp01(p.slowplay));
+    ChartAnswer out;
+    for (const HandClass hand : hand_classes_by_strength()) {
+        if (raising.contains(hand) || limp_trap_class(hand, window)) {
+            out.raise.set_class(hand, 1.0f - sp);
+            out.call.set_class(hand, sp);
+        } else if (calling.contains(hand)) {
+            out.call.set_class(hand, 1.0f);
+        }
+    }
+    return out;
+}
+
+// The top `percent` % by strength times `width`, capped as resized() caps growth.
+WeightedRange top_percent_range(double percent, double width, const ArchetypeParams& p) {
+    const double target = percent * std::max(0.0, width);
+    return WeightedRange::from_hand_range(HandRange::top_percent(std::min(target, growth_cap(percent, width, p))));
 }
 
 // --- The walk over a view's actions --------------------------------------------
 
 struct Tracked {
     WeightedRange range = WeightedRange::uniform();
-    bool wanted = false;
+    WeightedRange street_start = WeightedRange::uniform();  // As the current street began
+    WeightedRange preflop = WeightedRange::uniform();       // As preflop ended
+    bool dealt = false;
     bool folded = false;
+    bool limped = false;  // Called preflop before any raise (a limp, or the SB completing)
     int start_stack = 0;
     int committed = 0;
     int street_bet = 0;
 };
 
+// Every dealt player's range is tracked, whichever ones the caller wants, because
+// a bet or raise is judged against the other players' ranges.
 class RangeWalk {
 public:
-    RangeWalk(const PlayerView& view, const ArchetypeParams& params, std::uint8_t wanted, bool remove_viewer_cards)
-        : view_(view), p_(params), current_bet_(view.big_blind) {
+    RangeWalk(const PlayerView& view, const ArchetypeParams& params, bool remove_viewer_cards)
+        : view_(view), p_(params), tracked_(kMaxSeats), current_bet_(view.big_blind),
+          last_full_raise_(view.big_blind) {
         for (int i = 0; i < kMaxSeats; ++i) {
             const PublicSeat& s = view.seats[static_cast<std::size_t>(i)];
             if (s.position) ++players_;
             Tracked& t = tracked_[static_cast<std::size_t>(i)];
-            t.wanted = ((wanted >> i) & 1u) != 0 && s.position.has_value();
+            t.dealt = s.position.has_value();
             t.start_stack = s.stack + s.total_bet;
             // Blinds are not action records: whatever a player put in beyond its
             // records is its blind.
@@ -403,10 +536,11 @@ public:
             }
             t.committed = std::max(0, s.total_bet - recorded);
             t.street_bet = t.committed;
-            if (!s.position) t.range = WeightedRange{};
+            if (!t.dealt) t.range = WeightedRange{};
         }
-        if (remove_viewer_cards && view.own_hole) dead_ |= card_mask(std::span<const Card>(*view.own_hole));
+        if (remove_viewer_cards && view.own_hole) viewer_dead_ = card_mask(std::span<const Card>(*view.own_hole));
         apply_dead();
+        for (Tracked& t : tracked_) t.street_start = t.preflop = t.range;
     }
 
     void run() {
@@ -416,25 +550,33 @@ public:
             act(a);
         }
         // The board as it stands, including streets nobody has acted on yet.
-        dead_ |= card_mask(std::span<const Card>(view_.board));
+        board_dead_ |= card_mask(std::span<const Card>(view_.board));
         apply_dead();
     }
 
     const WeightedRange& range(int i) const { return tracked_[static_cast<std::size_t>(i)].range; }
 
 private:
+    // The viewer's own range never loses the viewer's cards.
+    CardMask dead_for(int i) const { return board_dead_ | (i == view_.seat ? CardMask{0} : viewer_dead_); }
+
     void apply_dead() {
-        for (Tracked& t : tracked_) {
-            if (t.wanted) t.range.remove_cards(dead_);
+        for (int i = 0; i < kMaxSeats; ++i) {
+            Tracked& t = tracked_[static_cast<std::size_t>(i)];
+            if (t.dealt) t.range.remove_cards(dead_for(i));
         }
     }
 
     void enter_street(Street street) {
+        if (street_ == Street::Preflop) {
+            for (Tracked& t : tracked_) t.preflop = t.range;
+        }
         previous_aggressor_ = street_aggressor_;
         street_aggressor_ = -1;
         acted_ = 0;
         street_ = street;
         current_bet_ = 0;
+        last_full_raise_ = view_.big_blind;
         added_ = 0;
         last_aggression_size_ = 0.0;
         last_aggression_all_in_ = false;
@@ -442,8 +584,9 @@ private:
         for (Tracked& t : tracked_) t.street_bet = 0;
         const std::size_t shown = street == Street::Flop ? 3 : street == Street::Turn ? 4 : 5;
         const std::size_t n = std::min(shown, view_.board.size());
-        dead_ |= card_mask(std::span<const Card>(view_.board.data(), n));
+        board_dead_ |= card_mask(std::span<const Card>(view_.board.data(), n));
         apply_dead();
+        for (Tracked& t : tracked_) t.street_start = t.range;
     }
 
     const StreetStrength& strength() {
@@ -456,18 +599,33 @@ private:
         return *strengths_[index];
     }
 
-    void narrow(Tracked& t, const WeightedRange& likelihood) {
-        const double before = t.range.total();
-        WeightedRange product = t.range;
-        product.multiply(likelihood);
-        const double after = product.total();
-        if (after >= kMinRangeCombos || after >= kMinActionChance * before) {
+    // A product too small to trust means the model all but ruled the action out.
+    // The action's likelihood is then kept on the range as this street began, or
+    // failing that as preflop ended, or alone; if all are empty it is ignored.
+    void narrow(Tracked& t, const WeightedRange& likelihood, int i) {
+        const auto product_of = [&](const WeightedRange& base) {
+            WeightedRange product = base;
+            product.multiply(likelihood);
+            product.remove_cards(dead_for(i));
+            return product;
+        };
+        const auto trusted = [](const WeightedRange& product, double before) {
+            const double after = product.total();
+            return after >= kMinRangeCombos || after >= kMinActionChance * before;
+        };
+        WeightedRange product = product_of(t.range);
+        if (trusted(product, t.range.total())) {
             t.range = product;
             return;
         }
-        WeightedRange alone = likelihood;
-        alone.remove_cards(dead_);
-        if (alone.total() > 0.0) t.range = alone;
+        product = product_of(t.street_start);
+        if (trusted(product, t.street_start.total())) {
+            t.range = product;
+            return;
+        }
+        product = product_of(t.preflop);
+        if (product.total() <= kEmptyMass) product = product_of(WeightedRange::uniform());
+        if (product.total() > kEmptyMass) t.range = product;
     }
 
     void act(const ActionRecord& a) {
@@ -476,11 +634,11 @@ private:
         const int pot_before = view_.street_start_pot[static_cast<std::size_t>(street_)] + added_;
         const bool aggressive = a.type == ActionType::Bet || a.type == ActionType::Raise;
 
-        if (t.wanted && !t.folded && a.type != ActionType::Fold) {
+        if (t.dealt && !t.folded && a.type != ActionType::Fold) {
             if (street_ == Street::Preflop) {
-                if (const auto likelihood = preflop_likelihood(a, t, facing)) narrow(t, *likelihood);
+                if (const auto likelihood = preflop_likelihood(a, t, facing)) narrow(t, *likelihood, a.seat);
             } else {
-                narrow(t, postflop_likelihood(a, t, pot_before));
+                narrow(t, postflop_likelihood(a, t, pot_before), a.seat);
             }
         }
 
@@ -491,13 +649,19 @@ private:
             last_aggression_all_in_ = a.all_in;
             last_aggression_total_ = a.street_total;
             street_aggressor_ = a.seat;
+            // As the engine rules: only a full raise (an increment of at least the
+            // last full one) is a new level. A short all-in is not, so a later
+            // re-raise reads as it would have without it. The first raise counts.
+            const bool full = increment >= last_full_raise_;
+            if (full) last_full_raise_ = increment;
             current_bet_ = std::max(current_bet_, a.street_total);
             if (street_ == Street::Preflop) {
                 if (raises_ == 0) opener_ = position_of(a.seat);
-                ++raises_;
+                if (full || raises_ == 0) ++raises_;
             }
         } else if (a.type == ActionType::Call && street_ == Street::Preflop && raises_ == 0) {
             ++limpers_;
+            t.limped = true;
         }
         if (a.type == ActionType::Fold) t.folded = true;
         acted_ = static_cast<std::uint8_t>(acted_ | (1u << a.seat));
@@ -521,7 +685,7 @@ private:
         int deepest = 0;
         for (int i = 0; i < kMaxSeats; ++i) {
             const Tracked& o = tracked_[static_cast<std::size_t>(i)];
-            if (i == a.seat || o.folded || !view_.seats[static_cast<std::size_t>(i)].position) continue;
+            if (i == a.seat || o.folded || !o.dealt) continue;
             deepest = std::max(deepest, o.start_stack - (o.committed - o.street_bet));
         }
         const int my_stack = t.start_stack - t.committed;
@@ -532,13 +696,14 @@ private:
         const Position pos = position_of(a.seat);
         const ExtraCharts& extra = extra_charts();
         const bool aggressive = a.type == ActionType::Bet || a.type == ActionType::Raise;
+        const bool limper_facing_raise = t.limped && raises_ == 1;
 
         if (aggressive) {
             if (a.all_in && big_blinds(a.street_total) <= kShortAllInBigBlinds) {
                 const double bb = std::max(1.0, big_blinds(a.street_total));
                 double percent = std::clamp(kPushPercentTimesBigBlinds / bb, kPushMinPercent, 100.0);
                 if (raises_ > 0) percent *= kReshoveShare;
-                return top_percent_range(percent * p_.open_width, p_);
+                return top_percent_range(percent, p_.open_width, p_);
             }
             if (a.all_in || a.street_total >= kCommitStackShare * t.start_stack) {
                 return WeightedRange::from_hand_range(resized(extra.commit, p_.four_bet_width, p_));
@@ -548,6 +713,7 @@ private:
                 if (pos == Position::BB) return WeightedRange::from_hand_range(resized(extra.bb_raise, p_.open_width, p_));
                 return WeightedRange::from_hand_range(resized(rfi_range(pos, players_), kIsoWidth * p_.open_width, p_));
             }
+            if (limper_facing_raise) return limper_answer(pos, players_, 1.0, p_).raise;
             return facing_raise_answer(pos, opener_, raises_, players_, 1.0, p_).raise;
         }
 
@@ -567,30 +733,50 @@ private:
         if (last_aggression_all_in_ && big_blinds(last_aggression_total_) <= kShortAllInBigBlinds) {
             const double bb = std::max(1.0, big_blinds(last_aggression_total_));
             const double percent = std::clamp(kCallPushPercentTimesBigBlinds / bb, kCallPushMinPercent, 100.0);
-            return top_percent_range(percent * p_.flat_width, p_);
+            return top_percent_range(percent, p_.flat_width, p_);
         }
         if (call_is_committing(a, t)) {
             return WeightedRange::from_hand_range(resized(extra.commit, p_.call_3bet_width, p_));
         }
+        if (limper_facing_raise) return limper_answer(pos, players_, 1.0, p_).call;
         return facing_raise_answer(pos, opener_, raises_, players_, 1.0, p_).call;
+    }
+
+    // The standing of every combo against the players `i` plays against: the
+    // largest top_share it holds in any of their current ranges. False when there
+    // is nobody left, and then the own-range rule applies.
+    bool standing(int i, const StreetStrength& s, Shares& out) const {
+        out.fill(0.0f);
+        bool any = false;
+        for (int j = 0; j < kMaxSeats; ++j) {
+            const Tracked& o = tracked_[static_cast<std::size_t>(j)];
+            if (j == i || !o.dealt || o.folded) continue;
+            any = true;
+            const Shares share = top_share(o.range, s);
+            for (std::size_t c = 0; c < share.size(); ++c) out[c] = std::max(out[c], share[c]);
+        }
+        return any;
     }
 
     WeightedRange postflop_likelihood(const ActionRecord& a, const Tracked& t, int pot_before) {
         const StreetStrength& s = strength();
-        const Shares shares = top_share(t.range, s);
+        const Shares own = top_share(t.range, s);
+        Shares vs{};
+        const bool against = standing(a.seat, s, vs);
+        const Footing f{own, against ? vs : own, !against, previous_aggressor_ == a.seat};
         switch (a.type) {
             case ActionType::Check:
-                return check_likelihood_at(t.range, s, shares, checks_to_aggressor(a.seat) ? p_.lead_share : 1.0, p_);
+                return check_likelihood_at(t.range, s, f, checks_to_aggressor(a.seat) ? p_.lead_share : 1.0, p_);
             case ActionType::Bet:
             case ActionType::Raise:
                 if (current_bet_ == 0) {
                     const double size = pot_before > 0 ? static_cast<double>(a.chips_added) / pot_before : 1.0;
-                    return bet_breakdown_at(t.range, s, shares, safe_size(size), p_).likelihood;
+                    return bet_breakdown_at(t.range, s, f, safe_size(size), p_).likelihood;
                 }
-                return raise_likelihood_at(t.range, s, shares, safe_size(last_aggression_size_), p_);
+                return raise_likelihood_at(t.range, s, f, safe_size(last_aggression_size_), p_);
             case ActionType::Call: {
                 const double odds = static_cast<double>(a.chips_added) / std::max(1, pot_before + a.chips_added);
-                return call_likelihood_at(t.range, s, shares, street_, safe_size(last_aggression_size_), odds, p_);
+                return call_likelihood_at(t.range, s, f, street_, safe_size(last_aggression_size_), odds, p_);
             }
             case ActionType::Fold:
             case ActionType::AllIn:
@@ -601,13 +787,15 @@ private:
 
     const PlayerView& view_;
     const ArchetypeParams& p_;
-    std::array<Tracked, kMaxSeats> tracked_{};
+    std::vector<Tracked> tracked_;  // On the heap: three ranges per player
     std::array<std::optional<StreetStrength>, 3> strengths_{};
-    CardMask dead_ = 0;
+    CardMask board_dead_ = 0;
+    CardMask viewer_dead_ = 0;
     int players_ = 0;
 
     Street street_ = Street::Preflop;
     int current_bet_ = 0;
+    int last_full_raise_ = 0;  // The increment a raise needs to be a new level
     int added_ = 0;
     int raises_ = 0;
     int limpers_ = 0;
@@ -657,7 +845,7 @@ const ArchetypeParams& archetype_params(Archetype archetype) {
 
         ArchetypeParams& station = t[2];
         station.open_width = 1.40;
-        station.max_range_pct = 70.0;
+        station.max_range_pct = 80.0;
         station.limp_pct = 20.0;
         station.limp_trap = 0.6;
         station.flat_width = 2.20;
@@ -676,7 +864,7 @@ const ArchetypeParams& archetype_params(Archetype archetype) {
 
         ArchetypeParams& maniac = t[3];
         maniac.open_width = 1.80;
-        maniac.max_range_pct = 75.0;
+        maniac.max_range_pct = 90.0;
         maniac.limp_pct = 4.0;
         maniac.limp_trap = 0.1;
         maniac.flat_width = 1.20;
@@ -774,43 +962,50 @@ double BetBreakdown::air_share_of_polarised() const {
 }
 
 BetBreakdown bet_breakdown(const WeightedRange& range, const StreetStrength& strength, double size_pots,
-                           const ArchetypeParams& params) {
-    return bet_breakdown_at(range, strength, top_share(range, strength), safe_size(size_pots), params);
+                           const ArchetypeParams& params, const WeightedRange* opponent) {
+    const OwnedFooting f(range, opponent, strength);
+    return bet_breakdown_at(range, strength, f.footing(), safe_size(size_pots), params);
 }
 
 WeightedRange bet_likelihood(const WeightedRange& range, const StreetStrength& strength, double size_pots,
-                             const ArchetypeParams& params) {
-    return bet_breakdown(range, strength, size_pots, params).likelihood;
+                             const ArchetypeParams& params, const WeightedRange* opponent) {
+    return bet_breakdown(range, strength, size_pots, params, opponent).likelihood;
 }
 
 WeightedRange check_likelihood(const WeightedRange& range, const StreetStrength& strength,
-                               const ArchetypeParams& params) {
-    return check_likelihood_at(range, strength, top_share(range, strength), 1.0, params);
+                               const ArchetypeParams& params, const WeightedRange* opponent) {
+    const OwnedFooting f(range, opponent, strength);
+    return check_likelihood_at(range, strength, f.footing(), 1.0, params);
 }
 
 WeightedRange call_likelihood(const WeightedRange& range, const StreetStrength& strength, Street street,
-                              double size_pots, double pot_odds, const ArchetypeParams& params) {
-    return call_likelihood_at(range, strength, top_share(range, strength), street, safe_size(size_pots), pot_odds,
-                              params);
+                              double size_pots, double pot_odds, const ArchetypeParams& params,
+                              const WeightedRange* bettor) {
+    const OwnedFooting f(range, bettor, strength);
+    return call_likelihood_at(range, strength, f.footing(), street, safe_size(size_pots), pot_odds, params);
 }
 
 WeightedRange raise_likelihood(const WeightedRange& range, const StreetStrength& strength, double size_pots,
-                               const ArchetypeParams& params) {
-    return raise_likelihood_at(range, strength, top_share(range, strength), safe_size(size_pots), params);
+                               const ArchetypeParams& params, const WeightedRange* bettor) {
+    const OwnedFooting f(range, bettor, strength);
+    return raise_likelihood_at(range, strength, f.footing(), safe_size(size_pots), params);
 }
 
 Response predict_postflop_response(const WeightedRange& range, const StreetStrength& strength, Street street,
-                                   double size_pots, double pot_odds, const ArchetypeParams& params) {
-    return postflop_response_at(range, strength, top_share(range, strength), street, safe_size(size_pots), pot_odds,
-                                params);
+                                   double size_pots, double pot_odds, const ArchetypeParams& params,
+                                   const WeightedRange* bettor_range) {
+    const OwnedFooting f(range, bettor_range, strength);
+    return postflop_response_at(range, strength, f.footing(), street, safe_size(size_pots), pot_odds, params);
 }
 
 Response predict_preflop_response(const WeightedRange& villain_range_so_far, Position villain, Position raiser,
                                   int raises_after_hero, double size_ratio, int players,
-                                  const ArchetypeParams& params) {
+                                  const ArchetypeParams& params, bool villain_limped) {
     const double scale = std::isfinite(size_ratio) && size_ratio > 0.0 ? 1.0 / std::sqrt(size_ratio) : 1.0;
-    const ChartAnswer answer =
-        facing_raise_answer(villain, raiser, std::max(1, raises_after_hero), players, scale, params);
+    const int level = std::max(1, raises_after_hero);
+    const ChartAnswer answer = villain_limped && level == 1
+                                   ? limper_answer(villain, players, scale, params)
+                                   : facing_raise_answer(villain, raiser, level, players, scale, params);
     Response out;
     double mass = 0.0;
     double calls = 0.0;
@@ -847,7 +1042,7 @@ std::array<std::optional<WeightedRange>, kMaxSeats> infer_ranges(const PlayerVie
         const bool contesting = s.status == SeatStatus::Active || s.status == SeatStatus::AllIn;
         if (i != view.seat && contesting && s.position) wanted = static_cast<std::uint8_t>(wanted | (1u << i));
     }
-    RangeWalk walk(view, params, wanted, true);
+    RangeWalk walk(view, params, true);
     walk.run();
     std::array<std::optional<WeightedRange>, kMaxSeats> out{};
     for (int i = 0; i < kMaxSeats; ++i) {
@@ -866,7 +1061,7 @@ WeightedRange infer_range_for(const PlayerView& view, int seat_index, const Arch
     if (!view.seats[static_cast<std::size_t>(seat_index)].position) return WeightedRange{};
     // The viewer's cards are never removed from the viewer's own range.
     const bool remove = remove_viewer_cards && seat_index != view.seat;
-    RangeWalk walk(view, params, static_cast<std::uint8_t>(1u << seat_index), remove);
+    RangeWalk walk(view, params, remove);
     walk.run();
     return walk.range(seat_index);
 }

@@ -25,6 +25,17 @@ namespace poker {
 // player's actions, starting from every combo at weight 1. Combos holding a known
 // card (the board, and the viewer's own cards where asked) are zeroed.
 //
+// The walk over a view tracks every dealt player's range, the viewer's included,
+// because a bet or raise is judged against the other players' ranges (below). All
+// of them are modeled with the one set of params given. With remove_viewer_cards
+// the viewer's cards are removed from the other players' ranges from the start, so
+// every likelihood is computed on ranges conditioned on them (the viewer's own range
+// never loses them). Measured against removing them only at the end, this moves
+// the viewer's equity by at most 1.5 pp in the spots tried.
+//
+// Layering: read_hand (made hand, pair, draws) comes from bots/gto_heuristic_engine.h,
+// so this module depends on the bots' hand reader, though never on bot behaviour.
+//
 // --- Player types -------------------------------------------------------------
 //
 // Four generic archetypes, applied to every opponent alike: Baseline (roughly the
@@ -35,18 +46,30 @@ namespace poker {
 // --- Preflop --------------------------------------------------------------------
 //
 // Positions come from the public table; `players` is the number dealt in. k counts
-// the raises before the action. resize(R, m) is resize_range(R, m, max_range_pct),
-// so every voluntary range is capped at max_range_pct; sp is `slowplay`.
+// the raises before the action: a raise is a new level only if its increment is
+// at least the last full raise's (the engine's rule), so a short all-in does not
+// count and a later re-raise reads as it would without it; the first raise always
+// counts. resize(R, m) is resize_range(R, m, cap) with cap 100 for m <= 1 and
+// max(max_range_pct, R's own %) for m > 1: the cap limits growth only, and never
+// below the chart itself, so a type narrower than the charts is narrower by its
+// width alone. sp is `slowplay`.
 //
 //   Open (k = 0, no limpers)      resize(rfi_range(pos), open_width) at 1
 //   Iso-raise over limpers        resize(rfi_range(pos), 0.75 * open_width); from the
 //                                 BB, its raise range (below)
-//   Limp, or SB completes         a window of limp_pct % of combos: the strongest
-//                                 classes outside the open range, at 1, plus the
-//                                 premium tier at limp_trap
+//   Limp, or SB completes         the window: the strongest limp_pct % of combos
+//                                 outside the open range, at 1, plus the premium
+//                                 tier at limp_trap
 //   BB checks its option          1 for everything outside the BB raise range
 //                                 (resize(premium and strong tiers, open_width)),
 //                                 sp on it. Not capped: the check is free.
+//   A limper facing the first     raise: 1 - sp on the premiums outside the window
+//   raise (limped earlier)        (the traps) and on the strongest
+//                                 0.1 x three_bet_width of the window; call: sp
+//                                 there, 1 on the strongest 0.6 x flat_width of the
+//                                 window (fractions of the window's combos, by
+//                                 strength). The charts do not apply: their call
+//                                 ranges barely meet a limp range.
 //   Facing one raise              chart = vs_open_ranges(pos, opener), with
 //                                 raise width three_bet_width, call width flat_width
 //   Facing a 3-bet                chart = the vs-3-bet ranges, four_bet_width and
@@ -67,10 +90,11 @@ namespace poker {
 //   All-in raise of at most 15 BB (street total)
 //       TEMPORARY, until Stage 6's push/fold tables: the top
 //       clamp(400 / bb, 5, 100) % by strength, halved when facing a raise, times
-//       open_width, capped. 10 BB first in is the top 40%, 15 BB 27%, 5 BB 80%.
+//       open_width, with growth capped as resize caps it. 10 BB first in is the
+//       top 40%, 15 BB 27%, 5 BB 80%.
 //   Call of an all-in of at most 15 BB
 //       TEMPORARY as above: the top clamp(250 / bb, 8, 100) % times flat_width,
-//       capped, with bb the all-in's street total in big blinds.
+//       capped as above, with bb the all-in's street total in big blinds.
 //   Any other all-in raise (so over 15 BB; the plan's 20 BB rule is covered too),
 //   or a raise to at least 40% of the stack the player started the hand with
 //       the commit range, resize(vs-4-bet raise + call, four_bet_width) at 1
@@ -78,48 +102,92 @@ namespace poker {
 //   of what is at stake (the same test as the bots' charts)
 //       resize(commit range, call_3bet_width) at 1
 //
+// KNOWN ISSUE for Stage 6: these overrides make a cliff. A 15 BB shove reads as the
+// top 27% of hands and a 16 BB shove as the commit range (about 3%); any raise to
+// 40% or more of the starting stack, all-in or not, reads as the commit range too.
+// Stage 6's push/fold tables replace them.
+//
 // --- Postflop -------------------------------------------------------------------
 //
 // StreetStrength ranks every combo on the board as it stands. For a range, a
 // combo's top_share t is its position in that range from the strongest hand down
-// (0 = the nuts, 1 = the worst). sigma(x) = 1 / (1 + e^-x) and w = softness.
-// Sizes s are fractions of the pot after calling, measured from the action
-// records: the pot before an action is street_start_pot plus every chip put in
-// earlier on that street, so a bet is chips / pot and a raise is
-// (street total - bet faced) / (pot + chips the raiser needed to call).
+// (0 = the nuts, 1 = the worst). Sizes s are fractions of the pot after calling,
+// measured from the action records: the pot before an action is
+// street_start_pot plus every chip put in earlier on that street, so a bet is
+// chips / pot and a raise is (street total - bet faced) / (pot + chips the
+// raiser needed to call).
+//
+// edge(x, t) is a smooth step on t around the threshold x with width w =
+// softness: 1 for t <= x - 2w, 0 for t >= x + 2w, 0.5 at x, and the cubic
+// 3y^2 - 2y^3 between, y = (x - t) / 4w + 1/2. Nothing leaks past 2w: with a
+// logistic, the tails over many weak hands outweighed a narrow value region.
+//
+// Standing. Bets and raises are judged against the opponents, not the actor's own
+// range. A combo's standing u is the largest top_share it holds in any live
+// opponent's current range (for a raise the bettor's range includes its bet):
+// u <= x means it beats at least 1 - x of every opponent's range, ties counting
+// half, the combo's own cards ignored. A value bet must beat whoever calls, so
+// multiway the worst standing counts. Value means more than half the equity
+// against the hands that call: if the callers are the top C of a range, that is
+// u <= C / 2. C is a standard player's continue share whatever the types,
+// Cref(s) = clamp(0.95 / (1 + s), 0.10, 0.95), so a type's aggression enters only
+// through the shift a = value_bet_top - 0.33 (Maniac +0.12, Nit -0.11).
+//
+// Own-range rule: the public functions given no opponent range (a null pointer)
+// read u as t and use the old thresholds, value_bet_top x (1.6 for s <= 0.4, 1.0
+// for s <= 0.8, else 0.75) for bets and value_bet_top / 2 for raises, with air
+// raising at 0.1 x bluff_mult and no barrel, slowplay or bluff-cap terms. It
+// judges value within the actor's range alone, so it overstates value raises from
+// a range facing a strong bettor; the walk never uses it while an opponent is in.
 //
 // Bet of size s, for a player not facing a bet:
-//   V    = value_bet_top * (1.6 if s <= 0.4, 1.0 if s <= 0.8, else 0.75)
-//   p_v  = sigma((V - t) / w) * (1 - sp)                      value
-//   x    = draw_bet for a strong draw (cards to come)          semi-bluff
-//          0.15 * value_bet_top / 0.33 for t <= 0.6            medium hands
-//          b for t > 0.6 without a strong draw                 air
+//   V    = Cref(s) / 2 + a, times 0.6 on the river (Cref(s) x 0.3 + a: ahead of
+//          70% of the calls, since a river bet is called only by hands that can
+//          beat it or catch bluffs)
+//   p_v  = edge(V, u) * (1 - sp x min(1, s / 0.5))   value; a bet under half pot
+//          keeps the opponent's range in, so value slowplays less
+//   x    = draw_bet for a strong draw (cards to come)  semi-bluff
+//          b for u > 0.6 without a strong draw          air
+//          0.15 * value_bet_top / 0.33 otherwise        medium hands
 //   P    = p_v + (1 - p_v) * x
 // b calibrates the bluffs: value mass M_v = sum(range * p_v), air mass
-// M_a = b * sum over air of range * (1 - p_v), and b = min(1, value) solving
-// M_a = bluff_mult * s / (1 + s) * M_v. So the bluff share of the polarised part,
-// M_a / (M_a + M_v), is m * r / (1 + m * r) with r = s / (1 + s), m = bluff_mult:
-// s / (1 + 2s) at m = 1, the river toy game's indifference share. Draws and medium
-// hands bet on top of that and are not counted as either part.
+// M_a = b * sum over air of range * (1 - p_v), and b = min(0.9, value) solving
+// M_a = g * bluff_mult * s / (1 + s) * M_v, where g = 4 for the previous street's
+// aggressor on the flop or turn (a c-bet or barrel: its air has equity and its
+// story fold equity) and 1 otherwise. While b < 0.9 the bluff share of the
+// polarised part, M_a / (M_a + M_v), is m * r / (1 + m * r) with r = s / (1 + s),
+// m = g * bluff_mult: s / (1 + 2s) for the Baseline on the river, the toy game's
+// indifference share. The cap 0.9 keeps some air checking, so a check never
+// removes air outright. Draws and medium hands bet on top of that and are not
+// counted as either part.
 //
-// Check, not facing a bet:  1 - P(bet of 0.5 pot). Value hands keep at least sp.
-// Checking to the aggressor (the last to bet or raise on the previous street,
-// still in and yet to act on this one) is what nearly every hand does, so it
-// narrows only by 1 - lead_share * P(bet of 0.5 pot). Without this the BB's check
-// to the preflop raiser would strip most of its strong hands.
+// Check, not facing a bet:  1 - P(bet of 0.5 pot). Value hands keep sp x (1 -
+// the medium rate) (sp, then the medium rate's bet on the rest). Checking to the
+// aggressor (the last to bet or raise on the previous street, still in and yet to
+// act on this one) is what nearly every hand does, so it narrows only by
+// 1 - lead_share * P(bet of 0.5 pot). Without this the BB's check to the preflop
+// raiser would strip most of its strong hands.
 //
-// Continue facing a bet of size s with pot odds o:
+// Continue facing a bet of size s with pot odds o (within the caller's own range:
+// defending the top of one's range is the standard model):
 //   C    = clamp(continue_mult * MDF, continue_floor, 0.95), MDF = 1 / (1 + s)
-//   p_c  = sigma((C - t) / w)
+//   p_c  = edge(C, t)
 //   strong draws: max(p_c, 1 if draw equity >= 0.9 * o, else 0.3), where draw
 //        equity is 0.35 on the flop and 0.18 on the turn
 //   pairs_and_draws_continue (Station): max(p_c, pairs_and_draws_prob) for a
 //        hand holding a pair (read_hand's holds_pair) or any draw
 //
-// Raise facing a bet of size s (the raise's own size is ignored):
-//   p_rv = sigma((value_bet_top / 2 - t) / w) * (1 - sp)
-//   y    = draw_bet / 2 for a strong draw, 0.1 * bluff_mult for air, else 0
-//   q    = p_rv + (1 - p_rv) * min(1, y)
+// Raise facing a bet of size s. The raise's own size is ignored: the bettor is
+// assumed to face a raise to three times its bet, s_r = 2s / (1 + 2s) pots.
+//   V_r  = 0.5 x Cref(s_r) / 2 + a: players fold more to raises than to bets, so
+//          the bettor is taken to continue with the top 0.5 x Cref(s_r) of its
+//          range, and a value raise must be ahead of half of that
+//   p_rv = edge(V_r, u) * (1 - sp)
+//   y    = draw_bet / 2 for a strong draw, b_r for air (t > 0.6 in the raiser's
+//          own range: bluff raises come from its weakest hands), else 0
+//   b_r  = min(1, bluff_mult * s_r / (1 + s_r) * M_rv / air room), the bet's
+//          calibration with M_rv = sum(range * p_rv)
+//   q    = p_rv + (1 - p_rv) * y
 //   R    = raise_share * clamp(1.5 / (1 + s), 0.4, 1.25)   (raise_share_scale)
 //   P_raise = k * q with k = min(1, R / Q), Q = the range's mean q: R caps the
 //        share of the range that raises, scaling every combo alike so the shape
@@ -139,11 +207,14 @@ namespace poker {
 //
 // --- Fallback -------------------------------------------------------------------
 //
-// If a product falls below 1% of all combos (13.26) and also below 5% of the
-// range before the action, the action was one the model all but ruled out, so
-// the range becomes that action's likelihood alone (with known cards removed). If
-// that is empty too, the action is ignored. Legitimately narrow ranges, such as a
-// Nit's 11-combo 4-bet range, keep their product.
+// A product is trusted if it holds at least 1% of all combos (13.26) or at least
+// 0.5% of the range before the action (well under any raise share, so a Station's
+// or a Nit's raise keeps its product). Otherwise the action was one the model all
+// but ruled out, and its likelihood is put on the range as the current street
+// began (if that product is trusted by the same test), else on the range as
+// preflop ended (if not empty), else on every combo, with known cards removed. If
+// all are empty, the action is ignored. So a hand folded preflop never comes back
+// postflop.
 
 enum class Archetype : std::uint8_t { Baseline, Nit, Station, Maniac };
 
@@ -158,7 +229,7 @@ constexpr std::string_view to_string(Archetype archetype) {
 struct ArchetypeParams {
     // Preflop widths, as multiples of the charts' combos.
     double open_width = 1.00;
-    double max_range_pct = 100.0;  // Cap on every voluntary range, % of combos
+    double max_range_pct = 100.0;  // Growth beyond a chart stops at max(this, the chart's %)
     double limp_pct = 2.0;         // Limps: this % of combos just outside the opens
     double limp_trap = 0.3;        // ... plus premiums at this weight
     double flat_width = 1.00;
@@ -172,11 +243,11 @@ struct ArchetypeParams {
     bool pairs_and_draws_continue = false;
     double pairs_and_draws_prob = 0.9;
     double raise_share = 0.10;     // Most of a range that raises a half-pot bet (see raise_share_scale)
-    double value_bet_top = 0.33;   // Top share of a range that bets for value at 0.5-0.8 pot
-    double bluff_mult = 1.0;       // Air : value = bluff_mult * s / (1 + s)
+    double value_bet_top = 0.33;   // Value thresholds shift by this - 0.33 (own-range rule: the top share)
+    double bluff_mult = 1.0;       // Air : value = bluff_mult * s / (1 + s), x4 when barrelling
     double draw_bet = 0.5;         // Strong draws bet this often
     double slowplay = 0.20;        // Value hands that check or flat instead
-    double softness = 0.06;        // Width of the logistic edges, in top_share
+    double softness = 0.06;        // Edge width w, in top_share: each edge spans 4w
     double lead_share = 0.15;      // Leads into the aggressor, as a share of P(bet)
     int value_size_shift = 0;      // Ladder rungs to shift value bets (used by the advisor)
 };
@@ -240,21 +311,26 @@ struct BetBreakdown {
     double air_share_of_polarised() const;
 };
 
-// Not facing a bet: a bet of `size_pots`.
+// Not facing a bet: a bet of `size_pots`. `opponent` is the range the bet is
+// judged against (value means beating enough of it); null applies the own-range
+// rule (see the model above).
 BetBreakdown bet_breakdown(const WeightedRange& range, const StreetStrength& strength, double size_pots,
-                           const ArchetypeParams& params);
+                           const ArchetypeParams& params, const WeightedRange* opponent = nullptr);
 WeightedRange bet_likelihood(const WeightedRange& range, const StreetStrength& strength, double size_pots,
-                             const ArchetypeParams& params);
+                             const ArchetypeParams& params, const WeightedRange* opponent = nullptr);
 // A check not to the aggressor (the full 1 - P(bet)).
 WeightedRange check_likelihood(const WeightedRange& range, const StreetStrength& strength,
-                               const ArchetypeParams& params);
+                               const ArchetypeParams& params, const WeightedRange* opponent = nullptr);
 
-// Facing a bet of `size_pots` at `pot_odds` (call / (pot + call)).
+// Facing a bet of `size_pots` at `pot_odds` (call / (pot + call)). `bettor` is the
+// bettor's range after its bet, which value raises are judged against; null
+// applies the own-range rule. Calls depend on it too, through the raises.
 WeightedRange call_likelihood(const WeightedRange& range, const StreetStrength& strength, Street street,
-                              double size_pots, double pot_odds, const ArchetypeParams& params);
+                              double size_pots, double pot_odds, const ArchetypeParams& params,
+                              const WeightedRange* bettor = nullptr);
 // A raise of a bet of `size_pots`: the size sets the raise share cap.
 WeightedRange raise_likelihood(const WeightedRange& range, const StreetStrength& strength, double size_pots,
-                               const ArchetypeParams& params);
+                               const ArchetypeParams& params, const WeightedRange* bettor = nullptr);
 
 // The factor on raise_share for a faced bet of `size_pots` (a fraction of the pot
 // after calling): clamp(1.5 / (1 + size_pots), 0.4, 1.25). A non-finite or
@@ -271,9 +347,14 @@ struct Response {
     WeightedRange raise_range;
 };
 
-// `range` facing a bet of `size_pots` at `pot_odds`, on the street `strength` is for.
+// `range` facing a bet of `size_pots` at `pot_odds`, on the street `strength` is
+// for. `bettor_range` is the bettor's range including this bet (for the advisor,
+// Hero's range as the villain sees it), which the villain's value raises are
+// judged against; null applies the own-range rule, which reads value raises from
+// the villain's own range alone and overstates them against a strong bettor.
 Response predict_postflop_response(const WeightedRange& range, const StreetStrength& strength, Street street,
-                                   double size_pots, double pot_odds, const ArchetypeParams& params);
+                                   double size_pots, double pot_odds, const ArchetypeParams& params,
+                                   const WeightedRange* bettor_range = nullptr);
 
 // `villain_range_so_far` facing a preflop raise from `raiser`, which makes
 // `raises_after_hero` raises in all (1 = an open, 2 = a 3-bet, 3+ = a 4-bet or
@@ -282,10 +363,11 @@ Response predict_postflop_response(const WeightedRange& range, const StreetStren
 // raise's size over the standard one: bigger raises lose their weakest calls
 // first, smaller ones gain calls. The raises are unchanged, so the continue share
 // moves by somewhat less than that factor. The stack-size overrides are not
-// applied here.
+// applied here. With villain_limped and a first raise, the limper's answer
+// (above) replaces the chart, its call width scaled the same way.
 Response predict_preflop_response(const WeightedRange& villain_range_so_far, Position villain, Position raiser,
                                   int raises_after_hero, double size_ratio, int players,
-                                  const ArchetypeParams& params);
+                                  const ArchetypeParams& params, bool villain_limped = false);
 
 // --- Ranges from a view ---------------------------------------------------------
 

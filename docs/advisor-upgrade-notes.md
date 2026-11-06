@@ -235,7 +235,7 @@ By line, regret is 1.38 BB for check-check, 1.27 for bet then check, and 3.18 fo
 - **Temporary short-stack formulas,** until Stage 6 adds push/fold tables:
   - Shoving ≤ 15 BB: the top clamp(400/BB, 5, 100)%, halved when facing a raise.
   - Calling such a shove: the top clamp(250/BB, 8, 100)%.
-- **Fallback:** a range falls back to the last action's likelihood only when it drops below 1% of combos *and* below 5% of its prior mass. This keeps small but legitimate ranges, such as a Nit's 4-bet range.
+- **Fallback:** a range falls back to the last action's likelihood only when it drops below 1% of combos *and* below 5% of its prior mass. This keeps small but legitimate ranges, such as a Nit's 4-bet range. (Superseded by the review fixes below.)
 
 **Speed:** `infer_ranges` on a river view with bets and calls on every street takes p50 0.5 ms and p95 0.6 ms with 2 opponents, and 0.84 / 1.22 ms with 5. `street_strength` takes about 0.15 ms.
 
@@ -263,6 +263,48 @@ On K72r, BTN vs BB, after a flop c-bet is called and the turn is checked, the vi
 
 **Tests:** 410 pass, which is 393 plus 15 new tests and 2 disabled reports (`RangeModelReport.DISABLED_ThreeSpots` and `DISABLED_Timing`). Each new test takes ≤ 0.03 s.
 
+### Stage 4 review fixes
+
+The Stage 4 review found that value was judged only within the actor's own range, so a capped range read its medium hands as value and Hero's equity against aggression came out far too high. The model is documented in full in `range_model.h`; the changes are:
+
+**Decisions**
+- **Bets and raises are judged against the opponents.** A combo's standing u is the largest top_share it holds in any live opponent's current range. Value means more than half the equity against the callers, the top C of a range, so u ≤ C/2, with C a standard player's continue share Cref(s) = clamp(0.95/(1+s), 0.10, 0.95) for every type. A type's aggression enters as a shift of value_bet_top − 0.33. The walk now tracks every dealt player's range, the viewer's included, all with the one params set.
+- **Margins, tuned on the reviewer's spots** (judgment, not solver-verified):
+  - River bets need u ≤ 0.6 × Cref/2 (ahead of 70% of the calls).
+  - Raises assume the bettor faces a 3x raise, s_r = 2s/(1+2s), and continues with 0.5 × Cref(s_r); a value raise is ahead of half of that.
+  - Bluff raises are calibrated to the value-raise mass like bets (bluff_mult × s_r/(1+s_r)), from the bottom of the raiser's own range.
+  - The previous street's aggressor bluffs 4× the river ratio on the flop and turn (c-bets and barrels). The bluff weight is capped at 0.9, so a check never removes all air.
+  - Bets under half pot slowplay less: sp × s/0.5.
+- **Edges are a cubic smooth step** (zero beyond ±2w) instead of a logistic. The logistic's tails over many weak hands outweighed a narrow value region: With everything else as now, the logistic gives AQ 44.6% against the river check-raise (x/c flop, x/x turn) and 61.1% against the flop check-raise; the step gives 27.5% and 56.8%.
+- **`predict_postflop_response` takes `bettor_range`,** and the likelihood functions take the opponent or bettor range. Null keeps the old own-range rule, documented as overstating raises against a strong bettor.
+- **Limpers facing the first raise** use their own answer: calls are the strongest 0.6 × flat_width of the limp window, plus traps at sp; raises are the traps and the strongest 0.1 × three_bet_width of the window. `predict_preflop_response` has `villain_limped`.
+- **Fallback:** the product is trusted at ≥ 1% of combos or ≥ 0.5% of the prior (was 5%). Otherwise the likelihood goes on the street-start range, then the preflop range, then every combo.
+- **Width caps limit growth only** and never cut below the chart: cap = max(max_range_pct, chart %) when the width is above 1.
+- **A short all-in is not a new raise level** (the engine's full-raise rule). The first raise always counts.
+
+**Deviations from the plan's table:** `max_range_pct` for the Station goes from 70 to 80 and for the Maniac from 75 to 90, so they open wider than the 75% heads-up BTN chart. The Nit's 15 now only limits growth, and the Nit is narrower through its widths alone: its CO/BTN/SB opens are 16.4/27.5/25.6% instead of 14.2% each.
+
+**Measured** (Baseline, AcQc on the BTN, Qs9h4d2c7s, BTN opens and the BB calls; old → new):
+
+| Spot | Old | New | Plausible |
+|---|---|---|---|
+| Flop check-raise | 72.1% | 56.8% | 45–60% |
+| River check-raise, after x/c flop and x/x turn | 91.2% | 27.5% | ≤ 35% |
+| River check-raise, after x/c flop and turn | 60.2% | 25.4% | ≤ 35% |
+| River lead of 75%, after x/c flop and x/x turn | 86.3% | 72.8% | 55–65% (**still high**) |
+| 3-bet range c-bet at 33% on K83r | 59% | 89% | ≥ 85% |
+| BTN c-bet on K72r vs BB at 33/75/125% | 56/43/37% | 71/63/59% | 60–80% at 33% |
+| 8c8d on Ah9s4c after BB check-calls 33% | 43.5% | 43.4% | 40–48% |
+| Baseline UTG limp-call of an iso | 4 combos | 14.3 | |
+| HU BTN open, Nit/Base/Station/Maniac | 14.2/75/69.8/75% | 45.1/75/79.8/89.1% | |
+
+**The river lead stays at 72.8%, and that was accepted.** The 55–65% band was the reviewer's estimate, not a solver result. In this model the BB 3-bets AQ and KQ preflop, so every one-pair hand it leads for value is worse than AQ. Its value range is sets, two pair and straights, plus thin queens, with about 30% bluffs. Tightening river value further only got to about 70%. Stage 5's bench measures whether this hurts the advice.
+
+- **The river lead is still high:** the BB 3-bets AQ and KQ, so every one-pair hand it leads for value is worse than AQ, and balanced bluffing (30% at 75% pot) sets a floor. Tightening river value further only reached about 70%.
+- **Check ranges:** a BB that checks the flop, turn and river keeps 156 of 453 combos (141 before). A BTN that checks back all three streets keeps 29 of 610 combos, mostly ace-high showdown value (107 before), because its c-bets and barrels now take most of its air.
+- **Viewer card removal** moves equity by at most 1.5 pp in the reviewer's three spots (≤ 0.8 pp before).
+- **Speed:** `infer_ranges` on a river view, over two runs: p50 0.74–0.79 ms and p95 0.88–1.37 ms with 2 opponents; p50 1.11–1.18 ms and p95 1.28–1.82 ms with 5 (was p95 1.29). Every dealt player is now tracked and judged against the others.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -280,3 +322,10 @@ On K72r, BTN vs BB, after a flop c-bet is called and the turn is checked, the vi
 
 - **Stage 1:** no existing test changed; all new tests are in `tests/range_test.cpp`.
 - **Tolerance note:** `PreflopMatrix.SpotChecksAgainstMonteCarlo` uses max(3 combined standard errors, 0.6 pp). Three standard errors is about 0.43 pp there, so the 0.6 pp floor is a little looser than the plan's "within 3 standard errors". It was kept so the test can't be flaky.
+- **Stage 4 review fixes** (`tests/range_model_test.cpp`):
+  - `RangeModel.BluffShareTracksSize`:
+    - **Old:** the BTN's river bet after checks equals prior × `bet_breakdown(prior, ...)` (own-range rule), and the measured air share (top_share > 0.6 in the prior) is within 0.05 of s/(1+2s).
+    - **New:** the BB's river lead after the flop and turn are checked through equals prior × `bet_breakdown(prior, ..., &btn_range)`. It is viewed from a folded player without card removal, so the BTN range given is the walk's own. `bet_likelihood` agrees, the bluff weight stays below the 0.9 cap, and air is measured against the BTN's range (u > 0.6). Same tolerances.
+    - **Reason:** inference now judges value against the opponent. The BTN's own checked range holds too little air to calibrate, because as the flop aggressor it bluffed most of it.
+  - `RangeModel.ThreeBetAndFourBetUseTheCharts`: a comment fix only (the viewer is the BTN, not the BB).
+  - **New tests:** `CheckRaiseRangesAreStrong`, `CbetFrequenciesArePlausible`, `PredictedRaisesAreJudgedAgainstTheBettor`, `LimpCallKeepsASensibleRange`, `FallbackNeverRevivesPreflopFolds`, `WidthsOrderByTypeHeadsUpAndByPosition`, `ShortAllInIsNotANewRaiseLevel`. Each takes ≤ 0.015 s in Release.
