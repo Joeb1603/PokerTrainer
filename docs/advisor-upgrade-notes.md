@@ -596,6 +596,79 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 
 **Tests:** 429 pass in Release (5.8 s), Debug (23.2 s) and clang, with zero warnings; `strict.sh` clean on `training_advisor.cpp`, `range_model.cpp` and `advisor_bench.cpp`.
 
+### Stage 6 batches A and B (positional 3-bet/4-bet charts, push/fold tables), uncommitted, on top of `cf3b6c3`
+
+**Batch A: positional answers to 3-bets and 4-bets** (`preflop_charts.{h,cpp}`)
+- New: `vs_three_bet_ranges(opener, three_bettor, players)` and `vs_four_bet_ranges(three_bettor, four_bettor, players)`. The bots' `vs_three_bet_response` and `vs_four_bet_response` are untouched, and `VsReraises.BotsChartsUnchanged` pins their answers for all 169 classes.
+- Assumed spot: 100 BB 6-max, open to 2.5 BB, 3-bet to about 3x in position and 3.5-4x from the blinds, 4-bet to about 22-25 BB.
+- "In position" is by postflop order (SB, BB, UTG, HJ, CO, BTN). An opener facing a later non-blind 3-bettor is out of position; facing a blind 3-bettor it is in position. Heads-up (players == 2) uses its own table. An SB or BB "opener" (a raise over limps) uses the SB-vs-BB table.
+- The 4-bet ranges are value plus A5s/A4s-type blocker bluffs. Every continue hand is in the opener's own RFI range (tested for every opener/3-bettor pair).
+
+Continue share = (4-bet + call combos) / the opener's RFI combos:
+
+| Table | Used for | Intended | Measured (4-bet + call) |
+|---|---|---|---|
+| UTG, out of position | UTG vs HJ/CO/BTN | 38-45% | 42.9% (24 + 66 of 210) |
+| UTG, in position | UTG vs SB/BB | 46-55% | 50.5% (24 + 82) |
+| HJ, out of position | HJ vs CO/BTN | 36-44% | 40.7% (24 + 86 of 270) |
+| HJ, in position | HJ vs SB/BB | 44-53% | 48.9% (24 + 108) |
+| CO, out of position | CO vs BTN | 30-40% | 35.7% (42 + 90 of 370) |
+| CO, in position | CO vs SB/BB | 40-50% | 45.4% (42 + 126) |
+| BTN | BTN vs SB/BB | 40-55% | 48.9% (50 + 248 of 610) |
+| SB | SB vs BB | 30-40% | 38.2% (56 + 160 of 566) |
+| Heads-up BTN | BTN vs BB, 2 players | 45-60% | 52.9% (86 + 440 of 994) |
+
+- For comparison, the old non-positional chart (106 combos) keeps 50.5% of a UTG open, 39.3% of HJ, **28.6% of CO**, 17.4% of BTN, 18.7% of SB and 10.7% heads-up. The CO-vs-BB entry is the must-fix's "CO folds 72%" (Stage 5 batch B); the new table folds 54.6%. Batch C has to switch the advisor and range model to these tables before the BB 3-bet share can be re-measured.
+- Earlier openers keep a larger share of their opens (UTG > HJ > CO, both in and out of position). The BTN keeps 48.9%, more than the CO's 45.4%, because the blinds 3-bet it wider.
+
+Answers to a 4-bet, as a share of all 1,326 combos:
+
+| Table | Used for | 5-bet jam | Call | Continue |
+|---|---|---|---|---|
+| In position vs early | non-blind 3-bettor vs a UTG/HJ 4-bet | KK+, AKs | QQ, JJ, AKo, AQs | 3.3% |
+| In position | non-blind 3-bettor vs a later 4-bet | KK+, AKs | QQ-TT, AKo, AQs, AJs, KQs | 4.4% |
+| Out of position | blind 3-bettor vs a non-blind 4-bet | QQ+, AK | JJ, TT, AQs | 3.8% |
+| Blind vs blind | both blinds | QQ+, AK | JJ-88, AQs-ATs, KQs, KJs, AQo | 6.8% |
+| Heads-up | 2 players | QQ+, AK | JJ-66, AQs-A9s, KQs, KJs, KTs, QJs, JTs, AQo, AJo, KQo | 10.7% |
+
+**Batch B: push/fold tables** (`tools/gen_push_fold.cpp`, `src/strategy/push_fold.{h,cpp}`, `src/strategy/generated/push_fold_data.cpp`)
+- API: `push_fold_response(hand, hero, stack_bb, shover, players)`. First in it gives Raise (all in) or Fold; facing a lone jam, Call or Fold. It gives nullopt outside 3-15 BB, for the BB first in, and for a hero who doesn't act after the shover. `push_fold_jam_range` and `push_fold_call_range` return the `HandRange` for the range model, and `push_fold_iterations()` returns 2000.
+- **Method:** fictitious play over the 169 classes, one game per first-in position and stack (3-15 BB in 1 BB steps, blinds 0.5/1, no ante, every player holding the stack). Strategies start as "jam everything, call half". Each iteration the jammer best-responds to the callers' averages, its average moves 1/(t+1) toward that, and then each caller best-responds to the jammer's updated average (alternating updates). The published set is every class whose average is at least 0.5.
+- **Inputs:** `class_vs_class_equity` (200,000 rollouts per pair). Card removal between the jammer and each caller uses combo counts: P(j | i) = disjoint combo pairs (i, j) / (combos(i) × 1225). That is exact at class level for two players.
+- **The one-caller approximation** (a known approximation for the decision log and CLAUDE.md section 12):
+  - For UTG-BTN first in, every player behind is a possible caller, but the first one to call is the only one: overcalls are ignored.
+  - The jammer's EV is Σ_m P(all before m fold) × (its showdown against m's calling range) + P(all fold) × 1.5 BB.
+  - Each caller's range is its heads-up best response to the jam, as if it were the only caller. Players behind it don't change its range.
+  - Card removal between callers, and from folded players, is ignored. The callers' fold probabilities are treated as independent.
+- **SB vs BB is the heads-up game,** so heads-up the button, which posts the small blind, uses the SB tables. A short-handed table drops early positions, so each position keeps the same number of players behind and uses the same tables.
+- **Determinism:** no randomness, fixed summation order, and strict "better than folding" tests. The output is byte-identical with 1 and 4 threads.
+- **Runtime:** 65 games × 2,000 iterations in 2.9-3.1 s on 4 threads (11.7 s on 1). Ten thousand iterations take 14.8 s.
+- **Convergence at 2,000 iterations:**
+  - NashConv is the sum over players of what a best response gains, each caller's term counted conditional on facing the jam. For the published (pure) sets it is at most 5.9 mBB per hand (UTG at 3 BB), and at most 0.32 mBB for every SB/heads-up game.
+  - For the mixed averages it is up to 57.6 mBB (UTG at 15 BB). That is mostly the 1/t tail of FP's early iterations, since the thresholded sets do better. At 10,000 iterations the figures are 10.8 mBB (averages) and 4.4 mBB (sets).
+  - The sets are not frozen. The last flip of any set was at iteration 1,989, from classes sitting at the indifference point.
+  - Against 10,000 iterations, the 2,000-iteration sets differ by 0.44% of combos per set on average. The worst cases are the multiway 3 BB games: SB calling a UTG jam (64 combos, 4.8%), and the UTG 3 BB jam (60 combos). Apart from 3 BB, the largest difference is 36 combos (BB vs a UTG jam at 6 BB).
+- **Heads-up at 10 BB: the SB jams 58.37% and the BB calls 37.25%,** against the commonly published 58% and 37%.
+  - At 5 BB: jams 71.3%, calls 62.0%. At 15 BB: jams 45.4%, calls 28.8%.
+  - `GeneratedTableMatchesARecomputation` rebuilds the heads-up model independently at 5, 10 and 15 BB and checks each published set against a best response to the other (allowing up to 3 classes per side within 0.05 BB of indifference). Measured: the jam sets differ in 0, 0 and 1 class (0.007 BB from indifference), and the call sets in 1 class at each stack (0.003, 0.005 and 0.029 BB).
+
+Jam share, as a percent of all combos:
+
+| Position | 5 BB | 10 BB | 15 BB |
+|---|---|---|---|
+| UTG | 25.2 | 16.0 | 10.1 |
+| HJ | 29.1 | 19.8 | 13.7 |
+| CO | 32.4 | 24.3 | 18.3 |
+| BTN | 40.9 | 32.1 | 26.4 |
+| SB | 71.3 | 58.4 | 45.4 |
+
+- **BB call share** against a jam at 5 / 10 / 15 BB: vs UTG 31.8 / 9.7 / 5.6; vs CO 38.8 / 17.2 / 10.0; vs BTN 45.7 / 24.3 / 16.1; vs SB 62.0 / 37.3 / 28.8. Non-blind callers share one range per jammer, since they face the same price.
+- **Monotonicity:** every jam and call share is non-increasing in the stack from 3 to 15 BB. A few adjacent stacks have equal shares (jams: UTG 13-14, CO 11-12 and 13-14, BTN 10-11), but no share rises. Earlier positions jam strictly tighter at every stack.
+- **Call sets are equity thresholds:** in every call set, the weakest called class has at most 0.94 pp less equity against the published jam set than the best folded class. That gap exists because the sets threshold mixed averages.
+- **One ordering exception, by design:** at 3 BB the BB calls a BTN jam wider (97.3%) than an SB jam (92.8%), because the SB's dead half blind improves its price. `EarlierPositionsJamTighter` checks "later jams are called wider" from 4 BB.
+
+**Tests:** 440 pass in Release (5.8 s) and Debug (24.0 s), with zero warnings in Release, Debug and clang. `strict.sh` is clean on `preflop_charts.cpp`, `push_fold.cpp`, `gen_push_fold.cpp`, the generated data and both test files. Every new test takes at most 0.02 s in Release.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -615,6 +688,9 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 - Stage 5 batch B: the threads used for the lines were run under GCC's ThreadSanitizer only for the advisor, range-equity and controller tests (Stage 5 review); clang's TSan and MSVC were not available.
 - Stage 5 batch D: the tuned Baseline parameters were fitted to the river bench's hand-written ranges. The winner sits at a corner of the grid, the grid was not extended, and the turn holdout (Stage 8) does not exist yet. Their effect on flop and turn advice was checked only through the Stage 4 plausibility tests and the unchanged test suite. (The three parameters are postflop only, so preflop advice does not change.)
 - Stage 5 batch D: the diagnosis of the 3-bet-pot spots compares the model's inferred lead range with the bench's assumed range. Neither range is solved, so which story is closer to real play is unverified.
+
+- Stage 6 batch A: the positional 3-bet and 4-bet tables are hand-authored to the stated bands, in the style of published 100 BB 6-max charts. They were not solved or compared with a specific solver output.
+- Stage 6 batch B: the 6-max push/fold tables rest on the one-caller approximation, and they were not compared with a full multiway equilibrium (such as HRC). Only the heads-up game is checked against published numbers, and only at 10 BB.
 
 ## Test changes
 
@@ -681,3 +757,8 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 - **Stage 5 batch D:** no test assertion changed. With the new Baseline defaults all 428 tests pass in Release and Debug, including the archetype and range-model tests. The Stage 4 plausibility numbers moved within their bounds (see "Stage 5 tuning"); the closest is `CheckRaiseRangesAreStrong`'s flop check-raise, 47.7% against a lower bound of 45%.
 
 - **Stage 5 review:** no assertion changed. New test `Advisor.RaiseEvsCountWhatShortStacksCanMatch`: rebuilds the bet/raise EV per villain from the range model's public functions, at 1e-6, for a raise and an all-in beside a short all-in player and for an all-in and a pot bet against a villain too short to cover it. It fails on `0e388be` and takes about 0.02 s in Release.
+
+- **Stage 6 batches A and B:** no existing assertion changed. New tests:
+  - In `tests/preflop_charts_test.cpp`: `PositionalVsThreeBet.NestsSensibly` (continue-share bands per table, continue ⊆ RFI for every opener/3-bettor pair, raise and call disjoint, in-position call and continue ⊇ out-of-position for UTG/HJ/CO), `PositionalVsThreeBet.EarlierOpenersKeepMoreOfTheirOpens`, `PositionalVsThreeBet.KnownDecisions`, `PositionalVsFourBet.VsFourBetRangesAreNarrow`, and `VsReraises.BotsChartsUnchanged` (a 169-class snapshot of the bots' two charts, taken before the change).
+  - In the new `tests/push_fold_test.cpp`: `HeadsUpTenBbMatchesKnownNash`, `JamShareFallsAsStacksDeepen`, `EarlierPositionsJamTighter`, `CallRangesAreSubsetsOfStrongHands` (premiums called, 72o/32o never at 6 BB or more, each call set a threshold on equity against the jam within 0.02), `GeneratedTableMatchesARecomputation` and `ResponsesAndNulloptCases`.
+  - `tests/player_boundary_test.cpp` also includes `strategy/push_fold.h`.

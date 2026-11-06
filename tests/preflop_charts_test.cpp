@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "strategy/preflop_charts.h"
 
@@ -13,6 +15,11 @@ namespace {
 HandClass hc(const char* text) { return HandClass::parse(text).value(); }
 
 constexpr std::array<Position, 5> kOpeners{Position::UTG, Position::HJ, Position::CO, Position::BTN, Position::SB};
+
+PreflopResponse respond_for_test(const VsRaiseRanges& ranges, HandClass hand) {
+    if (ranges.raise.contains(hand)) return PreflopResponse::Raise;
+    return ranges.call.contains(hand) ? PreflopResponse::Call : PreflopResponse::Fold;
+}
 
 HandRange defended(const VsRaiseRanges& ranges) {
     HandRange all = ranges.call;
@@ -267,6 +274,219 @@ TEST(VsReraises, RangesNarrowAsRaisesEscalate) {
     EXPECT_EQ(vs_four_bet_response(hc("QQ")), PreflopResponse::Call);
     EXPECT_EQ(vs_four_bet_response(hc("TT")), PreflopResponse::Fold);
     EXPECT_EQ(vs_four_bet_response(hc("A5s")), PreflopResponse::Fold);
+}
+
+// --- Positional responses to a 3-bet and a 4-bet (the advisor's) -----------------
+
+namespace {
+
+constexpr std::array<Position, 6> kAllPositions{Position::UTG, Position::HJ, Position::CO,
+                                                Position::BTN, Position::SB, Position::BB};
+
+double continue_share(const VsRaiseRanges& ranges, const HandRange& open) {
+    return 100.0 * defended(ranges).combos() / open.combos();
+}
+
+std::string spot_name(Position first, Position second, int players) {
+    return std::string(to_string(first)) + " vs " + std::string(to_string(second)) + " (" +
+           std::to_string(players) + " players)";
+}
+
+}  // namespace
+
+TEST(PositionalVsThreeBet, NestsSensibly) {
+    // Continue share of the opener's own open, by spot: the intended bands.
+    struct Band {
+        Position opener;
+        Position three_bettor;
+        int players;
+        double low;
+        double high;
+    };
+    const std::array<Band, 15> bands{{
+        {Position::UTG, Position::HJ, 6, 38.0, 45.0},  {Position::UTG, Position::BTN, 6, 38.0, 45.0},
+        {Position::UTG, Position::SB, 6, 46.0, 55.0},  {Position::UTG, Position::BB, 6, 46.0, 55.0},
+        {Position::HJ, Position::CO, 6, 36.0, 44.0},   {Position::HJ, Position::BTN, 6, 36.0, 44.0},
+        {Position::HJ, Position::BB, 6, 44.0, 53.0},   {Position::CO, Position::BTN, 6, 30.0, 40.0},
+        {Position::CO, Position::SB, 6, 40.0, 50.0},   {Position::CO, Position::BB, 6, 40.0, 50.0},
+        {Position::BTN, Position::SB, 6, 40.0, 55.0},  {Position::BTN, Position::BB, 6, 40.0, 55.0},
+        {Position::SB, Position::BB, 6, 30.0, 40.0},   {Position::BTN, Position::BB, 2, 45.0, 60.0},
+        {Position::CO, Position::BB, 4, 40.0, 50.0},
+    }};
+    for (const Band& band : bands) {
+        SCOPED_TRACE(spot_name(band.opener, band.three_bettor, band.players));
+        const double share = continue_share(vs_three_bet_ranges(band.opener, band.three_bettor, band.players),
+                                            rfi_range(band.opener, band.players));
+        EXPECT_GE(share, band.low);
+        EXPECT_LE(share, band.high);
+    }
+
+    // Every continue hand is one the opener opens, and no hand is in both sets.
+    for (std::size_t o = 0; o + 1 < kAllPositions.size(); ++o) {
+        for (std::size_t t = o + 1; t < kAllPositions.size(); ++t) {
+            const Position opener = kAllPositions[o];
+            const Position three_bettor = kAllPositions[t];
+            SCOPED_TRACE(spot_name(opener, three_bettor, kMaxSeats));
+            const VsRaiseRanges& ranges = vs_three_bet_ranges(opener, three_bettor);
+            EXPECT_TRUE(rfi_range(opener).contains_all(defended(ranges)));
+            EXPECT_EQ(defended(ranges).combos(), ranges.raise.combos() + ranges.call.combos());
+            EXPECT_TRUE(ranges.raise.contains(hc("AA")));
+            EXPECT_TRUE(ranges.raise.contains(hc("KK")));
+        }
+    }
+    EXPECT_TRUE(rfi_range(Position::BTN, 2).contains_all(defended(vs_three_bet_ranges(Position::BTN, Position::BB, 2))));
+
+    // In position (against a blind 3-bet) an opener flats and continues a superset
+    // of what it keeps out of position against a later 3-bettor.
+    for (const Position opener : {Position::UTG, Position::HJ, Position::CO}) {
+        SCOPED_TRACE(std::string(to_string(opener)));
+        const VsRaiseRanges& ip = vs_three_bet_ranges(opener, Position::BB);
+        const VsRaiseRanges& oop = vs_three_bet_ranges(opener, Position::BTN);
+        EXPECT_TRUE(ip.call.contains_all(oop.call));
+        EXPECT_TRUE(defended(ip).contains_all(defended(oop)));
+        EXPECT_GT(defended(ip).combos(), defended(oop).combos());
+        // Which blind 3-bets, or which later position, does not matter.
+        EXPECT_EQ(&vs_three_bet_ranges(opener, Position::SB), &ip);
+    }
+    // Heads-up the button keeps more than it does six-handed.
+    EXPECT_TRUE(defended(vs_three_bet_ranges(Position::BTN, Position::BB, 2))
+                    .contains_all(defended(vs_three_bet_ranges(Position::BTN, Position::BB))));
+}
+
+TEST(PositionalVsThreeBet, EarlierOpenersKeepMoreOfTheirOpens) {
+    const auto share = [](Position opener, Position three_bettor) {
+        return continue_share(vs_three_bet_ranges(opener, three_bettor), rfi_range(opener));
+    };
+    EXPECT_GT(share(Position::UTG, Position::BTN), share(Position::HJ, Position::BTN));
+    EXPECT_GT(share(Position::HJ, Position::BTN), share(Position::CO, Position::BTN));
+    EXPECT_GT(share(Position::UTG, Position::BB), share(Position::HJ, Position::BB));
+    EXPECT_GT(share(Position::HJ, Position::BB), share(Position::CO, Position::BB));
+    // In absolute terms the later, wider opens still continue more hands.
+    EXPECT_GT(defended(vs_three_bet_ranges(Position::CO, Position::BB)).combos(),
+              defended(vs_three_bet_ranges(Position::UTG, Position::BB)).combos());
+}
+
+TEST(PositionalVsThreeBet, KnownDecisions) {
+    const auto at = [](const char* hand, Position opener, Position three_bettor, int players = kMaxSeats) {
+        return respond_for_test(vs_three_bet_ranges(opener, three_bettor, players), hc(hand));
+    };
+    // The cutoff defends a BB 3-bet with its good broadways and suited hands.
+    EXPECT_EQ(at("AA", Position::CO, Position::BB), PreflopResponse::Raise);
+    EXPECT_EQ(at("A5s", Position::CO, Position::BB), PreflopResponse::Raise);
+    EXPECT_EQ(at("77", Position::CO, Position::BB), PreflopResponse::Call);
+    EXPECT_EQ(at("AJo", Position::CO, Position::BB), PreflopResponse::Call);
+    EXPECT_EQ(at("76s", Position::CO, Position::BB), PreflopResponse::Call);
+    EXPECT_EQ(at("AJo", Position::CO, Position::BTN), PreflopResponse::Fold);
+    EXPECT_EQ(at("72o", Position::CO, Position::BB), PreflopResponse::Fold);
+    EXPECT_EQ(at("K5s", Position::CO, Position::BB), PreflopResponse::Fold);
+    // UTG keeps its strong hands either way.
+    EXPECT_EQ(at("JJ", Position::UTG, Position::BTN), PreflopResponse::Call);
+    EXPECT_EQ(at("AKo", Position::UTG, Position::BTN), PreflopResponse::Call);
+    EXPECT_EQ(at("T9s", Position::UTG, Position::BTN), PreflopResponse::Fold);
+    EXPECT_EQ(at("T9s", Position::UTG, Position::BB), PreflopResponse::Call);
+    // The button and the heads-up button play back widely.
+    EXPECT_EQ(at("54s", Position::BTN, Position::BB), PreflopResponse::Call);
+    EXPECT_EQ(at("K2s", Position::BTN, Position::BB), PreflopResponse::Fold);
+    EXPECT_EQ(at("K2s", Position::BTN, Position::BB, 2), PreflopResponse::Call);
+    EXPECT_EQ(at("A2o", Position::BTN, Position::BB, 2), PreflopResponse::Call);
+    EXPECT_EQ(at("72o", Position::BTN, Position::BB, 2), PreflopResponse::Fold);
+}
+
+TEST(PositionalVsFourBet, VsFourBetRangesAreNarrow) {
+    struct Spot {
+        Position three_bettor;
+        Position four_bettor;
+        int players;
+        double max_percent;
+    };
+    const std::array<Spot, 7> spots{{
+        {Position::BTN, Position::UTG, 6, 5.0},
+        {Position::HJ, Position::UTG, 6, 5.0},
+        {Position::BTN, Position::CO, 6, 6.0},
+        {Position::BB, Position::CO, 6, 5.0},
+        {Position::SB, Position::BTN, 6, 5.0},
+        {Position::BB, Position::SB, 6, 8.0},
+        {Position::BB, Position::BTN, 2, 12.0},
+    }};
+    for (const Spot& spot : spots) {
+        SCOPED_TRACE(spot_name(spot.three_bettor, spot.four_bettor, spot.players));
+        const VsRaiseRanges& ranges = vs_four_bet_ranges(spot.three_bettor, spot.four_bettor, spot.players);
+        const HandRange all = defended(ranges);
+        EXPECT_GT(all.percent(), 2.0);
+        EXPECT_LE(all.percent(), spot.max_percent);
+        EXPECT_EQ(all.combos(), ranges.raise.combos() + ranges.call.combos());
+        // The 5-bet jam is premiums only, and always includes aces and kings.
+        for (const HandClass hand : hand_classes_by_strength()) {
+            if (ranges.raise.contains(hand)) {
+                EXPECT_EQ(preflop_tier(hand), PreflopTier::Premium) << hand.to_string();
+            }
+        }
+        EXPECT_TRUE(ranges.raise.contains(hc("AA")));
+        EXPECT_TRUE(ranges.raise.contains(hc("KK")));
+        EXPECT_FALSE(all.contains(hc("A5s")));
+        // Fewer hands answer the 4-bet than the 4-bettor kept against the 3-bet.
+        EXPECT_LT(all.combos(),
+                  defended(vs_three_bet_ranges(spot.four_bettor, spot.three_bettor, spot.players)).combos());
+    }
+
+    // Out of position a blind 3-bettor jams more and flats less than one in position.
+    const VsRaiseRanges& ip = vs_four_bet_ranges(Position::BTN, Position::CO);
+    const VsRaiseRanges& oop = vs_four_bet_ranges(Position::BB, Position::CO);
+    EXPECT_GT(oop.raise.combos(), ip.raise.combos());
+    EXPECT_LT(oop.call.combos(), ip.call.combos());
+    // Wider 4-bets are answered wider: early < late < blind vs blind < heads-up.
+    const auto continued = [](Position three_bettor, Position four_bettor, int players = kMaxSeats) {
+        return defended(vs_four_bet_ranges(three_bettor, four_bettor, players));
+    };
+    EXPECT_TRUE(continued(Position::BTN, Position::CO).contains_all(continued(Position::BTN, Position::UTG)));
+    EXPECT_TRUE(continued(Position::BTN, Position::CO).contains_all(continued(Position::BB, Position::CO)));
+    EXPECT_TRUE(continued(Position::BB, Position::SB).contains_all(continued(Position::BB, Position::CO)));
+    EXPECT_TRUE(continued(Position::BB, Position::BTN, 2).contains_all(continued(Position::BB, Position::SB)));
+    EXPECT_TRUE(continued(Position::BB, Position::BTN, 2).contains_all(continued(Position::BTN, Position::CO)));
+}
+
+// The bots' non-positional charts, snapshotted before the positional tables were
+// added: one letter per class in HandClass::index() order (the 13x13 grid, AA
+// first, suited above the diagonal), F fold, C call, R raise.
+TEST(VsReraises, BotsChartsUnchanged) {
+    constexpr std::string_view kVsThreeBet =
+        "RRCCCFFFFRFFF"
+        "RRCCFFFFFFFFF"
+        "CFRCFFFFFFFFF"
+        "FFFCCFFFFFFFF"
+        "FFFFCCFFFFFFF"
+        "FFFFFCFFFFFFF"
+        "FFFFFFCFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF";
+    constexpr std::string_view kVsFourBet =
+        "RRFFFFFFFFFFF"
+        "CRFFFFFFFFFFF"
+        "FFCFFFFFFFFFF"
+        "FFFCFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF";
+    static_assert(kVsThreeBet.size() == kHandClassCount && kVsFourBet.size() == kHandClassCount);
+    const auto letter = [](PreflopResponse response) { return to_string(response)[0]; };
+    for (const HandClass hand : hand_classes_by_strength()) {
+        const auto index = static_cast<std::size_t>(hand.index());
+        EXPECT_EQ(letter(vs_three_bet_response(hand)), kVsThreeBet[index]) << hand.to_string();
+        EXPECT_EQ(letter(vs_four_bet_response(hand)), kVsFourBet[index]) << hand.to_string();
+    }
+    EXPECT_EQ(vs_three_bet_response(hc("TT")), PreflopResponse::Call);
+    EXPECT_EQ(vs_three_bet_response(hc("A5s")), PreflopResponse::Raise);
+    EXPECT_EQ(vs_four_bet_response(hc("JJ")), PreflopResponse::Call);
 }
 
 // --- Tiers -------------------------------------------------------------------

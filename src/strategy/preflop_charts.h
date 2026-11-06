@@ -102,9 +102,28 @@ const VsRaiseRanges& vs_open_ranges(Position hero, Position opener, int players 
 PreflopResponse vs_open_response(HandClass hand, Position hero, Position opener, int players = kMaxSeats);
 
 // Facing a 3-bet or a 4-bet. These are not positional: their ranges are so narrow
-// that position moves only the marginal hands.
+// that position moves only the marginal hands. The bots use these; the advisor's
+// positional tables are below, and the two must not be merged.
 PreflopResponse vs_three_bet_response(HandClass hand);
 PreflopResponse vs_four_bet_response(HandClass hand);
+
+// The opener's answer to a 3-bet, by position, at 100 BB 6-max with an open to
+// 2.5 BB and a 3-bet to about 3x in position or 3.5-4x from the blinds: `raise`
+// is the 4-bet, `call` the flat. Every hand in either set is in the opener's own
+// RFI range. Out of position (a 3-bet from a later non-blind position) the opener
+// continues about 35-43% of its open, in position against a blind 3-bet about
+// 45-50%, and earlier openers keep a larger share of their tighter ranges.
+// Heads-up (players == 2) the button answers the big blind from the heads-up open.
+// Order is not enforced: an SB or BB "opener" (a raise over limps) uses the
+// blind-versus-blind table, and a BTN opener always counts as in position.
+const VsRaiseRanges& vs_three_bet_ranges(Position opener, Position three_bettor, int players = kMaxSeats);
+
+// The 3-bettor's answer to a 4-bet: `raise` is the 5-bet all-in, `call` the flat.
+// In position (a non-blind 3-bettor) it calls more and jams less than a blind
+// 3-bettor out of position; a 4-bet from UTG or HJ is answered tighter, and
+// blind-versus-blind and heads-up 4-bets wider. Position is by postflop order, so
+// a cold 4-bet uses the same tables.
+const VsRaiseRanges& vs_four_bet_ranges(Position three_bettor, Position four_bettor, int players = kMaxSeats);
 
 enum class PreflopTier : std::uint8_t { Premium, Strong, Playable, Speculative, Trash };
 

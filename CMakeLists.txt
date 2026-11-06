@@ -82,7 +82,9 @@ add_library(poker_core STATIC
     src/solver/postflop_solver.cpp
     src/solver/showdown.cpp
     src/solver/spot_from_view.cpp
+    src/strategy/generated/push_fold_data.cpp
     src/strategy/preflop_charts.cpp
+    src/strategy/push_fold.cpp
 )
 find_package(Threads REQUIRED)
 target_include_directories(poker_core PUBLIC src)
@@ -108,6 +110,11 @@ target_compile_options(advisor_bench PRIVATE ${POKER_WARNINGS})
 add_executable(gen_preflop_tables tools/gen_preflop_tables.cpp)
 target_link_libraries(gen_preflop_tables PRIVATE poker_core)
 target_compile_options(gen_preflop_tables PRIVATE ${POKER_WARNINGS})
+
+# Regenerates src/strategy/generated/push_fold_data.cpp; run from the repo root.
+add_executable(gen_push_fold tools/gen_push_fold.cpp)
+target_link_libraries(gen_push_fold PRIVATE poker_core)
+target_compile_options(gen_push_fold PRIVATE ${POKER_WARNINGS})
 
 # --- Desktop app (GLFW + OpenGL3 + Dear ImGui) ---------------------------------
 option(POKER_BUILD_APP "Build the poker_trainer desktop app" ON)
@@ -184,6 +191,7 @@ if(POKER_BUILD_TESTS)
         tests/player_boundary_test.cpp
         tests/equity_test.cpp
         tests/preflop_charts_test.cpp
+        tests/push_fold_test.cpp
         tests/range_test.cpp
         tests/range_model_test.cpp
         tests/solver_test.cpp
