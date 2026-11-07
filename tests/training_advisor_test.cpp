@@ -1375,9 +1375,6 @@ TEST(Advisor, VsNitFoldsMoreToBigBets) {
     EXPECT_NE(nit.why.find("pot odds"), std::string::npos) << nit.why;
 }
 
-// Run by hand in Release: hint latency by street and opponent count, default
-// options with and without the archetype lines, automatic threading and one
-// thread. Random play with mostly calls and checks, so many flops are multiway.
 // --- Stage 6: push/fold, positional 3-bets and players still to act ------------
 
 TEST(Advisor, ShortStackFirstInIsPushOrFold) {
@@ -1572,6 +1569,9 @@ TEST(Advisor, PlayersBehindAreNotCertainCallers) {
     }
 }
 
+// Run by hand in Release: hint latency by street and opponent count, default
+// options with and without the archetype lines, automatic threading and one
+// thread. Random play with mostly calls and checks, so many flops are multiway.
 TEST(Advisor, DISABLED_LatencyByStreet) {
     for (const bool lines : {false, true})
     for (const int threads : {0, 1}) {

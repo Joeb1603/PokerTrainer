@@ -755,6 +755,37 @@ Jam share, as a percent of all combos:
 
 **Tests:** 447 pass in Release (6.6 s) and Debug (26.7 s), 440 + 7 new. GCC Release/Debug and clang build with zero warnings; `strict.sh` is clean on `advisor_charts.cpp`, `training_advisor.cpp` and `range_model.cpp`. Each new test takes at most 0.7 s in Release (1.9 s in Debug).
 
+### Stage 6 review, uncommitted, on top of `becbe81`
+
+No defect needed a code change; one test comment was moved. Bench unchanged (0.708 BB, 56%). 447 tests pass in Release and Debug, zero warnings in Release, Debug and clang, `strict.sh` clean on the six Stage 6 files and the generated data.
+
+**Verified**
+- Push/fold solver: the jammer's EV (sum over callers of P(all before fold) × (equity × pot - stack) + P(all fold) × (1.5 - own blind)), the caller's gain (equity × pot - stack + own blind), the pots (2S + 1.5 - both blinds) and the combo-count card removal are right. "All fold" is the product of the callers' independent fold shares, as documented. `gen_push_fold` regenerates the committed data byte for byte. Lookup: heads-up the BTN reads the SB tables, and the engine names heads-up seats BTN and BB, so the mapping holds.
+- An independent best-response check of the multiway sets (UTG-BTN at 4, 8, 10, 12 and 15 BB) against each other: 0-9 jam classes and 1-15 call classes per game sit on the wrong side of indifference, by at most 0.40 BB per hand of that class (CO and BTN folding KQs to a 12 BB HJ jam; BB folding A9s to a 10 BB UTG jam, +0.25). These are classes the averages mix; thresholding at 0.5 makes the pure sets slightly off each other. About 1 mBB per hand dealt, consistent with the NashConv figures. Not changed.
+- Charts: every positional continue hand is in the opener's RFI (tested), and `BotsChartsUnchanged` is a literal snapshot; no bot file changed.
+- Players still to act, two hand checks with independent Monte Carlo (400,000 and 300,000 rollouts, each scenario dealing only its own players):
+  - CO AcQd facing a 10 BB UTG jam, BTN/SB/BB behind: call shares 6.86 / 7.10 / 8.33% (Hero's blockers removed; the model's are identical), P(nobody) 0.793, heads-up 53.97% exact (the class matrix says 53.80%), three-way 29.4-30.9%. Independent call EV +22.9 and 48.9% range equity; the model gives +18.1 and 48.2%. Dealing the folded players from their call ranges, as the model does, gives +19.4 (three-way equity falls about 2.3 pp per scenario); the matrix and the blinds' smaller calls account for most of the rest. CALL either way.
+  - UTG AcQc on 2c7dJh facing the BB's 100 into 210, CO and BTN behind: each folds 42.3%, calls 49.6%, raises 8.1%; Hero folds to a squeeze (V_sq = -100). Independent call EV -17.7 and 19.5%; the model -21.7 and 18.7%. FOLD either way.
+  - So the "folded players hold call-range cards" approximation (listed under Unverified) biases multiway call EVs down by about 3.5-4 chips (0.2 BB) in both spots. A fix needs per-scenario dealing or fold-range weighting inside `equity_vs_ranges`; not done.
+- `implied` is used only in `raise_value`; nothing else read it preflop.
+- No hidden information or engine types in `src/advisor`, `src/range`, `src/strategy` or the tool; the new static tables are function-local statics (thread-safe initialisation); the continuing Monte Carlo is seeded from the line seed.
+
+**Sanity tables** (Baseline, lines off, all 169 classes, combos of 1326)
+
+| Spot | Advice |
+|---|---|
+| 100 BB first in | UTG opens 15.8% (2 BB 8.0, 2.25 BB 4.8, 2.9 BB 0.5, 3.5 BB 2.6); HJ 20.4%; CO 27.9%; BTN 46.0% (mostly 2.25 BB); SB 42.7% (2.5-3 BB). Every class agrees with `advisor_chart`. |
+| 12 BB first in | jam or fold only: UTG 13.4%, HJ 17.2%, CO 22.5%, BTN 31.2%, SB 53.2%, exactly the tables. |
+| BB vs a BTN 2.5 BB open | 3-bet 6.5% (to 8 BB), call 37.4%, fold 56.1%, all per the chart. |
+
+Judgement: the open ranges and the 12 BB jams are in line with common 6-max charts and push/fold tables. The BB's defence against the BTN is tight next to solver outputs (which defend about 55-65% with 12-15% 3-bets); that is the bots' BB-vs-BTN chart, which this stage may not change. The open sizes are plausible in size, but the 3.5 BB opens with premiums are a size tell (already noted under batch C).
+
+**Found, not fixed**
+- `advisor_charts.cpp` `push_fold_answer`: facing a lone jam, the table applies whenever Hero's effective stack is at most 15 BB, even when the jammer is deep and a deep player was still to act behind it. Example: BB with 10 BB, SB 100 BB, BTN jams 100 BB. The range model reads that jam at 100 BB depth (JJ+, AK), but the chart prior is the BB's 10 BB call range against a BTN jam, so 22 and 55 are advised to call (model -50 chips, prior +65). Restricting push/fold to jams the range model also reads as short (tried) does not change the advice: the jam is a call of 9 BB, not "committing" by the bots' test, so the chart falls back to `vs_open_response`, which also calls 22. A real fix means a commit-aware answer to deep jams in the chart; left for a decision.
+- The inference (a villain's range after it calls) ignores raise size, while `predict_preflop_response` widens calls below the standard size: a flat of a min-raise is read as the standard flat range. Pre-existing for sizes above standard; not changed.
+
+**Test changes:** none to assertions. The `DISABLED_LatencyByStreet` comment, which batch C's new tests had separated from its test, is back above it.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
