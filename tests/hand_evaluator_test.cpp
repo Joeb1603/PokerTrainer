@@ -352,3 +352,113 @@ TEST(HandEvaluator, ExhaustiveSevenCardFrequencies) {
     EXPECT_EQ(by_category[HandCategory::OnePair], 58'627'800u);
     EXPECT_EQ(by_category[HandCategory::HighCard], 23'294'460u);
 }
+
+// --- Best five cards and kickers ---------------------------------------------
+
+namespace {
+
+std::array<Card, 2> hole_of(const std::string& text) {
+    const auto all = hand(text + " 2c 3c 4c 5c 6c");
+    return {all[0], all[1]};
+}
+
+std::array<Card, 5> board_of(const std::string& text) {
+    const auto all = hand("Ah Ad " + text);
+    return {all[2], all[3], all[4], all[5], all[6]};
+}
+
+std::string ranks_of(const std::array<Card, 5>& five) {
+    std::string out;
+    for (const Card& c : five) out += c.to_string()[0];
+    return out;
+}
+
+}  // namespace
+
+TEST(BestFive, OrdersPairThenKickers) {
+    EXPECT_EQ(ranks_of(best_five(hole_of("Kc Kd"), board_of("As 9d 7h 3d 2h"))), "KKA97");
+}
+
+TEST(BestFive, TwoPairKeepsTheBestKicker) {
+    EXPECT_EQ(ranks_of(best_five(hole_of("Ac Kd"), board_of("As Kh 9d 9c 3h"))), "AAKK9");
+    EXPECT_EQ(ranks_of(best_five(hole_of("Qc Jd"), board_of("As Ah Kd Kc 3h"))), "AAKKQ");
+}
+
+TEST(BestFive, WheelPutsTheAceLast) {
+    EXPECT_EQ(ranks_of(best_five(hole_of("Ac 2d"), board_of("3s 4h 5d Kc Kh"))), "5432A");
+    EXPECT_EQ(ranks_of(best_five(hole_of("6c 2d"), board_of("3s 4h 5d Ac Kh"))), "65432");
+}
+
+TEST(BestFive, BoardThatPlaysIgnoresHoleCards) {
+    EXPECT_EQ(ranks_of(best_five(hole_of("2c 3d"), board_of("As Ks Qd Jc Th"))), "AKQJT");
+}
+
+TEST(BestFive, FlushUsesTheTopFiveOfSixSuited) {
+    const auto five = best_five(hole_of("Ks 2s"), board_of("As 9s 7s 4s 3d"));
+    EXPECT_EQ(ranks_of(five), "AK974");
+    for (const Card& c : five) EXPECT_EQ(c.suit(), Suit::Spades);
+}
+
+TEST(BestFive, MatchesTheSevenCardRank) {
+    std::mt19937_64 rng(7);
+    for (int trial = 0; trial < 2000; ++trial) {
+        Deck deck;
+        deck.shuffle(rng);
+        const std::array<Card, 2> hole{deck.deal(), deck.deal()};
+        const std::array<Card, 5> board{deck.deal(), deck.deal(), deck.deal(), deck.deal(), deck.deal()};
+        EXPECT_EQ(evaluate5(best_five(hole, board)), evaluate7(hole, board));
+    }
+}
+
+TEST(KickerDifference, PairDecidedByKicker) {
+    const auto board = board_of("Kh 9d 7c 4s 2h");
+    const auto a = hole_of("Kc As");
+    const auto b = hole_of("Kd Qs");
+    const HandRank ra = evaluate7(a, board);
+    const HandRank rb = evaluate7(b, board);
+    ASSERT_EQ(describe_made_hand(ra), describe_made_hand(rb));
+    const auto diff = kicker_difference(ra, best_five(a, board), rb, best_five(b, board));
+    ASSERT_TRUE(diff);
+    EXPECT_EQ(diff->winner, Rank::Ace);
+    EXPECT_EQ(diff->loser, Rank::Queen);
+    EXPECT_FALSE(kicker_difference(rb, best_five(b, board), ra, best_five(a, board)));  // Worse hand first
+}
+
+TEST(KickerDifference, TripsAndFlushes) {
+    const auto trips_board = board_of("Qh Qd 8c 5s 2h");
+    const auto t1 = hole_of("Qc Jd");
+    const auto t2 = hole_of("Qs Td");
+    const auto trips = kicker_difference(evaluate7(t1, trips_board), best_five(t1, trips_board),
+                                         evaluate7(t2, trips_board), best_five(t2, trips_board));
+    ASSERT_TRUE(trips);
+    EXPECT_EQ(trips->winner, Rank::Jack);
+    EXPECT_EQ(trips->loser, Rank::Ten);
+
+    const auto flush_board = board_of("Ah 9h 6h 2h Kc");
+    const auto f1 = hole_of("Qh 3d");
+    const auto f2 = hole_of("Jh Ts");
+    const auto flush = kicker_difference(evaluate7(f1, flush_board), best_five(f1, flush_board),
+                                         evaluate7(f2, flush_board), best_five(f2, flush_board));
+    ASSERT_TRUE(flush);
+    EXPECT_EQ(flush->winner, Rank::Queen);
+    EXPECT_EQ(flush->loser, Rank::Jack);
+}
+
+TEST(KickerDifference, NoneForTiesOrDifferentNames) {
+    const auto board = board_of("As Ks Qd Jc Th");
+    const auto a = hole_of("2c 3d");
+    const auto b = hole_of("4h 5c");
+    EXPECT_FALSE(kicker_difference(evaluate7(a, board), best_five(a, board), evaluate7(b, board), best_five(b, board)));
+
+    const auto pair_board = board_of("Kh 9d 7c 4s 2h");
+    const auto kings = hole_of("Kc As");
+    const auto nines = hole_of("9c As");
+    EXPECT_FALSE(kicker_difference(evaluate7(kings, pair_board), best_five(kings, pair_board),
+                                   evaluate7(nines, pair_board), best_five(nines, pair_board)));
+}
+
+TEST(HandEvaluator, RankNames) {
+    EXPECT_EQ(rank_name(Rank::Ace), "Ace");
+    EXPECT_EQ(rank_name(Rank::Ten), "Ten");
+    EXPECT_EQ(rank_name(Rank::Two), "Two");
+}

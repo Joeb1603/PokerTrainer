@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -134,6 +135,102 @@ TEST_F(Controller, OpponentCardsHiddenUntilShowdownAndShifterNameNeverChanges) {
     }
     EXPECT_GT(showdowns, 0);
     EXPECT_GT(fold_wins, 0);
+}
+
+// --- Showdown results ----------------------------------------------------------
+
+namespace {
+
+std::string five_ranks(const std::array<Card, 5>& five) {
+    std::string out;
+    for (const Card& c : five) out += c.to_string()[0];
+    return out;
+}
+
+}  // namespace
+
+TEST_F(Controller, ShowdownResultsMarkSplitPotsAndKickers) {
+    // Hero calls everything, so showdowns are common. Plays until both a split pot and
+    // a win on kickers have appeared, checking every showdown along the way.
+    LocalGameController c(options(7));
+    int splits = 0;
+    int kickers = 0;
+    for (int hand = 0; hand < 600 && (splits == 0 || kickers == 0); ++hand) {
+        play_hand_out(c, [](const TableSnapshot& s) { return passive(s.legal); });
+        const TableSnapshot& s = c.snapshot();
+
+        for (const SeatSnapshot& seat : s.seats) {
+            EXPECT_EQ(seat.shown_five.has_value(), s.showdown && seat.shown_hand.has_value()) << seat.name;
+        }
+        for (const PayoutLine& line : s.payouts) {
+            const auto me = std::find_if(s.seats.begin(), s.seats.end(),
+                                         [&](const SeatSnapshot& seat) { return seat.name == line.name; });
+            ASSERT_NE(me, s.seats.end());
+            EXPECT_NE(std::find(s.action_log.begin(), s.action_log.end(), describe_payout(line)), s.action_log.end());
+            if (!s.showdown) {
+                EXPECT_FALSE(line.split);
+                EXPECT_FALSE(line.kicker_note);
+                continue;
+            }
+            ASSERT_TRUE(me->shown_five);
+            if (line.split) {
+                ++splits;
+                // Someone else won chips with exactly the same five ranks.
+                const bool partner = std::any_of(s.payouts.begin(), s.payouts.end(), [&](const PayoutLine& other) {
+                    if (other.name == line.name) return false;
+                    const auto them = std::find_if(s.seats.begin(), s.seats.end(),
+                                                   [&](const SeatSnapshot& seat) { return seat.name == other.name; });
+                    return them->shown_five && five_ranks(*them->shown_five) == five_ranks(*me->shown_five);
+                });
+                EXPECT_TRUE(partner) << describe_payout(line);
+                EXPECT_NE(describe_payout(line).find("(split pot"), std::string::npos);
+            }
+            if (line.kicker_note) {
+                ++kickers;
+                // A beaten shown hand had the same name but different cards.
+                const bool beaten = std::any_of(s.seats.begin(), s.seats.end(), [&](const SeatSnapshot& seat) {
+                    return seat.name != line.name && seat.shown_hand == me->shown_hand && seat.shown_five &&
+                           five_ranks(*seat.shown_five) != five_ranks(*me->shown_five);
+                });
+                EXPECT_TRUE(beaten) << describe_payout(line);
+                EXPECT_NE(line.kicker_note->find(" kicker beats "), std::string::npos);
+            }
+        }
+
+        if (s.phase == ControllerPhase::SessionOver) {
+            c.new_session();
+        } else {
+            ASSERT_TRUE(c.next_hand());
+        }
+    }
+    EXPECT_GT(splits, 0);
+    EXPECT_GT(kickers, 0);
+
+    // The hand log keeps its plain hand names.
+    for (const json& line : read_json_lines(hands())) {
+        for (const json& win : line["win"]) {
+            if (!win.contains("hand")) continue;
+            const std::string name = win["hand"].get<std::string>();
+            EXPECT_EQ(name.find("kicker"), std::string::npos);
+            EXPECT_EQ(name.find("split"), std::string::npos);
+        }
+    }
+}
+
+TEST(DescribePayout, AddsSplitAndKickerNotes) {
+    PayoutLine line;
+    line.name = "Hero";
+    line.amount = 150;
+    line.hand = "Ten-High Straight";
+    EXPECT_EQ(describe_payout(line), "Hero wins 150 with Ten-High Straight");
+    line.split = true;
+    EXPECT_EQ(describe_payout(line), "Hero wins 150 with Ten-High Straight (split pot)");
+    line.kicker_note = "Ace kicker beats Queen";
+    EXPECT_EQ(describe_payout(line), "Hero wins 150 with Ten-High Straight (split pot; Ace kicker beats Queen)");
+    PayoutLine fold_win;
+    fold_win.name = "Nit";
+    fold_win.amount = 30;
+    EXPECT_EQ(describe_payout(fold_win), "Nit wins 30");
 }
 
 // --- Pacing ------------------------------------------------------------------

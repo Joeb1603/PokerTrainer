@@ -13,6 +13,46 @@ namespace {
 
 constexpr std::size_t at(int index) { return static_cast<std::size_t>(index); }
 
+// Marks a showdown payout as a split, and notes the kicker when it beat a hand with the
+// same name, using the pots the seat won and the five cards each shown hand plays.
+void annotate_showdown_payout(PayoutLine& line, int seat, const HandResult& result,
+                              const std::array<SeatSnapshot, kMaxSeats>& seats) {
+    const std::optional<HandRank>& mine = result.showdown_ranks[at(seat)];
+    if (!result.showdown || !mine || !seats[at(seat)].shown_five) return;
+
+    std::optional<int> closest_loser;  // Same name, worse hand, nearest in rank
+    for (const Pot& pot : result.pots) {
+        if (std::find(pot.eligible.begin(), pot.eligible.end(), seat) == pot.eligible.end()) continue;
+        HandRank best = kWorstHandRank + 1;
+        int tied = 0;
+        for (int other : pot.eligible) {
+            const std::optional<HandRank>& rank = result.showdown_ranks[at(other)];
+            if (!rank) continue;
+            if (*rank < best) {
+                best = *rank;
+                tied = 0;
+            }
+            if (*rank == best) ++tied;
+        }
+        if (best != *mine) continue;  // This seat did not win this pot
+        if (tied > 1) line.split = true;
+
+        for (int other : pot.eligible) {
+            const std::optional<HandRank>& rank = result.showdown_ranks[at(other)];
+            if (!rank || *rank <= *mine || !seats[at(other)].shown_five) continue;
+            if (describe_made_hand(*rank) != describe_made_hand(*mine)) continue;
+            if (!closest_loser || *rank < *result.showdown_ranks[at(*closest_loser)]) closest_loser = other;
+        }
+    }
+
+    if (closest_loser) {
+        const auto diff = kicker_difference(*mine, *seats[at(seat)].shown_five,
+                                            *result.showdown_ranks[at(*closest_loser)],
+                                            *seats[at(*closest_loser)].shown_five);
+        if (diff) line.kicker_note = rank_name(diff->winner) + " kicker beats " + rank_name(diff->loser);
+    }
+}
+
 GameConfig make_config(const ControllerOptions& options) {
     GameConfig config;
     config.starting_stack = options.starting_stack;
@@ -43,6 +83,17 @@ std::string describe_action(const ActionRecord& a) {
 }
 
 }  // namespace
+
+std::string describe_payout(const PayoutLine& line) {
+    std::string text = line.name + " wins " + std::to_string(line.amount);
+    if (line.hand) text += " with " + *line.hand;
+    std::vector<std::string> notes;
+    if (line.split) notes.emplace_back("split pot");
+    if (line.kicker_note) notes.push_back(*line.kicker_note);
+    for (std::size_t i = 0; i < notes.size(); ++i) text += (i == 0 ? " (" : "; ") + notes[i];
+    if (!notes.empty()) text += ")";
+    return text;
+}
 
 int quick_bet_to(const LegalActions& legal, int current_bet, int total_pot, double pot_fraction, int raise_cap_to) {
     if (!legal.allows(ActionType::Bet) && !legal.allows(ActionType::Raise)) return 0;
@@ -383,6 +434,11 @@ void LocalGameController::rebuild_snapshot() {
         const bool shown = result && result->showdown_ranks[at(seat)].has_value();
         if (s.hole && (seat == kHeroSeat || shown)) out.visible_hole = s.hole;
         if (shown) out.shown_hand = describe_made_hand(*result->showdown_ranks[at(seat)]);
+        if (shown && s.hole && state.board.size() == 5) {
+            std::array<Card, 5> board{};
+            std::copy(state.board.begin(), state.board.end(), board.begin());
+            out.shown_five = best_five(*s.hole, board);
+        }
         if (bots_revealed_ && seat != kHeroSeat && s.hole) {
             out.visible_hole = s.hole;
             out.revealed_after_fold = s.status == SeatStatus::Folded;
@@ -405,8 +461,11 @@ void LocalGameController::rebuild_snapshot() {
         for (const Pot& pot : result->pots) next.pots.total += pot.amount;
         for (const Payout& payout : result->payouts) {
             next.seats[at(payout.seat)].won = payout.amount;
-            PayoutLine line{public_names_[at(payout.seat)], payout.amount, std::nullopt};
+            PayoutLine line;
+            line.name = public_names_[at(payout.seat)];
+            line.amount = payout.amount;
             if (result->showdown_ranks[at(payout.seat)]) line.hand = describe_made_hand(*result->showdown_ranks[at(payout.seat)]);
+            annotate_showdown_payout(line, payout.seat, *result, next.seats);
             next.payouts.push_back(std::move(line));
         }
         if (result->refund) {
@@ -415,8 +474,7 @@ void LocalGameController::rebuild_snapshot() {
             next.action_log.push_back(*next.refund_text);
         }
         for (const PayoutLine& line : next.payouts) {
-            next.action_log.push_back(line.name + " wins " + std::to_string(line.amount) +
-                                      (line.hand ? " with " + *line.hand : std::string()));
+            next.action_log.push_back(describe_payout(line));
         }
     } else {
         next.pots = engine_.live_pots();

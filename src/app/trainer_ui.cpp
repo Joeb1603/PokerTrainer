@@ -171,13 +171,23 @@ void draw_payout_lines(const TableSnapshot& s) {
     std::string text;
     for (const PayoutLine& line : s.payouts) {
         if (!text.empty()) text += "   |   ";
-        text += line.name + " wins " + std::to_string(line.amount) + (line.hand ? " with " + *line.hand : std::string());
+        text += describe_payout(line);
     }
-    ImGui::TextColored(kAccentText, "%s", text.c_str());
-    if (s.refund_text) {
-        ImGui::SameLine();
-        ImGui::TextColored(kMutedText, "%s", s.refund_text->c_str());
+    float width = ImGui::CalcTextSize(text.c_str()).x;
+    if (s.refund_text) width += ImGui::GetStyle().ItemSpacing.x + ImGui::CalcTextSize(s.refund_text->c_str()).x;
+    if (width <= ImGui::GetContentRegionAvail().x) {
+        ImGui::TextColored(kAccentText, "%s", text.c_str());
+        if (s.refund_text) {
+            ImGui::SameLine();
+            ImGui::TextColored(kMutedText, "%s", s.refund_text->c_str());
+        }
+        return;
     }
+    // Split pots and kicker notes can run past one line.
+    ImGui::PushStyleColor(ImGuiCol_Text, kAccentText);
+    ImGui::TextWrapped("%s", text.c_str());
+    ImGui::PopStyleColor();
+    if (s.refund_text) ImGui::TextColored(kMutedText, "%s", s.refund_text->c_str());
 }
 
 constexpr ImGuiWindowFlags kFixedWindow = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -372,9 +382,15 @@ void TrainerUi::draw_seat(ImDrawList* dl, const SeatSnapshot& seat, int index, c
     const TableSnapshot& table = controller_.snapshot();
     const std::optional<std::string>& hand_name = seat.shown_hand || !is_hero ? seat.shown_hand : table.hero_hand;
     if (hand_name) {
+        std::string label = *hand_name;
+        if (seat.shown_five) {
+            // The five cards played, so a win on kickers doesn't read as a tie.
+            label += ":";
+            for (const Card& card : *seat.shown_five) label += std::string(" ") + card.to_string()[0];
+        }
         const float hand_size = u(13.0f);
         draw_pill(dl, fonts_.regular, hand_size, {mid.x, max.y + hand_size * 0.2f}, IM_COL32(16, 18, 24, 245), kText,
-                  *hand_name);
+                  label);
     }
 
     // Between the seat and the table center: the street bet and the dealer button.

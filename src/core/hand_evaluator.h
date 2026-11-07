@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -48,5 +49,24 @@ std::string describe_hand(HandRank rank);
 // The name to show a player for their current hand, e.g. "Ace High" or
 // "Two Pair, Aces and Kings". Logs keep using describe_hand.
 std::string describe_made_hand(HandRank rank);
+
+// The five cards that make the best hand from hole + board, most significant first:
+// larger rank groups first, then higher ranks, with the ace last in a five-high
+// straight. For "Kc Kd As 9d 7h" with any two lower cards: K K A 9 7.
+std::array<Card, 5> best_five(const std::array<Card, 2>& hole, const std::array<Card, 5>& board);
+
+// Singular rank name, e.g. "Ace", "Ten", "Two".
+std::string rank_name(Rank rank);
+
+// Where a better hand beats a worse one that shows the same describe_made_hand
+// name, such as two "Pair of Kings": the first card ranks, most significant first,
+// at which their best five cards differ. Nullopt when the names differ or the hands
+// tie. Each `five` must come from best_five for the matching rank.
+struct KickerDifference {
+    Rank winner;
+    Rank loser;
+};
+std::optional<KickerDifference> kicker_difference(HandRank winner, const std::array<Card, 5>& winner_five,
+                                                  HandRank loser, const std::array<Card, 5>& loser_five);
 
 }  // namespace poker

@@ -391,7 +391,11 @@ TEST_F(UiTest, NextHandButtonAndSpacebarDealOnlyWhenTheHandIsComplete) {
     EXPECT_EQ(fake_.next_hand_calls, 0);
 
     fake_.table.phase = ControllerPhase::HandComplete;
-    fake_.table.payouts = {{"Hero", 300, "Pair of Aces"}};
+    PayoutLine hero_win;
+    hero_win.name = "Hero";
+    hero_win.amount = 300;
+    hero_win.hand = "Pair of Aces";
+    fake_.table.payouts = {hero_win};
     press_space();
     EXPECT_EQ(fake_.next_hand_calls, 1);
 

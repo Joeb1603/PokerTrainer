@@ -31,6 +31,7 @@ struct SeatSnapshot {
     bool holds_cards = false;  // Dealt in and has not folded
     std::optional<std::array<Card, 2>> visible_hole;
     std::optional<std::string> shown_hand;  // Hand name, once shown at showdown
+    std::optional<std::array<Card, 5>> shown_five;  // Its best five cards, most significant first
     int won = 0;                            // Chips won from pots in the finished hand
     bool revealed_after_fold = false;       // visible_hole is a folded bot's, shown on request
 };
@@ -39,7 +40,14 @@ struct PayoutLine {
     std::string name;
     int amount = 0;
     std::optional<std::string> hand;  // Absent if everyone else folded
+    bool split = false;               // Tied with another player for a pot this seat won
+    // Set when a beaten showdown hand had the same name, e.g. "Ace kicker beats Queen"
+    // for two "Pair of Kings", so a win on kickers is not mistaken for a tie.
+    std::optional<std::string> kicker_note;
 };
+
+// One line of a hand's result, e.g. "Hero wins 150 with Ten-High Straight (split pot)".
+std::string describe_payout(const PayoutLine& line);
 
 struct SessionStats {
     std::string session_id;
