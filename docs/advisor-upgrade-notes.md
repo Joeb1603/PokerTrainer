@@ -1230,6 +1230,28 @@ Regret above 1 BB covers 13% of tuned hands (15% pre-tuning); the solver's frequ
 
 **Tests:** 491 pass in Release (9.3 s wall) and Debug (37.5 s): 488 plus 3 new. GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `advisor_bench.cpp` and `bench_test.cpp`.
 
+### Stage 8 review, uncommitted, on top of `e07d799`
+
+No defect needed a code change. 491 tests pass in Release and Debug, zero warnings in Release, Debug and clang, `strict.sh` clean on `src/solver/*.cpp`, `solver_service.cpp`, `local_game_controller.cpp`, `trainer_ui.cpp` and `main.cpp`; clang `-Wshadow-all` (lambda parameters too, which MSVC's C4456 also flags) is clean on the same files and the two solver test files. Bench unchanged (0.694 BB, 57%).
+
+**Verified**
+- `SolverService`: every shared member is touched under the one mutex; the worker waits with a predicate, so neither a spurious wake-up nor a `notify_one` after unlocking loses a submit; `submit`, `cancel` and the destructor each bump the serial, so a replaced job's progress and result are dropped; the destructor stops the job, then the worker, then joins; a new job starts only after the old solver has gone out of scope, so two solves never hold memory at once. After every solver call that an interrupt can cut short (constructor, `run`, both exploitability checks, `root()`), `solve` checks the job's token before using the result, and `SolverLimits::interrupt` is that same token, so an abandoned pass is never read.
+- `WorkerPool`: task state is written under the mutex before the generation bump and read after the wait; `busy_` makes every worker join every region, so a slow worker cannot skip or overlap one; results are published through the mutex; the destructor stops the waits before the members go. No task hands out work after an exception.
+- A TSan stress program (two threads: rapid submit, cancel and poll on flop, turn and river requests, 180 rounds, while a second thread polls every superseded key): no report, and no old key ever answered.
+- Controller: the key is reset on every `after_state_change`, cancelled for any state but a Hero decision (bot to act, hand end, session over, `new_session`'s first hand, a decision Fold Early folds at once), and `rebuild_snapshot` copies the panel after `update_solver`, so the snapshot's progress is always the current decision's. The UI plays `advice.best` only with `phase == HeroToAct` and state Done, and there is no keyboard path to Play GTO.
+- Action legality, against `GameEngine::apply_action` on a copy of the engine: 24 hand-built spots (OOP first, facing a bet, a raise and a 3-bet; Hero deeper against a short bettor, including a minimum raise above the villain's reach; Hero shorter facing an overbet, a small bet and a bet where the minimum raise is the all-in; 15 chips behind; a limped pot where 25% merges into the minimum bet; turn and flop check-down trees; three-handed with a fold) and 404 random heads-up postflop decisions from random 6-max play (156 flop, 133 turn, 115 river): every option accepted, frequencies sum to 1, no Failed. Three more (multiway with an all-in player; a heads-up villain all-in, by a bet or a short raise) give their notes. `build_betting_tree` (which checks its count against the build) on 840 random flop spots for both flop trees, and the turn and river trees: no mismatch.
+- Hidden information: the service and `src/solver` use only `PlayerView` and the range model; the scan's patterns find nothing in `src/solver`, `src/range` or `solver_service.*`; `SolverPanel` holds Hero's own options only; no bot identity reaches the job (every villain is read as Baseline).
+- Hardware: the Windows branch reads correctly (`WIN32_LEAN_AND_MEAN` and `NOMINMAX` before `<windows.h>`, which comes after every project header in `hardware.cpp`; `dwLength` set; `ullTotalPhys` / `ullAvailPhys`). The headers newly reached from `main.cpp`, where `<windows.h>` precedes the project headers, use no identifier that `<windows.h>` defines as a macro. `/proc/meminfo` parsing tolerates missing lines (falls back to `sysconf`).
+
+**Found, not fixed**
+- Play GTO follows any Done result, however far from converged. Measured on the heads-up spot (`SolverService.DISABLED_ReportEndToEndTimes`'s), Turn tier: a 2 s budget ends the flop at 31.6% of the pot on 3 threads (221% on 1), the turn at 16.4%; the default 8 s gives 5.8% and 1.6%. The most frequent action flips between budgets (CHECK, BET 100%, BET 25% on the flop). A rule such as "solver advice only below a few times the target" needs a decision.
+- Below the minimum a solve can take (setup, one iteration, the closing check and `root()`), the budget overruns: flop check-down at 2 s took 2.21 s on 3 threads and 2.95 s on 1.
+- The villain's range has Hero's cards removed (`infer_ranges` conditions on the viewer) while Hero's range is the public one. The solver already removes conflicting pairs per matchup, so this only shifts Hero's other combos and, through them, the equilibrium; small, but not the public-range game a solver normally solves.
+- At 1180x760 the "Approximate solver: ..." line sits below the advisor child's scroll when a solve is Done; the visible heading reads "Solver: X (most frequent)". The status line's exploitability and the toggle's tooltip still say it is approximate.
+- Playing the solver's action can be recorded as a hero mistake, because mistakes stay on Baseline `base_ev` (decision 5); the UI does not say so.
+
+**Test changes:** none.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
