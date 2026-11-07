@@ -60,6 +60,10 @@ Each stage is committed to `main` when its tests pass.
 24. **Stage 6 batch C: a short committing raise reads as push/fold up to 15 BB, blending linearly into the commit range by 25 BB** (inference), and a short jam is answered with the push/fold call ranges, blending into the chart answer by 25 BB (prediction). There is no cliff at 15 or 16 BB.
 25. **Stage 6 batch C: preflop calls respond to a raise's size in both directions:** f = ratio^-0.5 above the standard size (unchanged), f = ratio^-1 below it, with the extra calls taken from the villain's own folding hands.
 
+26. **Stage 8 batch A: the approximate flop tier checks the river down in one `CheckDown` node per turn line,** evaluated from a per-turn-board table of exact win counts (2 per win, 1 per tie over the 44 rivers, one byte per hand pair), not with 48 river showdown nodes. With the realistic flop spot it is 138 ms per iteration on one thread against 770 ms for a first version that summed 48 `ShowdownTable` sweeps per node (the chance-node layout does those same sweeps plus reach copies). The table costs 2 · n0 · n1 bytes per turn board (23 MB at 515 × 469 combos).
+27. **Stage 8 batch A: the memory estimate counts the tree without building it** (`count_betting_tree`). It walks one card per chance node and remembers each street start, so it takes microseconds even for a 100 GB tree. The constructor refuses before building anything, and the builder reserves every array exactly from the count.
+28. **Stage 8 batch A: threads split over the first chance layer, with one buffered code path for every thread count.** Each card's subtree is one task writing its own nodes and its own slice of a per-card value buffer, and the chance node sums the slices in card order. One thread runs the same path on the caller, so the results are bit-identical by construction, not by the arithmetic happening to agree. `SolverLimits::threads` counts the caller, 0 means 1, and the value is capped at the layer's cards (48 or 49). A river tree has no chance layer and ignores it.
+
 ## Deviations from the spec or earlier statements
 
 - **What I said earlier:** in the conversation that led to the plan, I said "the GTO bot gets [range equity, exact equity, range-based fold equity] automatically".
@@ -903,6 +907,113 @@ Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the
 
 **Tests:** 462 pass in Release (7.8 s) and Debug (30.8 s), 453 + 9 new; GCC Release/Debug and clang build with zero warnings; `strict.sh` is clean on `trainer_ui.cpp`, `main.cpp`, `screenshot.cpp`, `trainer_ui_test.cpp` and `screenshot_test.cpp` (four pre-existing sign-conversion warnings in `trainer_ui.cpp` and `trainer_ui_test.cpp` fixed with casts).
 
+### Stage 8 batch A (tiered trees, memory-first estimates, threads), uncommitted, on top of `1153cc7`
+
+**Abstractions** (factories in `src/solver/betting_tree.h`). Every tier puts the advisor's ladder (25/50/75/100% + all-in) at the root decision only, so the advisor's options map onto the tree, as `river_default_abstraction` does. All tiers merge a size into all-in at 0.67 of the stack.
+
+| Factory | Flop | Turn | River |
+|---|---|---|---|
+| `river_default_abstraction()` (unchanged) | none | none | bets 33/75/150%, raises pot, cap 2 |
+| `turn_tier_abstraction()` | none | bets 50/100%, raises pot, cap 2 | bet 66%, raise all-in only |
+| `flop_full_abstraction()` | bet 33% | bet 66% | bet 75% |
+| `flop_checkdown_abstraction()` | bet 33% | bet 66% | checked down (`check_down_river`) |
+
+Every street also has all-in, and the flop tiers raise all-in only.
+
+**Check-down node** (`NodeKind::CheckDown`, `CheckDownTable` in `showdown.h`)
+- With `check_down_river`, the end of turn betting becomes one terminal on the turn board, including all-in runouts from the turn. The tree then has no river boards, nodes or decisions.
+- For each turn board, the solver builds a table of counts: for every hand pair that shares no card and holds no board card, each player gets 2 per win and 1 per tie over the 44 rivers that neither hand holds. The counts are exact (0-88 in a byte).
+- Each player's table has the opponent's hands as rows. A node's value is `fold_values(-invested)` plus pot/88 × the reach-weighted sum of the rows of opponent hands that have reach. Rows with zero reach are skipped, and the order is fixed.
+- The tables are built in parallel at setup, one task per board. Setup for the realistic flop spot takes 438 ms on 1 thread and 97 ms on 4.
+- **Checked against brute force:** checks-only from the flop, each hand's EV equals the pot times its equity over all C(n, 2) runouts by brute force (1e-3), including blockers between the ranges. From the turn, `CheckDown` equals the chance-node tree with 48 showdowns (1e-9).
+
+**Memory-first estimate**
+- `count_betting_tree(root, abstraction)` returns a `TreeShape`: nodes, child slots, decision nodes and actions per player, boards, full boards, check-down boards, walk scratch, and the first chance layer's cards and child scratch.
+- It shares the builder's betting rules (`Rules`). It counts one card per chance node, since every child has the same betting, and memoizes each street start by (street, pot, cap). Its cost grows with the betting lines per street, not with the tree.
+- `build_betting_tree` calls it first, reserves every vector exactly, and checks its counts against what it built (`logic_error` on a mismatch). It throws `length_error` above INT_MAX nodes. The counts saturate instead of overflowing.
+- `PostflopSolver::estimate_bytes(spot, abstraction, threads = 1)` and the constructor use the same `StorageLayout`. The constructor throws `SolverMemoryError` before building the tree. The estimate equals `allocated_bytes()` exactly on GCC for every tier at 1 and 3 threads.
+- RSS of the flop full solve below: 3,282 MB, against an estimate of 3,278 MB.
+- **Full ranges on Kd7c2h** (1,176 combos each, 100 BB):
+
+  | Abstraction | Estimate |
+  |---|---|
+  | flop full | 7.7 GB |
+  | river sizes on every street | 103 GB |
+  | check-down | 184 MB, mostly check-down tables |
+
+  Refusing either large one takes about 2 ms in Debug.
+
+**Threading design** (`src/solver/worker_pool.{h,cpp}` and `PostflopSolver`)
+- `WorkerPool(threads)` holds threads − 1 `std::jthread`s, created once in the solver's constructor and reused by every pass.
+- `run(tasks, f)` bumps a generation under the mutex and wakes the workers (`condition_variable_any` with the jthread's `stop_token`). The caller works as worker 0. Tasks are handed out by an atomic integer counter. The caller waits until every background worker has left the region.
+- An exception in a task stops the hand-out. `run` waits, then rethrows the exception from the lowest-numbered failing task on the caller, and the pool stays usable. The destructor stops and joins the threads.
+- The solver's walk runs the root street on the caller. At a chance node that deals the street after the root's (river cards in a turn tree, turn cards in a flop tree), each card is one task. A task copies and blocks the two reaches in its worker's scratch and walks its subtree, which has its own nodes, regrets and sums. It writes the values to its slice of the per-card buffer, and the node sums the slices in card order.
+- Deeper chance nodes stay serial inside their task. Training, best response and `root()` all go through this path.
+- Scratch: workers 1.. each get (2 + the deepest first-layer child's lists) × the widest range. The caller uses the chance node's own scratch. Both are counted in the estimate.
+- The stop token is checked before every iteration, as before.
+- **Determinism evidence:**
+  - `Solver.DeterministicAcrossThreadCounts` compares, with `==`, every decision node's average strategy, both best-response values, the exploitability, and `root()`'s freq, ev and ev_best. It runs the turn tier (1 against 3 threads) and flop full with river chance nodes inside the tasks (1 against 2 threads).
+  - `solver_cli` prints identical exploitability paths and root tables at 1, 2 and 4 threads (turn tier and check-down spots below).
+
+**Measurements** (Release, this 4-core container). BTN against BB in a single-raised pot with 100 BB stacks (pot 110, stack 1950).
+- **BB ranges:** "22-99, A2s-A9s, K2s-KJs, Q4s-QJs, J6s-JTs, T6s-T9s, 96s-98s, 85s-87s, 74s-76s, 63s-65s, 52s-54s, 42s-43s, 32s, A2o-AJo, K7o-KJo, Q8o-QJo, J8o-JTo, T8o-T9o, 98o, 87o".
+- **BTN ranges:** "22+, A2s+, K2s+, Q5s+, J7s+, T7s+, 97s+, 86s+, 75s+, 65s, 54s, A2o+, K9o+, Q9o+, J9o+, T9o".
+- **Spots:** the turn is Kd7c2h4s with 501 × 460 combos after a checked flop; the flop is Kd7c2h with 515 × 469 combos.
+- **Method:** exploitability is checked every 10 iterations. The times are training only; each check costs about one more iteration.
+
+| Tier | Nodes | (node, action) slots | Estimated MB (4 threads) | ms per iteration, 1 / 2 / 4 threads | Iterations to 1% / 0.5% | Seconds to 1%, 1 / 2 / 4 threads | Seconds to 0.5%, 1 / 2 / 4 threads |
+|---|---|---|---|---|---|---|---|
+| Turn tier (turn spot) | 15,597 | 14,108 | 54.0 | 102 / 56 / 31 | 180 / 260 | 18.4 / 10.3 / 5.7 | 26.7 / 14.6 / 8.2 |
+| Flop check-down (flop spot) | 6,556 | 5,918 | 46.0 | 138 / 78 / 40 | 100 / 140 | 14.4 / 8.1 / 4.2 | 19.4 / 10.9 / 5.6 |
+| Flop full (flop spot) | 968,524 | 852,638 | 3,278 (RSS 3,282) | 6,502 / 3,113 / 1,870 | 160 / 230 | ≈1,040 / ≈500 / 297 | ≈1,500 / ≈720 / 430 |
+
+- Flop full at 1 and 2 threads is timed over 3 iterations, and its seconds at 1 and 2 threads are iterations × ms per iteration (marked ≈). Everything else was run to the target.
+- The exploitability paths are identical at every thread count, so the iteration counts hold for all of them.
+- **Scaling with 4 threads:** 3.3x (turn), 3.5x (check-down) and 3.5x (flop full).
+- **Setup time:**
+
+  | Tier | Setup, 4 threads |
+  |---|---|
+  | Turn | 32 ms |
+  | Check-down | 97 ms |
+  | Flop full | 1.3 s (1,176 showdown tables and a 60 MB tree) |
+
+- The turn tier misses the plan's "15-20 ms per iteration on 3 threads": it takes 31 ms on 4 threads with 500-combo ranges.
+- The approximate flop tier converges faster than the turn tier, because it has fewer nodes, and it fits in about 46 MB.
+- **Root strategies (OOP):** at 0.5%, the approximate tier checks 39.9% and bets 25% 40.6%. Flop full checks 42.7% and bets 25% 43.4%, 50% 9.9%, 75% 1.9% and 100% 2.1%. They are close, but not the same.
+
+**Does flop full fit?**
+- **Under a 2 GB limit:** no (3.28 GB here).
+- **Under 8 GB:** yes. With the plan's budget of 50% of available RAM, it needs about 6.6 GB available.
+- **Full ranges:** 7.7 GB, which only fits machines with about 16 GB available.
+- **Time on this box:** 4 threads reach 1% in 5 minutes and 0.5% in 7.2 minutes, plus about 8% for the checks.
+- **Against the plan's flop stop (2% of pot):** 2% comes at about 105 iterations (2.15% at 100, 1.78% at 110), which is about 3.3 minutes on 4 threads.
+- **8 threads:** extrapolated, not measured. If scaling held, the 2% stop would take about 1.6 minutes and 0.5% about 3.6, so 2% needs about 100 s of the UI's 120 s maximum budget.
+- **The approximate tier** reaches 0.5% in under 6 s on 4 threads.
+
+**Tests** (`tests/solver_test.cpp`). Times are Release / Debug; Debug runs smaller ranges and fewer iterations via `kOptimized`.
+
+| Test | Release | Debug | What it checks |
+|---|---|---|---|
+| `SolverTiers.AbstractionsHaveTheirSizes` | 0 ms | 3 ms | The factory sizes, and concrete actions on the turn and river of the turn tree. The approximate tree has no river boards or decisions, and has `CheckDown` nodes. |
+| `SolverTiers.CountingWalkMatchesTheBuiltTree` | 72 ms | 0.5 s | Every count, plus `bytes()`, against the built tree for 3 spots × 4 abstractions, facing a bet, and IP to act. |
+| `TurnSolver.SmallRangesConverge` | 0.41 s | 2.3 s | 63 × 65 combos on the turn tier. Exploitability falls at 10, 30 and 100 iterations and ends below 5% (14.0 → 1.85 → 0.19%). |
+| `TurnSolver.MemoryEstimateMatchesAllocation` | 64 ms | 0.3 s | estimate ≥ allocation ≤ 1.2× for the turn tier and check-down at 1 and 3 threads, and for flop full on tiny ranges at 2. estimate − 1 throws. Threads add scratch up to the cap, and river trees are unaffected. |
+| `FlopSolver.CheckDownApproximationRuns` | 0.50 s | 0.7 s | The brute force and chance-node equalities above. The approximate tier's exploitability falls (to < 2% at 80 iterations), and EVs stay within the chips. |
+| `FlopSolver.EstimateRejectsHugeTreesWithoutBuilding` | 0 ms | 2 ms | The full-range estimates above, refusals for both, `required()` equal to the estimate, and under 0.5 s in total. |
+| `Solver.DeterministicAcrossThreadCounts` | 0.82 s | 4.4 s | As above; a river tree reports 1 thread. |
+| `WorkerPool.RunsEveryTaskOnceAndPropagatesExceptions` | 1 ms | 1 ms | 20 regions of 97 tasks, each run once on a valid worker. Task 37 throws and is rethrown, the pool is reused, and a one-thread pool runs on the caller. |
+
+470 tests pass in Release (8.4 s wall) and Debug (32.1 s): 462 plus 8 new. GCC Release and Debug and clang build with zero warnings. `strict.sh` is clean on `src/solver/*.cpp`, `tools/solver_cli.cpp` and `tests/solver_test.cpp`. `advisor_bench` overall is unchanged at 0.694 bb and 57%.
+
+**solver_cli:** new flags `--tier river|turn|flop|flop-checkdown` (default river, the old behaviour), `--threads N`, `--memory-mb N` (default 2048) and `--check-every N` (default 25, was fixed). It prints the counted shape and the estimate before building, the setup time, the threads in use, and training ms and ms per iteration apart from the exploitability checks.
+
+**Deviations**
+- `estimate_bytes` gained a `threads` parameter (default 1), because each extra thread adds scratch.
+- The `CheckDown` node and `CheckDownTable` are new types; the plan only said "showdown averaged over river cards".
+- The tree lost nothing; `TreeShape` and `count_betting_tree` are new public API.
+- The turn tier misses the plan's per-iteration estimate (see above).
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -911,8 +1022,7 @@ Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the
 - The combo tables (`combos.cpp`) are built at run time behind a function-local static rather than with `constexpr`, to stay clear of MSVC's constexpr step limit. Whether MSVC would actually hit that limit wasn't tested.
 - The multiway redraw cap (16,384) and the flop threading threshold (64 needed combos) were chosen, not tuned.
 - Timings come only from this container.
-- Solver solves are single-threaded so far. The `threads` limit is validated but not yet used, so thread-count determinism has nothing to test until Stage 8.
-- Flop trees are built before the memory check runs. Stage 8 has to count nodes before building a flop tree.
+- Solver threads (Stage 2: unused) and the memory check before building a flop tree (Stage 2: after) were done in Stage 8 batch A. See its entries below.
 
 - Stage 5: the preflop all-in rule's 15 BB line was chosen to match the range model's short-stack threshold and Stage 6's push/fold range; it was not measured.
 - Stage 5: the 3+ way hint latencies come from random play, whose lines are not representative of real games.
@@ -938,6 +1048,14 @@ Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the
 
 - Stage 7: the new controls were tested with injected ImGui input and the `--hover` flag only; real GLFW mouse input, Windows fonts (Segoe UI widths) and DPI scales other than 1 were not checked. The screenshots come from Mesa under Xvfb with DejaVu Sans.
 - Stage 7: the 560 px threshold for showing the `why` under the action was chosen from the two window sizes, not from user feedback.
+
+- Stage 8 batch A: ThreadSanitizer has not been run on `WorkerPool` or the threaded solver (planned for batch E). Thread safety rests on the design: tasks write disjoint storage, and region start and end go through the pool's mutex. The determinism test only shows equal results.
+- Stage 8 batch A: speeds come from this 4-core container only, with no tests above 4 threads. The scaling to 8+ threads that the flop tier assumes was not measured. Memory bandwidth may limit it, since a flop full iteration streams about 3 GB of regrets and sums.
+- Stage 8 batch A: flop full was measured on one spot only (515 × 469 combos, 100 BB, single-raised pot). Other boards, deeper stacks or wider ranges scale it (full ranges: 7.7 GB). Its 1- and 2-thread times to target and all 8-thread figures are extrapolated.
+- Stage 8 batch A: the approximate tier's error from having no river betting was not measured against flop full on the same spot. Their root strategies differ by a few points, and neither is the true game.
+- Stage 8 batch A: the first check-down version (48 sweeps per node) had a different exploitability path on the same spot (5.6% at 90 iterations against 1.25% for the table). It was replaced before the brute-force test existed, so whether it had a bug is unknown. The table version matches the brute force and the chance-node tree.
+- Stage 8 batch A: the thread cap (the first layer's cards, at most 1024) and the dynamic task hand-out were chosen, not tuned.
+- Stage 8 batch A: the hot loops (showdown sweeps 46% and the walk 38% of turn-tier instructions under callgrind) were not optimized. The known options are folding the reach-total pass into the forward sweep and skipping zero-reach hands. The turn tier misses the plan's 15-20 ms per iteration on 3 threads (31 ms on 4).
 
 ## Test changes
 
@@ -1062,3 +1180,5 @@ Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the
   - `EveryScreenDrawsWithFullData`: also sets `range_equity_pct`, `equity_pct`, outcomes for every raise row and three lines (140-character `why`s), and draws each phase with each of the four selections.
   - New constants `kAdviceBaseline` {1095, 120}, `kAdviceNit` {1182, 120}, `kAdviceStation` {1095, 143}, `kAdviceManiac` {1182, 143} and `kVersusStation` {1040, 314} (with `set_lines()`'s one-line rationale), measured by scanning hovered IDs; helpers `sidebar_item_is` and `set_lines`.
   - **New tests:** `PlayGtoFollowsTheSelectedLine` (each radio, then Play GTO plays that line's action, Baseline again at the end), `PlayVsLabelNamesTheArchetype` (labels per line, and "Play vs Station" with the advisor hidden still plays it), `PlayGtoFallsBackToBaselineWithoutLines`, `VersusRowSelectsItsLine`, `ExistingSidebarButtonsDidNotMove` (New Session, the toggle and the four radios hit their own IDs at the constants; New Session and the toggle still act), `TooltipAppearsOnHover` (30 frames at 1/60 s over the table: no `##Tooltip_00`; over Station: active this frame), `Screenshot.ChecksumsMatchKnownValues`, `Screenshot.TinyImageHasTheExactLayout`, `Screenshot.LargeImagesSplitIntoStoredBlocks`.
+
+- **Stage 8 batch A** (`tests/solver_test.cpp`): no existing assertion changed. `BettingTree.TurnTreeDealsEveryRiver` and the river tests pass unchanged, because only `check_down_river` trees use the new node. New tests: `SolverTiers.AbstractionsHaveTheirSizes`, `SolverTiers.CountingWalkMatchesTheBuiltTree`, `TurnSolver.SmallRangesConverge`, `TurnSolver.MemoryEstimateMatchesAllocation`, `FlopSolver.CheckDownApproximationRuns`, `FlopSolver.EstimateRejectsHugeTreesWithoutBuilding`, `Solver.DeterministicAcrossThreadCounts` and `WorkerPool.RunsEveryTaskOnceAndPropagatesExceptions`. Debug builds use smaller ranges and fewer iterations (`kOptimized`). `tests/player_boundary_test.cpp` also includes `solver/worker_pool.h`.

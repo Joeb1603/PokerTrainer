@@ -206,6 +206,89 @@ std::size_t ShowdownTable::bytes_for(int hands0, int hands1) {
     return static_cast<std::size_t>(hands0 + hands1) * (sizeof(int) + sizeof(HandRank));
 }
 
+CheckDownTable::CheckDownTable(const MatchupHands& hands, std::span<const Card> turn_board) {
+    if (turn_board.size() != 4) throw std::invalid_argument("check-down table: the board must have 4 cards");
+    const CardMask dead = mask_of(turn_board);
+    const auto n0 = static_cast<std::size_t>(hands.size(0));
+    const auto n1 = static_cast<std::size_t>(hands.size(1));
+    // Built [h0][h1] for both players (the inner loop runs over h1), then player 0's
+    // transposed so each player's rows are the opponent's hands.
+    std::vector<std::uint8_t> by_h0(n0 * n1, 0);
+    std::vector<std::uint8_t> theirs(n0 * n1, 0);
+    std::vector<int> rank0(n0);
+    std::vector<int> rank1(n1);
+    std::vector<std::uint8_t> live1(n1);
+    std::array<Card, 5> five{turn_board[0], turn_board[1], turn_board[2], turn_board[3], Card(0)};
+    const auto holds = [](const std::array<std::uint8_t, 2>& cards, CardMask mask) {
+        return (mask & ((CardMask{1} << cards[0]) | (CardMask{1} << cards[1]))) != 0;
+    };
+    for (int river = 0; river < kDeckSize; ++river) {
+        const CardMask river_mask = CardMask{1} << river;
+        if ((dead & river_mask) != 0) continue;
+        five[4] = Card(static_cast<std::uint8_t>(river));
+        const CardMask blocked = dead | river_mask;
+        for (std::size_t h = 0; h < n0; ++h) {
+            const std::array<std::uint8_t, 2>& cards = hands.cards(0, static_cast<int>(h));
+            rank0[h] = holds(cards, blocked) ? -1 : static_cast<int>(evaluate7({Card(cards[0]), Card(cards[1])}, five));
+        }
+        for (std::size_t o = 0; o < n1; ++o) {
+            const std::array<std::uint8_t, 2>& cards = hands.cards(1, static_cast<int>(o));
+            const bool live = !holds(cards, blocked);
+            live1[o] = live ? 1 : 0;
+            rank1[o] = live ? static_cast<int>(evaluate7({Card(cards[0]), Card(cards[1])}, five)) : 0;
+        }
+        for (std::size_t h = 0; h < n0; ++h) {
+            const int mine = rank0[h];
+            if (mine < 0) continue;
+            std::uint8_t* row0 = by_h0.data() + h * n1;
+            std::uint8_t* row1 = theirs.data() + h * n1;
+            // Lower rank numbers are stronger.
+            for (std::size_t o = 0; o < n1; ++o) {
+                const int other = rank1[o];
+                const int live = live1[o];
+                row0[o] = static_cast<std::uint8_t>(row0[o] + live * ((mine < other ? 2 : 0) + (mine == other ? 1 : 0)));
+                row1[o] = static_cast<std::uint8_t>(row1[o] + live * ((mine > other ? 2 : 0) + (mine == other ? 1 : 0)));
+            }
+        }
+    }
+    // Pairs sharing a card were counted as if they could be dealt together.
+    for (std::size_t h = 0; h < n0; ++h) {
+        for (const std::uint8_t card : hands.cards(0, static_cast<int>(h))) {
+            for (const int o : hands.with_card(1, card)) {
+                by_h0[h * n1 + static_cast<std::size_t>(o)] = 0;
+                theirs[h * n1 + static_cast<std::size_t>(o)] = 0;
+            }
+        }
+    }
+    counts_[0].assign(n0 * n1, 0);
+    for (std::size_t h = 0; h < n0; ++h) {
+        for (std::size_t o = 0; o < n1; ++o) counts_[0][o * n0 + h] = by_h0[h * n1 + o];
+    }
+    counts_[1] = std::move(theirs);
+}
+
+void CheckDownTable::values(const MatchupHands& hands, int player, std::span<const double> opp_reach, double pot,
+                            double invested, std::span<double> out) const {
+    const auto n = static_cast<std::size_t>(hands.size(player));
+    const auto rows = static_cast<std::size_t>(hands.size(1 - player));
+    fold_values(hands, player, opp_reach, -invested, out);
+    const double unit = pot / 88.0;
+    const std::uint8_t* counts = counts_[static_cast<std::size_t>(player)].data();
+    for (std::size_t o = 0; o < rows; ++o) {
+        const double reach = opp_reach[o];
+        if (reach == 0.0) continue;
+        const double weight = unit * reach;
+        const std::uint8_t* row = counts + o * n;
+        for (std::size_t h = 0; h < n; ++h) out[h] += weight * static_cast<double>(row[h]);
+    }
+}
+
+std::size_t CheckDownTable::bytes() const { return capacity_bytes(counts_[0]) + capacity_bytes(counts_[1]); }
+
+std::size_t CheckDownTable::bytes_for(int hands0, int hands1) {
+    return 2 * static_cast<std::size_t>(hands0) * static_cast<std::size_t>(hands1);
+}
+
 void fold_values_reference(const MatchupHands& hands, int player, std::span<const double> opp_reach, double payoff,
                            std::span<double> out) {
     const int opponent = 1 - player;

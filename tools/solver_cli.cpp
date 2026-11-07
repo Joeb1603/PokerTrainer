@@ -3,7 +3,8 @@
 //
 //   solver_cli --board Kh9d5c3s2h --pot 300 --stack 1000 --oop "RANGE" --ip "RANGE"
 //              [--bets B0,B1] [--to-act oop|ip] [--iterations N] [--target PCT]
-//              [--sizes 25,50,75,100] [--big-blind N] [--no-timing] [--verbose]
+//              [--sizes 25,50,75,100] [--big-blind N] [--tier river|turn|flop|flop-checkdown]
+//              [--threads N] [--memory-mb N] [--check-every N] [--no-timing] [--verbose]
 //
 // Ranges use HandRange syntax with optional per-token weights ("AKo:0.5").
 
@@ -32,12 +33,11 @@ using namespace poker;
 
 namespace {
 
-constexpr int kCheckEvery = 25;  // Iterations between exploitability checks
-
 constexpr std::string_view kUsage =
     "Usage: solver_cli --board CARDS --pot N --stack N --oop RANGE --ip RANGE\n"
     "                  [--bets B0,B1] [--to-act oop|ip] [--iterations N] [--target PCT]\n"
-    "                  [--sizes 25,50,75,100] [--big-blind N] [--no-timing] [--verbose]\n"
+    "                  [--sizes 25,50,75,100] [--big-blind N] [--tier river|turn|flop|flop-checkdown]\n"
+    "                  [--threads N] [--memory-mb N] [--check-every N] [--no-timing] [--verbose]\n"
     "  --board       3-5 cards, e.g. Kh9d5c3s2h (5 = river, 4 = turn, 3 = flop)\n"
     "  --pot         chips in the middle from earlier streets\n"
     "  --stack       effective stack behind once the larger street bet is matched\n"
@@ -45,9 +45,18 @@ constexpr std::string_view kUsage =
     "  --to-act      who acts at the root (default oop; ip with equal bets means OOP checked)\n"
     "  --oop, --ip   HandRange syntax, tokens may end in :weight, e.g. \"QQ+, AKs, AKo:0.5\"\n"
     "  --iterations  maximum iterations (default 1000)\n"
-    "  --target      stop once exploitability is at most PCT % of pot (checked every 25)\n"
+    "  --target      stop once exploitability is at most PCT % of pot\n"
     "  --sizes       root bet (or raise) sizes in % of pot (default 25,50,75,100)\n"
-    "  --big-blind   smallest bet and raise increment (default 20)\n";
+    "  --big-blind   smallest bet and raise increment (default 20)\n"
+    "  --tier        bet abstraction (default river):\n"
+    "                  river           river sizes (33/75/150% + all-in, raises pot + all-in) on every street\n"
+    "                  turn            turn 50/100% + all-in, raises pot + all-in; river 66% + all-in\n"
+    "                  flop            one size per street + all-in (33/66/75%), raises all-in only\n"
+    "                  flop-checkdown  as flop, but the river is checked down (approximate)\n"
+    "                the root always gets --sizes\n"
+    "  --threads     solver threads, the calling one included (default 1); results do not change\n"
+    "  --memory-mb   memory limit in MiB (default 2048); a larger solve is refused before building\n"
+    "  --check-every iterations between exploitability checks (default 25)\n";
 
 struct Options {
     std::vector<Card> board;
@@ -60,6 +69,10 @@ struct Options {
     std::optional<double> target;
     std::optional<std::vector<double>> sizes;
     int big_blind = 20;
+    std::string tier = "river";
+    int threads = 1;
+    std::size_t memory_mb = 2048;
+    int check_every = 25;
     bool timing = true;
     bool verbose = false;
 };
@@ -141,6 +154,17 @@ Options parse_options(int argc, char** argv) {
                 options.sizes = sizes;
             } else if (arg == "--big-blind") {
                 options.big_blind = int_flag(arg, value, 1);
+            } else if (arg == "--tier") {
+                if (value != "river" && value != "turn" && value != "flop" && value != "flop-checkdown") {
+                    usage_error("--tier must be river, turn, flop or flop-checkdown");
+                }
+                options.tier = std::string(value);
+            } else if (arg == "--threads") {
+                options.threads = int_flag(arg, value, 1);
+            } else if (arg == "--memory-mb") {
+                options.memory_mb = static_cast<std::size_t>(int_flag(arg, value, 1));
+            } else if (arg == "--check-every") {
+                options.check_every = int_flag(arg, value, 1);
             } else {
                 usage_error("unknown flag: " + std::string(arg));
             }
@@ -155,12 +179,21 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-// The river abstraction. On a turn or flop board the earlier streets get the
-// deeper river sizes too (33/75/150% + all-in, raises pot + all-in), so the root
-// has the same options whatever the street; the memory estimate is printed first.
+// The tier's abstraction. The river tier gives a turn or flop board the deeper
+// river sizes too (33/75/150% + all-in, raises pot + all-in), so the root has the
+// same options whatever the street; the memory estimate is printed first.
 BetAbstraction abstraction_for(const Options& options) {
-    BetAbstraction abstraction = river_default_abstraction();
-    for (std::size_t street = 0; street < 2; ++street) abstraction.streets[street] = abstraction.streets[2];
+    BetAbstraction abstraction;
+    if (options.tier == "turn") {
+        abstraction = turn_tier_abstraction();
+    } else if (options.tier == "flop") {
+        abstraction = flop_full_abstraction();
+    } else if (options.tier == "flop-checkdown") {
+        abstraction = flop_checkdown_abstraction();
+    } else {
+        abstraction = river_default_abstraction();
+        for (std::size_t street = 0; street < 2; ++street) abstraction.streets[street] = abstraction.streets[2];
+    }
     if (options.sizes) abstraction.root_sizes = *options.sizes;
     return abstraction;
 }
@@ -344,10 +377,22 @@ int main(int argc, char** argv) {
     }
 
     std::optional<PostflopSolver> solver;
+    using Clock = std::chrono::steady_clock;
+    const auto ms_since = [](Clock::time_point from) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - from).count();
+    };
+    SolverLimits limits;
+    limits.threads = options.threads;
+    limits.memory_bytes = options.memory_mb << 20;
     try {
-        const std::size_t estimate = PostflopSolver::estimate_bytes(spot, abstraction);
-        std::cout << "Estimated memory: " << bytes_text(estimate) << '\n';
-        solver.emplace(spot, abstraction);
+        const TreeShape shape = count_betting_tree(spot, abstraction);
+        const std::size_t estimate = PostflopSolver::estimate_bytes(spot, abstraction, options.threads);
+        std::cout << "Tier: " << options.tier << "; tree " << shape.nodes << " nodes, " << shape.decision_nodes
+                  << " decision, " << shape.decision_actions << " slots; estimated memory " << bytes_text(estimate)
+                  << " with " << options.threads << " thread" << (options.threads == 1 ? "" : "s") << '\n';
+        const auto built = Clock::now();
+        solver.emplace(spot, abstraction, limits);
+        if (options.timing) std::cout << "Set up in " << fixed(ms_since(built), 0) << " ms\n";
     } catch (const SolverMemoryError& error) {
         spot_error(error.what());
     } catch (const std::invalid_argument& error) {
@@ -357,19 +402,23 @@ int main(int argc, char** argv) {
     const BettingTree& tree = solver->tree();
     std::cout << "Tree: " << tree.nodes.size() << " nodes, " << tree.decision_nodes << " decision, "
               << tree.decision_actions << " slots, " << bytes_text(tree.bytes()) << "; solver "
-              << bytes_text(solver->allocated_bytes()) << '\n';
+              << bytes_text(solver->allocated_bytes()) << ", " << solver->threads() << " thread"
+              << (solver->threads() == 1 ? "" : "s") << '\n';
 
-    std::cout << "\n  iter  expl %pot" << (options.timing ? "       ms" : "") << '\n';
-    const auto start = std::chrono::steady_clock::now();
+    // Training time excludes the exploitability checks (each about one iteration).
+    std::cout << "\n  iter  expl %pot" << (options.timing ? "   train ms   ms/iter   total ms" : "") << '\n';
+    const auto start = Clock::now();
+    double train_ms = 0.0;
     double exploitability = 0.0;
     while (solver->iterations() < options.iterations) {
-        solver->run(std::min(kCheckEvery, options.iterations - solver->iterations()));
+        const auto train = Clock::now();
+        solver->run(std::min(options.check_every, options.iterations - solver->iterations()));
+        train_ms += ms_since(train);
         exploitability = solver->exploitability_pct_pot();
         std::cout << pad(std::to_string(solver->iterations()), 6) << pad(fixed(exploitability, 4), 11);
         if (options.timing) {
-            const auto elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
-            std::cout << pad(std::to_string(elapsed.count()), 9);
+            std::cout << pad(fixed(train_ms, 0), 11) << pad(fixed(train_ms / solver->iterations(), 2), 10)
+                      << pad(fixed(ms_since(start), 0), 11);
         }
         std::cout << '\n';
         if (options.target && exploitability <= *options.target) break;

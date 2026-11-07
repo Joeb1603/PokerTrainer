@@ -19,6 +19,11 @@ enum class NodeKind : std::uint8_t {
     Chance,    // The next street's card: one child per card not on the board
     Fold,      // TreeNode::player folded
     Showdown,  // Bets are matched on the river (or the street ended with nobody able to bet)
+    // The turn's betting is over and the river is dealt and checked down (or nobody can
+    // bet): a showdown averaged over every river card, without a node per river.
+    // TreeNode::board is the turn board. Only in trees whose abstraction sets
+    // check_down_river.
+    CheckDown,
 };
 
 // One option at a decision node. Pot fractions follow raise_to_for_pot_fraction:
@@ -50,16 +55,36 @@ struct BetAbstraction {
     // becomes all-in: the chips left behind would be too few to matter.
     double all_in_merge = 0.67;
     // Ends the hand at the end of turn betting with no river betting: the river is
-    // dealt and checked down. For approximate flop trees; a river tree ignores it.
+    // dealt and checked down, as one CheckDown node per turn line (showdown averaged
+    // over the river cards, card removal exact; no river boards in the tree). For
+    // approximate flop trees; a river tree ignores it.
     bool check_down_river = false;
 
     const StreetSizes& sizes(Street street) const;
 };
 
-// Root bets on the advisor's ladder (25/50/75/100% + all-in), deeper bets 33/75/150%
-// + all-in, raises pot + all-in, two raises per street, merge at 0.67 of the stack.
-// Only the river sizes are set; flop and turn have none (check or all-in).
+// The solver tiers. Every one puts the advisor's ladder (25/50/75/100% + all-in) at
+// the root decision only, so the advisor's options map onto the tree; deeper sizes
+// are coarser to keep the tree small. All merge sizes into all-in at 0.67 of the
+// stack. A street with no sizes still has check (or call) and all-in.
+
+// River tier. Root: the ladder. Deeper bets 33/75/150% + all-in, raises pot +
+// all-in, two raises per street. Only the river sizes are set; flop and turn have
+// none (check or all-in).
 BetAbstraction river_default_abstraction();
+
+// Turn tier, for turn roots. Turn: bets 50/100% + all-in, raises pot + all-in, two
+// raises. River: bet 66% + all-in, raise all-in only. No flop sizes.
+BetAbstraction turn_tier_abstraction();
+
+// Full flop tier, for flop roots: one size per street plus all-in (flop 33%, turn
+// 66%, river 75%), raises all-in only.
+BetAbstraction flop_full_abstraction();
+
+// Approximate flop tier: flop_full_abstraction on the flop and turn, but the river
+// is checked down (check_down_river; no river betting), which makes the tree about
+// as small as a turn tree. Advice from it must say "approximate: no river betting".
+BetAbstraction flop_checkdown_abstraction();
 
 // The public betting state a tree starts from.
 struct BettingRoot {
@@ -121,9 +146,41 @@ struct BettingTree {
     std::size_t bytes() const;  // Heap memory held, from capacities
 };
 
+// What build_betting_tree would build, counted without building it: a walk over one
+// representative card per chance node (every child of a chance node has the same
+// betting, only the card differs) that remembers each street start it has counted,
+// so its time and memory grow with the betting lines per street, not with the tree.
+// Counts saturate at SIZE_MAX instead of overflowing.
+struct TreeShape {
+    std::size_t nodes = 0;
+    std::size_t children = 0;  // Child slots: entries of children, actions and dealt
+    std::size_t decision_nodes = 0;
+    std::size_t decision_actions = 0;
+    std::array<std::size_t, 2> player_actions{};  // decision_actions by the player to act
+    std::size_t boards = 0;
+    std::size_t full_boards = 0;       // Boards with 5 cards
+    std::size_t checkdown_boards = 0;  // Turn boards that CheckDown nodes end on
+    // Scratch for PostflopSolver's walk, in lists of one double per hand of the larger
+    // range: what a walk from the root holds at its deepest (a decision node holds
+    // 2A + 1 lists, a chance node 3, plus the deepest child).
+    std::size_t walk_lists = 0;
+    // The first chance layer (the chance nodes dealing the street after the root's),
+    // whose children the solver runs in parallel: the most cards any of them deals
+    // (0 for a river root) and the most walk_lists below any one card.
+    std::size_t first_layer_cards = 0;
+    std::size_t first_layer_child_lists = 0;
+
+    std::size_t bytes() const;  // BettingTree::bytes() of the built tree
+};
+
+// Same validation and exceptions as build_betting_tree.
+TreeShape count_betting_tree(const BettingRoot& root, const BetAbstraction& abstraction);
+
 // Throws std::invalid_argument for an invalid board, negative chips, a player to
 // act who is not facing the larger bet, nothing left to decide (no chips behind and
-// no bet to face), or a non-positive or non-finite size or merge threshold.
+// no bet to face), or a non-positive or non-finite size or merge threshold; and
+// std::length_error for a tree with more than INT_MAX nodes or child slots. Counts
+// the tree first (count_betting_tree) and reserves every array exactly.
 BettingTree build_betting_tree(const BettingRoot& root, const BetAbstraction& abstraction);
 
 }  // namespace poker

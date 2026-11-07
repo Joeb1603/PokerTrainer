@@ -83,6 +83,7 @@ add_library(poker_core STATIC
     src/solver/postflop_solver.cpp
     src/solver/showdown.cpp
     src/solver/spot_from_view.cpp
+    src/solver/worker_pool.cpp
     src/strategy/generated/push_fold_data.cpp
     src/strategy/preflop_charts.cpp
     src/strategy/push_fold.cpp

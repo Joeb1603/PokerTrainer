@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <vector>
@@ -18,6 +20,7 @@
 #include "solver/dcfr.h"
 #include "solver/postflop_solver.h"
 #include "solver/showdown.h"
+#include "solver/worker_pool.h"
 #include "strategy/preflop_charts.h"
 
 using namespace poker;
@@ -701,6 +704,409 @@ TEST(TurnSolver, SmallTreeConverges) {
     EXPECT_LT(late, early);
     EXPECT_LT(late, 1.0);
     EXPECT_GE(late, -1e-9);
+}
+
+}  // namespace
+
+// --- Stage 8: tiers, memory-first estimates, threads --------------------------
+
+namespace {
+
+// Builds to a release-sized test in Release and a smaller one in Debug, where the
+// walk is many times slower.
+#ifdef NDEBUG
+constexpr bool kOptimized = true;
+#else
+constexpr bool kOptimized = false;
+#endif
+
+// About 60 combos a side on the turn: a BB check-calling range against a BTN
+// that bet the flop with a strong range.
+SolveSpot small_turn_spot() {
+    SolveSpot spot;
+    spot.board = cards({"Kd", "7c", "2h", "4s"});
+    spot.pot = 200;
+    spot.effective_stack = 400;
+    spot.min_bet = 20;
+    spot.ranges[0] = range_of("99-55, A5s-A3s, KJs-KTs, QJs, JTs, 98s, 87s, 65s");
+    spot.ranges[1] = range_of("AA-TT, AKs-AJs, KQs, AKo-AQo, 76s");
+    return spot;
+}
+
+SolveSpot small_flop_spot() {
+    SolveSpot spot = small_turn_spot();
+    spot.board.pop_back();
+    spot.pot = 110;
+    spot.effective_stack = 300;
+    return spot;
+}
+
+// Every count the counting walk makes against the built tree.
+void expect_shape_matches(const SolveSpot& spot, const BetAbstraction& abstraction) {
+    const TreeShape shape = count_betting_tree(spot, abstraction);
+    const BettingTree tree = build_betting_tree(spot, abstraction);
+    EXPECT_EQ(shape.nodes, tree.nodes.size());
+    EXPECT_EQ(shape.children, tree.children.size());
+    EXPECT_EQ(shape.decision_nodes, static_cast<std::size_t>(tree.decision_nodes));
+    EXPECT_EQ(shape.decision_actions, static_cast<std::size_t>(tree.decision_actions));
+    EXPECT_EQ(shape.boards, tree.boards.size());
+    EXPECT_EQ(shape.bytes(), tree.bytes());
+    std::size_t full = 0;
+    for (const BoardCards& board : tree.boards) full += board.size == 5 ? 1 : 0;
+    EXPECT_EQ(shape.full_boards, full);
+    std::array<std::size_t, 2> by_player{};
+    std::vector<int> checkdown_boards;
+    for (const TreeNode& node : tree.nodes) {
+        if (node.kind == NodeKind::Decision) by_player[node.player] += static_cast<std::size_t>(node.child_count);
+        if (node.kind == NodeKind::CheckDown) checkdown_boards.push_back(node.board);
+    }
+    EXPECT_EQ(shape.player_actions, by_player);
+    std::sort(checkdown_boards.begin(), checkdown_boards.end());
+    checkdown_boards.erase(std::unique(checkdown_boards.begin(), checkdown_boards.end()), checkdown_boards.end());
+    EXPECT_EQ(shape.checkdown_boards, checkdown_boards.size());
+}
+
+TEST(SolverTiers, AbstractionsHaveTheirSizes) {
+    const BetAbstraction turn = turn_tier_abstraction();
+    EXPECT_EQ(turn.streets[1].bets, (std::vector<double>{0.5, 1.0}));
+    EXPECT_EQ(turn.streets[1].raises, (std::vector<double>{1.0}));
+    EXPECT_EQ(turn.streets[2].bets, (std::vector<double>{0.66}));
+    EXPECT_TRUE(turn.streets[2].raises.empty());  // All-in only
+    EXPECT_EQ(turn.raise_cap, 2);
+    const BetAbstraction flop = flop_full_abstraction();
+    EXPECT_EQ(flop.streets[0].bets, (std::vector<double>{0.33}));
+    EXPECT_EQ(flop.streets[1].bets, (std::vector<double>{0.66}));
+    EXPECT_EQ(flop.streets[2].bets, (std::vector<double>{0.75}));
+    for (const StreetSizes& street : flop.streets) EXPECT_TRUE(street.raises.empty());
+    const BetAbstraction approximate = flop_checkdown_abstraction();
+    EXPECT_TRUE(approximate.check_down_river);
+    EXPECT_TRUE(approximate.streets[2].bets.empty());
+    for (const BetAbstraction& abstraction : {turn, flop, approximate}) {
+        EXPECT_EQ(abstraction.root_sizes, (std::vector<double>{0.25, 0.5, 0.75, 1.0}));
+        EXPECT_TRUE(abstraction.add_all_in);
+    }
+
+    // The turn root offers the ladder; facing a 50% turn bet, the raise is pot-sized.
+    const BettingTree tree = build_betting_tree(small_turn_spot(), turn);
+    const std::span<const TreeAction> root = tree.actions_of(0);
+    ASSERT_EQ(root.size(), 6u);
+    EXPECT_EQ(root[1].to, 50);
+    EXPECT_EQ(root[4].to, 200);
+    EXPECT_EQ(root[5].type, ActionType::AllIn);
+    const int ip = tree.child(0, 0);  // OOP checked
+    const std::span<const TreeAction> ip_bets = tree.actions_of(ip);
+    ASSERT_EQ(ip_bets.size(), 4u);  // Check, 50%, 100%, all-in
+    EXPECT_EQ(ip_bets[1].to, 100);
+    EXPECT_EQ(ip_bets[2].to, 200);
+    // Facing it, a pot raise would be to 100 + 400 (the pot after calling), past
+    // the 400 behind, so only fold, call and all-in remain.
+    const std::span<const TreeAction> facing = tree.actions_of(tree.child(ip, 1));
+    ASSERT_EQ(facing.size(), 3u);
+    EXPECT_EQ(facing[2].type, ActionType::AllIn);
+    EXPECT_EQ(facing[2].to, 400);
+    // A river after checks: 66% bet and all-in; facing it, all-in is the only raise.
+    const int turn_checked = tree.child(ip, 0);
+    ASSERT_EQ(tree.nodes[static_cast<std::size_t>(turn_checked)].kind, NodeKind::Chance);
+    const int river = tree.child(turn_checked, 0);
+    const std::span<const TreeAction> river_bets = tree.actions_of(river);
+    ASSERT_EQ(river_bets.size(), 3u);
+    EXPECT_EQ(river_bets[1].to, 132);
+    const std::span<const TreeAction> river_facing = tree.actions_of(tree.child(river, 1));
+    ASSERT_EQ(river_facing.size(), 3u);
+    EXPECT_EQ(river_facing[2].type, ActionType::AllIn);
+
+    // The approximate flop tree has no river boards and no river decisions.
+    const BettingTree checkdown = build_betting_tree(small_flop_spot(), approximate);
+    for (const BoardCards& board : checkdown.boards) EXPECT_LE(board.size, 4);
+    int checkdowns = 0;
+    for (const TreeNode& node : checkdown.nodes) {
+        EXPECT_FALSE(node.street == Street::River && node.kind == NodeKind::Decision);
+        checkdowns += node.kind == NodeKind::CheckDown ? 1 : 0;
+    }
+    EXPECT_GT(checkdowns, 0);
+}
+
+TEST(SolverTiers, CountingWalkMatchesTheBuiltTree) {
+    for (const SolveSpot& spot : {realistic_spot(), small_turn_spot(), small_flop_spot()}) {
+        for (const BetAbstraction& abstraction :
+             {river_default_abstraction(), turn_tier_abstraction(), flop_full_abstraction(), flop_checkdown_abstraction()}) {
+            SCOPED_TRACE(spot.board.size());
+            expect_shape_matches(spot, abstraction);
+        }
+    }
+    // Facing a bet at the root, and IP to act after a check.
+    SolveSpot facing = small_turn_spot();
+    facing.street_bet = {0, 100};
+    expect_shape_matches(facing, turn_tier_abstraction());
+    SolveSpot checked = small_flop_spot();
+    checked.to_act = 1;
+    expect_shape_matches(checked, flop_checkdown_abstraction());
+}
+
+TEST(TurnSolver, SmallRangesConverge) {
+    SolveSpot spot = small_turn_spot();
+    if (!kOptimized) spot.ranges[1] = range_of("AA-QQ, AKs, KQs, AKo, 76s");
+    PostflopSolver solver(spot, turn_tier_abstraction());
+    if (kOptimized) {
+        EXPECT_GE(solver.hands(0).size(), 50u);
+        EXPECT_LE(solver.hands(0).size(), 70u);
+        EXPECT_GE(solver.hands(1).size(), 50u);
+        EXPECT_LE(solver.hands(1).size(), 70u);
+    }
+    std::vector<double> exploitability;
+    for (const int until : {10, 30, 100}) {
+        solver.run(until - solver.iterations());
+        exploitability.push_back(solver.exploitability_pct_pot());
+    }
+    EXPECT_LT(exploitability[1], exploitability[0]);
+    EXPECT_LT(exploitability[2], exploitability[1]);
+    EXPECT_LT(exploitability[2], 5.0);
+    EXPECT_GE(exploitability[2], -1e-9);
+}
+
+void expect_estimate_bounds_allocation(const SolveSpot& spot, const BetAbstraction& abstraction, int threads) {
+    SolverLimits limits;
+    limits.threads = threads;
+    const std::size_t estimate = PostflopSolver::estimate_bytes(spot, abstraction, threads);
+    const PostflopSolver solver(spot, abstraction, limits);
+    const std::size_t actual = solver.allocated_bytes();
+    EXPECT_GE(estimate, actual);
+    EXPECT_LE(static_cast<double>(estimate), 1.2 * static_cast<double>(actual));
+    limits.memory_bytes = estimate - 1;
+    EXPECT_THROW(PostflopSolver(spot, abstraction, limits), SolverMemoryError);
+}
+
+TEST(TurnSolver, MemoryEstimateMatchesAllocation) {
+    for (const int threads : {1, 3}) {
+        SCOPED_TRACE(threads);
+        expect_estimate_bounds_allocation(small_turn_spot(), turn_tier_abstraction(), threads);
+        expect_estimate_bounds_allocation(small_flop_spot(), flop_checkdown_abstraction(), threads);
+    }
+    SolveSpot tiny = small_flop_spot();
+    tiny.ranges[0] = range_of("99-77, KJs");
+    tiny.ranges[1] = range_of("AA, AKs, 76s");
+    expect_estimate_bounds_allocation(tiny, flop_full_abstraction(), 2);
+    // Extra threads add scratch, but never beyond the cards of the first chance layer.
+    EXPECT_LT(PostflopSolver::estimate_bytes(small_turn_spot(), turn_tier_abstraction(), 1),
+              PostflopSolver::estimate_bytes(small_turn_spot(), turn_tier_abstraction(), 4));
+    EXPECT_EQ(PostflopSolver::estimate_bytes(small_turn_spot(), turn_tier_abstraction(), 48),
+              PostflopSolver::estimate_bytes(small_turn_spot(), turn_tier_abstraction(), 1000));
+    // A river tree has no chance layer, so threads change nothing.
+    EXPECT_EQ(PostflopSolver::estimate_bytes(realistic_spot(), river_default_abstraction(), 1),
+              PostflopSolver::estimate_bytes(realistic_spot(), river_default_abstraction(), 8));
+}
+
+// Each hand's check-down EV from the flop: the pot times its equity against the
+// other range over every turn and river, with card removal, by brute force.
+double brute_force_check_down_ev(int mine, const SolveSpot& spot) {
+    const CardMask board = card_mask(spot.board);
+    double weight = 0.0;
+    double share = 0.0;
+    for (int o = 0; o < kComboCount; ++o) {
+        const float w = spot.ranges[1].weight(o);
+        const CardMask dead = board | combo_mask(mine) | combo_mask(o);
+        if (w <= 0.0f || (combo_mask(o) & (board | combo_mask(mine))) != 0) continue;
+        double wins = 0.0;
+        int runouts = 0;
+        for (int turn = 0; turn < kDeckSize; ++turn) {
+            if ((dead & (CardMask{1} << turn)) != 0) continue;
+            for (int river = turn + 1; river < kDeckSize; ++river) {
+                if ((dead & (CardMask{1} << river)) != 0) continue;
+                std::vector<Card> full = spot.board;
+                full.emplace_back(turn);
+                full.emplace_back(river);
+                const HandRank a = rank_of(mine, full);
+                const HandRank b = rank_of(o, full);
+                wins += a < b ? 1.0 : a == b ? 0.5 : 0.0;
+                ++runouts;
+            }
+        }
+        weight += w;
+        share += w * wins / runouts;
+    }
+    return spot.pot * share / weight;
+}
+
+TEST(FlopSolver, CheckDownApproximationRuns) {
+    // Checks only: every hand's EV is its equity share of the pot over both cards.
+    SolveSpot tiny;
+    tiny.board = cards({"Kh", "9d", "5c"});
+    tiny.pot = 200;
+    tiny.effective_stack = 400;
+    tiny.ranges[0] = range_of("AA, 99, 76s, QJo");
+    tiny.ranges[1] = range_of("KK, KQs, 44, T8s");
+    tiny.ranges[1].set(combo_index(card("Ah"), card("Ad")), 0.5f);  // Shares cards with player 0's aces
+    BetAbstraction checks_only;
+    checks_only.add_all_in = false;
+    checks_only.check_down_river = true;
+    {
+        PostflopSolver solver(tiny, checks_only);
+        solver.run(1);
+        const RootSolution root = solver.root();
+        for (std::size_t h = 0; h < root.hands.size(); ++h) {
+            EXPECT_NEAR(root.hand_ev[h], brute_force_check_down_ev(root.hands[h], tiny), 1e-3) << "hand " << h;
+        }
+        EXPECT_NEAR(solver.exploitability_pct_pot(), 0.0, 1e-9);
+    }
+
+    // From the turn, the CheckDown node equals a chance node over 48 river showdowns.
+    SolveSpot turn = tiny;
+    turn.board.push_back(card("3s"));
+    BetAbstraction dealt = checks_only;
+    dealt.check_down_river = false;
+    PostflopSolver with_node(turn, checks_only);
+    PostflopSolver with_rivers(turn, dealt);
+    with_node.run(1);
+    with_rivers.run(1);
+    const RootSolution a = with_node.root();
+    const RootSolution b = with_rivers.root();
+    ASSERT_EQ(a.hands, b.hands);
+    for (std::size_t h = 0; h < a.hands.size(); ++h) EXPECT_NEAR(a.hand_ev[h], b.hand_ev[h], 1e-9);
+
+    // The approximate tier solves: exploitability falls, EVs stay within the chips.
+    SolveSpot spot = small_flop_spot();
+    if (!kOptimized) {
+        spot.ranges[0] = range_of("99-77, A5s, KJs, JTs, 87s");
+        spot.ranges[1] = range_of("AA-QQ, AKs, KQs, 76s");
+    }
+    PostflopSolver solver(spot, flop_checkdown_abstraction());
+    solver.run(10);
+    const double early = solver.exploitability_pct_pot();
+    solver.run(kOptimized ? 70 : 30);
+    const double late = solver.exploitability_pct_pot();
+    EXPECT_LT(late, early);
+    EXPECT_LT(late, kOptimized ? 2.0 : 5.0);
+    EXPECT_GE(late, -1e-9);
+    const RootSolution root = solver.root();
+    for (std::size_t h = 0; h < root.hands.size(); ++h) {
+        EXPECT_GE(root.hand_ev[h], -static_cast<float>(spot.effective_stack));
+        EXPECT_LE(root.hand_ev[h], static_cast<float>(spot.pot + spot.effective_stack));
+    }
+}
+
+TEST(FlopSolver, EstimateRejectsHugeTreesWithoutBuilding) {
+    // Every combo on both sides, 100 BB deep, with the river sizes on every street:
+    // tens of gigabytes. The estimate and the refusal take no time and no memory.
+    SolveSpot spot;
+    spot.board = cards({"Kd", "7c", "2h"});
+    spot.pot = 110;
+    spot.effective_stack = 1950;
+    spot.min_bet = 20;
+    spot.ranges[0] = range_of("22+, A2s+, K2s+, Q2s+, J2s+, T2s+, 92s+, 82s+, 72s+, 62s+, 52s+, 42s+, 32s, A2o+, "
+                              "K2o+, Q2o+, J2o+, T2o+, 92o+, 82o+, 72o+, 62o+, 52o+, 42o+, 32o");
+    spot.ranges[1] = spot.ranges[0];
+    BetAbstraction wide = river_default_abstraction();
+    wide.streets[0] = wide.streets[2];
+    wide.streets[1] = wide.streets[2];
+
+    const auto start = std::chrono::steady_clock::now();
+    const std::size_t full = PostflopSolver::estimate_bytes(spot, flop_full_abstraction());
+    const std::size_t huge = PostflopSolver::estimate_bytes(spot, wide);
+    EXPECT_GT(full, std::size_t{4} << 30);  // Full ranges do not fit the default 2 GB
+    EXPECT_GT(huge, std::size_t{20} << 30);
+    EXPECT_THROW(PostflopSolver(spot, flop_full_abstraction()), SolverMemoryError);
+    try {
+        const PostflopSolver solver(spot, wide);
+        ADD_FAILURE() << "built a " << huge << "-byte solve";
+    } catch (const SolverMemoryError& error) {
+        EXPECT_EQ(error.required(), huge);
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    EXPECT_LT(seconds, 0.5);  // Building the flop_full tree alone takes longer
+    // The approximate tier fits easily.
+    EXPECT_LT(PostflopSolver::estimate_bytes(spot, flop_checkdown_abstraction()), std::size_t{512} << 20);
+}
+
+// Every decision node's average strategy, and the values.
+void expect_identical_solves(const PostflopSolver& a, const PostflopSolver& b) {
+    ASSERT_EQ(a.iterations(), b.iterations());
+    EXPECT_EQ(a.best_response_values(), b.best_response_values());
+    EXPECT_EQ(a.exploitability_pct_pot(), b.exploitability_pct_pot());
+    const BettingTree& tree = a.tree();
+    int compared = 0;
+    for (std::size_t i = 0; i < tree.nodes.size(); ++i) {
+        if (tree.nodes[i].kind != NodeKind::Decision) continue;
+        ASSERT_EQ(a.average_strategy(static_cast<int>(i)), b.average_strategy(static_cast<int>(i))) << "node " << i;
+        ++compared;
+    }
+    EXPECT_GT(compared, 100);
+    const RootSolution ra = a.root();
+    const RootSolution rb = b.root();
+    EXPECT_EQ(ra.freq, rb.freq);
+    EXPECT_EQ(ra.ev, rb.ev);
+    EXPECT_EQ(ra.ev_best, rb.ev_best);
+}
+
+TEST(Solver, DeterministicAcrossThreadCounts) {
+    SolveSpot spot = small_turn_spot();
+    if (!kOptimized) spot.ranges[1] = range_of("AA-QQ, AKs, KQs, AKo, 76s");
+    SolverLimits one;
+    SolverLimits three;
+    three.threads = 3;
+    PostflopSolver serial(spot, turn_tier_abstraction(), one);
+    PostflopSolver parallel(spot, turn_tier_abstraction(), three);
+    EXPECT_EQ(serial.threads(), 1);
+    EXPECT_EQ(parallel.threads(), 3);
+    const int iterations = kOptimized ? 40 : 10;
+    serial.run(iterations);
+    parallel.run(iterations);
+    expect_identical_solves(serial, parallel);
+
+    // The flop tier splits over turn cards, with river chance nodes inside each task.
+    SolveSpot flop = small_flop_spot();
+    flop.ranges[0] = range_of("99-77, A5s, KJs");
+    flop.ranges[1] = range_of("AA, AKs, 76s");
+    flop.effective_stack = 150;
+    SolverLimits two;
+    two.threads = 2;
+    PostflopSolver flop_serial(flop, flop_full_abstraction(), one);
+    PostflopSolver flop_parallel(flop, flop_full_abstraction(), two);
+    flop_serial.run(3);
+    flop_parallel.run(3);
+    expect_identical_solves(flop_serial, flop_parallel);
+
+    // A river tree ignores threads.
+    SolverLimits four;
+    four.threads = 4;
+    EXPECT_EQ(PostflopSolver(realistic_spot(), river_default_abstraction(), four).threads(), 1);
+}
+
+TEST(WorkerPool, RunsEveryTaskOnceAndPropagatesExceptions) {
+    WorkerPool pool(3);
+    EXPECT_EQ(pool.size(), 3);
+    for (int round = 0; round < 20; ++round) {
+        std::vector<int> runs(97, 0);
+        std::vector<int> worker_of(97, -1);
+        pool.run(97, [&](int task, int worker) {
+            ++runs[static_cast<std::size_t>(task)];
+            worker_of[static_cast<std::size_t>(task)] = worker;
+        });
+        for (std::size_t k = 0; k < runs.size(); ++k) {
+            ASSERT_EQ(runs[k], 1);
+            ASSERT_GE(worker_of[k], 0);
+            ASSERT_LT(worker_of[k], 3);
+        }
+    }
+    const auto throwing = [](int task, int) {
+        if (task == 37) throw std::runtime_error("task 37");
+    };
+    try {
+        pool.run(100, throwing);
+        ADD_FAILURE() << "no exception";
+    } catch (const std::runtime_error& error) {
+        EXPECT_STREQ(error.what(), "task 37");
+    }
+    // Still usable, and a one-thread pool runs everything on the caller.
+    int sum = 0;
+    WorkerPool single(1);
+    single.run(10, [&](int task, int worker) {
+        EXPECT_EQ(worker, 0);
+        sum += task;
+    });
+    EXPECT_EQ(sum, 45);
+    std::vector<int> again(10, 0);
+    pool.run(10, [&](int task, int) { again[static_cast<std::size_t>(task)] = 1; });
+    EXPECT_EQ(std::count(again.begin(), again.end(), 1), 10);
 }
 
 }  // namespace

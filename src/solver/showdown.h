@@ -58,6 +58,7 @@ void fold_values(const MatchupHands& hands, int player, std::span<const double> 
 // Every player's hands ranked on one complete board, built once per board.
 class ShowdownTable {
 public:
+    ShowdownTable() = default;  // Empty, to be assigned
     ShowdownTable(const MatchupHands& hands, std::span<const Card> board);
 
     // out[h] = sum over unblocked o of opp_reach[o] * (win, tie or lose payoff of h
@@ -79,6 +80,32 @@ private:
     // and their ranks in the same order.
     std::array<std::vector<int>, 2> order_;
     std::array<std::vector<HandRank>, 2> rank_;
+};
+
+// The river dealt and checked down from one turn board, for a CheckDown node. Built
+// once per turn board: for every pair of hands that share no card and hold no turn
+// board card, each player's count over the 44 rivers neither holds of 2 per win and
+// 1 per tie (0 to 88, exact in a byte). Stored per player with the opponent's hands
+// as rows, so values() adds one row per opponent hand that has reach and skips the
+// rest; 2 * n0 * n1 bytes.
+class CheckDownTable {
+public:
+    CheckDownTable() = default;  // Empty, to be assigned
+    CheckDownTable(const MatchupHands& hands, std::span<const Card> turn_board);
+
+    // out[h] = sum over unblocked o of opp_reach[o] * (pot * share(h, o) - invested),
+    // share = count / 88: the pot share h wins against o on average over the rivers.
+    // Hands holding a turn board card are not 0 (unlike ShowdownTable): the caller
+    // zeroes them, as a chance node does.
+    void values(const MatchupHands& hands, int player, std::span<const double> opp_reach, double pot, double invested,
+                std::span<double> out) const;
+
+    std::size_t bytes() const;  // From capacities
+    static std::size_t bytes_for(int hands0, int hands1);
+
+private:
+    // counts_[p][o * n_p + h]: player p's count with hand h against opponent hand o.
+    std::array<std::vector<std::uint8_t>, 2> counts_;
 };
 
 // O(n^2) versions for tests.

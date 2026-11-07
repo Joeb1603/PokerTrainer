@@ -20,6 +20,7 @@
 #include "solver/postflop_solver.h"
 #include "solver/showdown.h"
 #include "solver/spot_from_view.h"
+#include "solver/worker_pool.h"
 #include "strategy/preflop_charts.h"
 #include "strategy/push_fold.h"
 

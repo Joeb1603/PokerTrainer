@@ -1,10 +1,12 @@
 #include "solver/postflop_solver.h"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <utility>
 
 #include "range/combos.h"
+#include "solver/worker_pool.h"
 
 namespace poker {
 namespace {
@@ -23,53 +25,64 @@ std::vector<int> hands_in(const WeightedRange& range, std::span<const Card> boar
     return combos;
 }
 
-// Where everything goes, worked out from the tree and the hand counts alone so the
-// memory estimate needs no allocation of its own.
-struct StoragePlan {
-    std::vector<std::size_t> offset;  // Per node; decision nodes only
-    std::size_t floats = 0;           // Regret (and strategy sum) entries
-    std::size_t scratch = 0;          // Doubles of traversal scratch
-    std::size_t full_boards = 0;
-};
-
-// Scratch a walk below a node takes, at most, per hand of the larger list:
-// a decision keeps its strategy, every child's values and one child reach
-// ((2A + 1) lists); a chance node keeps two reaches and one child's values.
-StoragePlan plan_storage(const BettingTree& tree, int hands0, int hands1) {
-    const std::array<std::size_t, 2> n{static_cast<std::size_t>(hands0), static_cast<std::size_t>(hands1)};
-    const std::size_t widest = std::max(n[0], n[1]);
-    StoragePlan plan;
-    plan.offset.assign(tree.nodes.size(), 0);
-    for (std::size_t i = 0; i < tree.nodes.size(); ++i) {
-        const TreeNode& node = tree.nodes[i];
-        if (node.kind != NodeKind::Decision) continue;
-        plan.offset[i] = plan.floats;
-        plan.floats += static_cast<std::size_t>(node.child_count) * n[node.player];
-    }
-    std::vector<std::size_t> need(tree.nodes.size(), 0);
-    for (std::size_t i = tree.nodes.size(); i-- > 0;) {
-        const TreeNode& node = tree.nodes[i];
-        std::size_t deepest = 0;
-        for (const int child : tree.children_of(static_cast<int>(i))) {
-            deepest = std::max(deepest, need[static_cast<std::size_t>(child)]);
-        }
-        const auto actions = static_cast<std::size_t>(node.child_count);
-        if (node.kind == NodeKind::Decision) need[i] = (2 * actions + 1) * widest + deepest;
-        if (node.kind == NodeKind::Chance) need[i] = 3 * widest + deepest;
-    }
-    // Ahead of the root's walk: its values, the opponent weight each hand can face,
-    // and one root child's values (for root()).
-    plan.scratch = 3 * widest + need.front();
-    for (const BoardCards& board : tree.boards) plan.full_boards += board.size == 5 ? 1 : 0;
-    return plan;
+std::size_t add_sat(std::size_t a, std::size_t b) {
+    return a > std::numeric_limits<std::size_t>::max() - b ? std::numeric_limits<std::size_t>::max() : a + b;
 }
 
-std::size_t planned_bytes(const BettingTree& tree, const StoragePlan& plan, int hands0, int hands1) {
+std::size_t mul_sat(std::size_t a, std::size_t b) {
+    if (a == 0 || b == 0) return 0;
+    return a > std::numeric_limits<std::size_t>::max() / b ? std::numeric_limits<std::size_t>::max() : a * b;
+}
+
+// Where the floats and scratch go, worked out from the tree's shape and the hand
+// counts alone, so the memory estimate needs neither the tree nor an allocation.
+//
+// Scratch, in doubles, one list = one double per hand of the larger range:
+// - main: what the calling thread's walk needs: three lists ahead of the root's
+//   walk (its values, the opponent weight each hand can face and one root child's
+//   values, for root()) plus TreeShape::walk_lists. A decision node holds 2A + 1
+//   lists, a chance node 3 (its child reaches and one child's values), plus the
+//   deepest child. The calling thread also runs first-layer tasks inside the chance
+//   node's own part of this.
+// - chance: one list per card of the first chance layer, for the per-card values.
+// - workers 1..: each its two child reaches plus the deepest first-layer child.
+struct StorageLayout {
+    std::size_t floats = 0;  // Regret (and strategy sum) entries
+    std::size_t main = 0;
+    std::size_t chance = 0;
+    std::size_t stride = 0;  // Per extra worker
+    int threads = 1;         // After the cap
+
+    std::size_t scratch() const {
+        return add_sat(add_sat(main, chance), mul_sat(static_cast<std::size_t>(threads - 1), stride));
+    }
+};
+
+StorageLayout layout_for(const TreeShape& shape, int hands0, int hands1, int threads) {
+    const std::array<std::size_t, 2> n{static_cast<std::size_t>(hands0), static_cast<std::size_t>(hands1)};
+    const std::size_t widest = std::max(n[0], n[1]);
+    StorageLayout layout;
+    layout.floats = add_sat(mul_sat(shape.player_actions[0], n[0]), mul_sat(shape.player_actions[1], n[1]));
+    layout.main = mul_sat(add_sat(3, shape.walk_lists), widest);
+    if (shape.first_layer_cards > 0) {
+        layout.chance = mul_sat(shape.first_layer_cards, widest);
+        layout.stride = mul_sat(add_sat(2, shape.first_layer_child_lists), widest);
+        const auto cards = static_cast<int>(std::min<std::size_t>(shape.first_layer_cards, 1024));
+        layout.threads = std::clamp(threads, 1, cards);
+    }
+    return layout;
+}
+
+std::size_t planned_bytes(const TreeShape& shape, const StorageLayout& layout, int hands0, int hands1) {
     const auto hands = static_cast<std::size_t>(hands0 + hands1);
-    return tree.bytes() + MatchupHands::bytes_for(hands0, hands1) + hands * sizeof(double) +
-           plan.full_boards * (sizeof(ShowdownTable) + ShowdownTable::bytes_for(hands0, hands1)) +
-           tree.boards.size() * sizeof(int) + tree.nodes.size() * sizeof(std::size_t) +
-           2 * plan.floats * sizeof(float) + plan.scratch * sizeof(double);
+    std::size_t total = shape.bytes();
+    total = add_sat(total, MatchupHands::bytes_for(hands0, hands1) + hands * sizeof(double));
+    total = add_sat(total, mul_sat(shape.full_boards, sizeof(ShowdownTable) + ShowdownTable::bytes_for(hands0, hands1)));
+    total = add_sat(total, mul_sat(shape.checkdown_boards, sizeof(CheckDownTable) + CheckDownTable::bytes_for(hands0, hands1)));
+    total = add_sat(total, mul_sat(shape.boards, 2 * sizeof(int)));
+    total = add_sat(total, mul_sat(shape.nodes, sizeof(std::size_t)));
+    total = add_sat(total, mul_sat(layout.floats, 2 * sizeof(float)));
+    return add_sat(total, mul_sat(layout.scratch(), sizeof(double)));
 }
 
 enum class Pass : std::uint8_t {
@@ -88,6 +101,8 @@ public:
     const MatchupHands* hands = nullptr;
     const std::vector<ShowdownTable>* showdowns = nullptr;
     const std::vector<int>* showdown_of_board = nullptr;
+    const std::vector<CheckDownTable>* checkdowns = nullptr;
+    const std::vector<int>* checkdown_of_board = nullptr;  // Index into checkdowns, or -1
     const std::vector<std::size_t>* offset = nullptr;
     const float* strategy_source = nullptr;  // Train: regrets; otherwise strategy sums
     float* regrets = nullptr;                // Train only
@@ -95,6 +110,12 @@ public:
     DcfrDiscount discount;
     Pass pass = Pass::Average;
     int traverser = 0;
+    // The first chance layer: chance nodes dealing this street run one task per card.
+    Street parallel_street = Street::Preflop;
+    WorkerPool* pool = nullptr;      // Null: the calling thread runs every task
+    double* chance_values = nullptr;  // Per card, one list
+    double* worker_scratch = nullptr;  // Workers 1..: worker_stride doubles each
+    std::size_t worker_stride = 0;
 
     void walk(int index, const double* own, const double* opp, double* out, double* scratch) const {
         const TreeNode& node = tree->nodes[static_cast<std::size_t>(index)];
@@ -116,7 +137,14 @@ public:
                                                                      0.5 * pot - invested, -invested, {out, np});
                 return;
             }
-            case NodeKind::Chance: chance(index, node, own, opp, out, scratch, np, no); return;
+            case NodeKind::CheckDown: check_down(node, opp, out, np, no); return;
+            case NodeKind::Chance:
+                if (node.street == parallel_street) {
+                    parallel_chance(index, node, own, opp, out, scratch, np, no);
+                } else {
+                    chance(index, node, own, opp, out, scratch, np, no);
+                }
+                return;
             case NodeKind::Decision:
                 if (node.player == p) {
                     own_decision(index, node, own, opp, out, scratch, np);
@@ -223,6 +251,49 @@ private:
         const double scale = 1.0 / static_cast<double>(children.size() - 4);
         for (std::size_t h = 0; h < np; ++h) out[h] *= scale;
     }
+
+    // The chance node above, with each card's subtree a task that leaves its values
+    // in its own list of chance_values; the lists are then summed in card order, so
+    // the result does not depend on which worker ran which card.
+    void parallel_chance(int index, const TreeNode& node, const double* own, const double* opp, double* out,
+                         double* scratch, std::size_t np, std::size_t no) const {
+        const int p = traverser;
+        const std::span<const int> children = tree->children_of(index);
+        const auto task = [&](int k, int worker) {
+            double* child_own = worker == 0 ? scratch : worker_scratch + static_cast<std::size_t>(worker - 1) * worker_stride;
+            double* child_opp = child_own + np;
+            double* rest = child_opp + no;
+            double* values = chance_values + static_cast<std::size_t>(k) * np;
+            const auto slot = static_cast<std::size_t>(node.first_child) + static_cast<std::size_t>(k);
+            const int card = tree->dealt[slot].id;
+            std::copy(own, own + np, child_own);
+            std::copy(opp, opp + no, child_opp);
+            for (const int h : hands->with_card(p, card)) child_own[h] = 0.0;
+            for (const int o : hands->with_card(1 - p, card)) child_opp[o] = 0.0;
+            walk(children[static_cast<std::size_t>(k)], child_own, child_opp, values, rest);
+            for (const int h : hands->with_card(p, card)) values[h] = 0.0;
+        };
+        const auto cards = static_cast<int>(children.size());
+        if (pool != nullptr) {
+            pool->run(cards, task);
+        } else {
+            for (int k = 0; k < cards; ++k) task(k, 0);
+        }
+        std::fill(out, out + np, 0.0);
+        for (std::size_t k = 0; k < children.size(); ++k) {
+            const double* values = chance_values + k * np;
+            for (std::size_t h = 0; h < np; ++h) out[h] += values[h];
+        }
+        const double scale = 1.0 / static_cast<double>(children.size() - 4);
+        for (std::size_t h = 0; h < np; ++h) out[h] *= scale;
+    }
+
+    // The river checked down, from the turn board's CheckDownTable.
+    void check_down(const TreeNode& node, const double* opp, double* out, std::size_t np, std::size_t no) const {
+        const double invested = node.invested[static_cast<std::size_t>(traverser)];
+        const int table = (*checkdown_of_board)[static_cast<std::size_t>(node.board)];
+        (*checkdowns)[static_cast<std::size_t>(table)].values(*hands, traverser, {opp, no}, node.pot, invested, {out, np});
+    }
 };
 
 }  // namespace
@@ -233,50 +304,126 @@ SolverMemoryError::SolverMemoryError(std::size_t required, std::size_t limit)
       required_(required),
       limit_(limit) {}
 
-std::size_t PostflopSolver::estimate_bytes(const SolveSpot& spot, const BetAbstraction& abstraction) {
-    const BettingTree tree = build_betting_tree(spot, abstraction);
+std::size_t PostflopSolver::estimate_bytes(const SolveSpot& spot, const BetAbstraction& abstraction, int threads) {
+    const TreeShape shape = count_betting_tree(spot, abstraction);
     const int hands0 = static_cast<int>(hands_in(spot.ranges[0], spot.board).size());
     const int hands1 = static_cast<int>(hands_in(spot.ranges[1], spot.board).size());
-    return planned_bytes(tree, plan_storage(tree, hands0, hands1), hands0, hands1);
+    return planned_bytes(shape, layout_for(shape, hands0, hands1, threads), hands0, hands1);
 }
 
 PostflopSolver::PostflopSolver(SolveSpot spot, BetAbstraction abstraction, SolverLimits limits, DcfrParams params)
     : limits_(limits), params_(params) {
     if (limits.threads < 0) throw std::invalid_argument("solver: threads must not be negative");
-    tree_ = build_betting_tree(spot, abstraction);
+    const TreeShape shape = count_betting_tree(spot, abstraction);
     const std::array<std::vector<int>, 2> combos{hands_in(spot.ranges[0], spot.board),
                                                  hands_in(spot.ranges[1], spot.board)};
     if (combos[0].empty() || combos[1].empty()) throw std::invalid_argument("solver: a range has no hands");
     const int hands0 = static_cast<int>(combos[0].size());
     const int hands1 = static_cast<int>(combos[1].size());
 
-    StoragePlan plan = plan_storage(tree_, hands0, hands1);
-    const std::size_t required = planned_bytes(tree_, plan, hands0, hands1);
+    // The memory check comes before the tree is built.
+    const StorageLayout layout = layout_for(shape, hands0, hands1, limits.threads);
+    const std::size_t required = planned_bytes(shape, layout, hands0, hands1);
     if (required > limits.memory_bytes) throw SolverMemoryError(required, limits.memory_bytes);
 
+    tree_ = build_betting_tree(spot, abstraction);
     hands_ = MatchupHands(combos[0], combos[1]);
     for (std::size_t p = 0; p < 2; ++p) {
         weights_[p].reserve(combos[p].size());
         for (const int combo : combos[p]) weights_[p].push_back(spot.ranges[p].weight(combo));
     }
-    showdowns_.reserve(plan.full_boards);
+    {
+        // Some pair of hands must be dealable together, or nothing has a value.
+        std::vector<double> faced(static_cast<std::size_t>(hands0));
+        fold_values(hands_, 0, weights_[1], 1.0, faced);
+        double mass = 0.0;
+        for (std::size_t h = 0; h < faced.size(); ++h) mass += weights_[0][h] * faced[h];
+        if (!(mass > 0.0)) throw std::invalid_argument("solver: the ranges cannot be dealt together");
+    }
+    threads_ = layout.threads;
+    if (threads_ > 1) pool_ = std::make_unique<WorkerPool>(threads_);
+    build_tables(shape.full_boards, shape.checkdown_boards);
+    const std::array<std::size_t, 2> n{static_cast<std::size_t>(hands0), static_cast<std::size_t>(hands1)};
+    offset_.assign(tree_.nodes.size(), 0);
+    std::size_t floats = 0;
+    for (std::size_t i = 0; i < tree_.nodes.size(); ++i) {
+        const TreeNode& node = tree_.nodes[i];
+        if (node.kind != NodeKind::Decision) continue;
+        offset_[i] = floats;
+        floats += static_cast<std::size_t>(node.child_count) * n[node.player];
+    }
+    if (floats != layout.floats) throw std::logic_error("solver: the layout does not match the tree");
+    regrets_.assign(floats, 0.0f);
+    strategy_sum_.assign(floats, 0.0f);
+    scratch_.assign(layout.scratch(), 0.0);
+    chance_offset_ = layout.main;
+    workers_offset_ = layout.main + layout.chance;
+    worker_stride_ = layout.stride;
+    if (shape.first_layer_cards > 0) {
+        parallel_street_ = static_cast<Street>(static_cast<int>(tree_.root().street) + 1);
+    }
+
+}
+
+PostflopSolver::~PostflopSolver() = default;
+
+void PostflopSolver::build_tables(std::size_t full_boards, std::size_t checkdown_boards) {
     showdown_of_board_.assign(tree_.boards.size(), -1);
+    checkdown_of_board_.assign(tree_.boards.size(), -1);
+    std::vector<int> showdown_boards;
+    std::vector<int> turn_boards;
     for (std::size_t b = 0; b < tree_.boards.size(); ++b) {
         if (tree_.boards[b].size != 5) continue;
-        showdown_of_board_[b] = static_cast<int>(showdowns_.size());
-        showdowns_.emplace_back(hands_, tree_.boards[b].view());
+        showdown_of_board_[b] = static_cast<int>(showdown_boards.size());
+        showdown_boards.push_back(static_cast<int>(b));
     }
-    offset_ = std::move(plan.offset);
-    regrets_.assign(plan.floats, 0.0f);
-    strategy_sum_.assign(plan.floats, 0.0f);
-    scratch_.assign(plan.scratch, 0.0);
+    for (const TreeNode& node : tree_.nodes) {
+        const auto b = static_cast<std::size_t>(node.board);
+        if (node.kind != NodeKind::CheckDown || checkdown_of_board_[b] >= 0) continue;
+        checkdown_of_board_[b] = static_cast<int>(turn_boards.size());
+        turn_boards.push_back(node.board);
+    }
+    if (showdown_boards.size() != full_boards || turn_boards.size() != checkdown_boards) {
+        throw std::logic_error("solver: the tables do not match the tree's shape");
+    }
+    // Reserved first, so the capacities are exact.
+    showdowns_.reserve(showdown_boards.size());
+    showdowns_.resize(showdown_boards.size());
+    checkdowns_.reserve(turn_boards.size());
+    checkdowns_.resize(turn_boards.size());
+    const auto showdown_count = static_cast<int>(showdown_boards.size());
+    const auto task = [&](int k, int) {
+        if (k < showdown_count) {
+            const auto board = static_cast<std::size_t>(showdown_boards[static_cast<std::size_t>(k)]);
+            showdowns_[static_cast<std::size_t>(k)] = ShowdownTable(hands_, tree_.boards[board].view());
+        } else {
+            const auto i = static_cast<std::size_t>(k - showdown_count);
+            const auto board = static_cast<std::size_t>(turn_boards[i]);
+            checkdowns_[i] = CheckDownTable(hands_, tree_.boards[board].view());
+        }
+    };
+    const int tasks = showdown_count + static_cast<int>(turn_boards.size());
+    if (pool_) {
+        pool_->run(tasks, task);
+    } else {
+        for (int k = 0; k < tasks; ++k) task(k, 0);
+    }
+}
 
-    // Some pair of hands must be dealable together, or nothing has a value.
-    std::span<double> faced(scratch_.data(), static_cast<std::size_t>(hands0));
-    fold_values(hands_, 0, weights_[1], 1.0, faced);
-    double mass = 0.0;
-    for (std::size_t h = 0; h < faced.size(); ++h) mass += weights_[0][h] * faced[h];
-    if (!(mass > 0.0)) throw std::invalid_argument("solver: the ranges cannot be dealt together");
+template <typename W>
+void PostflopSolver::attach(W& walker) const {
+    walker.tree = &tree_;
+    walker.hands = &hands_;
+    walker.showdowns = &showdowns_;
+    walker.showdown_of_board = &showdown_of_board_;
+    walker.checkdowns = &checkdowns_;
+    walker.checkdown_of_board = &checkdown_of_board_;
+    walker.offset = &offset_;
+    walker.parallel_street = parallel_street_;
+    walker.pool = pool_.get();
+    walker.chance_values = scratch_.data() + chance_offset_;
+    walker.worker_scratch = scratch_.data() + workers_offset_;
+    walker.worker_stride = worker_stride_;
 }
 
 void PostflopSolver::run(int iterations, std::stop_token stop) {
@@ -286,11 +433,7 @@ void PostflopSolver::run(int iterations, std::stop_token stop) {
         if (stop.stop_requested()) return;
         ++iterations_;
         Walker walker;
-        walker.tree = &tree_;
-        walker.hands = &hands_;
-        walker.showdowns = &showdowns_;
-        walker.showdown_of_board = &showdown_of_board_;
-        walker.offset = &offset_;
+        attach(walker);
         walker.strategy_source = regrets_.data();
         walker.regrets = regrets_.data();
         walker.strategy_sum = strategy_sum_.data();
@@ -307,11 +450,7 @@ void PostflopSolver::run(int iterations, std::stop_token stop) {
 std::array<double, 2> PostflopSolver::best_response_values() const {
     const std::size_t widest = static_cast<std::size_t>(std::max(hands_.size(0), hands_.size(1)));
     Walker walker;
-    walker.tree = &tree_;
-    walker.hands = &hands_;
-    walker.showdowns = &showdowns_;
-    walker.showdown_of_board = &showdown_of_board_;
-    walker.offset = &offset_;
+    attach(walker);
     walker.strategy_source = strategy_sum_.data();
     walker.pass = Pass::BestResponse;
 
@@ -382,11 +521,7 @@ RootSolution PostflopSolver::root() const {
     solution.hand_ev.assign(n, 0.0f);
 
     Walker walker;
-    walker.tree = &tree_;
-    walker.hands = &hands_;
-    walker.showdowns = &showdowns_;
-    walker.showdown_of_board = &showdown_of_board_;
-    walker.offset = &offset_;
+    attach(walker);
     walker.strategy_source = strategy_sum_.data();
     walker.pass = Pass::Average;
     walker.traverser = player;
@@ -418,9 +553,11 @@ RootSolution PostflopSolver::root() const {
 
 std::size_t PostflopSolver::allocated_bytes() const {
     std::size_t total = tree_.bytes() + hands_.bytes() + capacity_bytes(weights_[0]) + capacity_bytes(weights_[1]) +
-                        capacity_bytes(showdowns_) + capacity_bytes(showdown_of_board_) + capacity_bytes(offset_) +
+                        capacity_bytes(showdowns_) + capacity_bytes(showdown_of_board_) + capacity_bytes(checkdowns_) +
+                        capacity_bytes(checkdown_of_board_) + capacity_bytes(offset_) +
                         capacity_bytes(regrets_) + capacity_bytes(strategy_sum_) + capacity_bytes(scratch_);
     for (const ShowdownTable& table : showdowns_) total += table.bytes();
+    for (const CheckDownTable& table : checkdowns_) total += table.bytes();
     return total;
 }
 

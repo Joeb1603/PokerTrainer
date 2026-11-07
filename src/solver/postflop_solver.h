@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <stop_token>
@@ -23,10 +24,13 @@ struct SolveSpot : BettingRoot {
 
 struct SolverLimits {
     std::size_t memory_bytes = std::size_t{2} << 30;
-    // Accepted for the API; the river solve runs on the calling thread, which keeps
-    // results identical for any value. Stage 8 splits chance subtrees over a pool.
+    // Threads for a turn or flop tree, the calling thread included (0 counts as 1),
+    // capped at the cards of the first chance layer. A river tree has no chance node
+    // and always runs on the calling thread. Results are bit-identical for any value.
     int threads = 1;
 };
+
+class WorkerPool;
 
 // Thrown by the constructor, before any large allocation, when a solve would need
 // more than SolverLimits::memory_bytes.
@@ -79,7 +83,20 @@ struct RootSolution {
 // player 1 against player 0's updated one (alternating updates). Regrets and
 // strategy sums are float per (decision node, action, hand); sums inside a pass run
 // in double in a fixed order, so a solve repeats bit for bit. Chance nodes weight
-// each card uniformly over the cards neither player's hand blocks.
+// each card uniformly over the cards neither player's hand blocks; a CheckDown node
+// averages the showdown the same way over the river cards.
+//
+// Threads: the solver owns a WorkerPool, created once in the constructor. Every pass
+// (training, best response, root()) walks the root street on the calling thread;
+// at each chance node of the first chance layer (the turn cards of a flop tree, the
+// river cards of a turn tree) each card's subtree is one task. A task writes only
+// that subtree's regrets and strategy sums (no two cards share a node) and its own
+// slice of a per-card value buffer, using its worker's scratch; the chance node
+// then sums the slices in card order. Every value is therefore computed by the same
+// operations in the same order whatever the thread count, and a solve is
+// bit-identical for any SolverLimits::threads. The same buffered path runs with one
+// thread. An exception in a task is rethrown by the call that ran it; the solver's
+// strategies are then unspecified (destroying it is safe).
 //
 // Not safe for concurrent use: even the const queries share one scratch buffer.
 class PostflopSolver {
@@ -87,14 +104,19 @@ public:
     // Throws std::invalid_argument for an invalid spot (see build_betting_tree), a
     // player with no hands, negative threads or iterations; SolverMemoryError over
     // the memory limit.
+    // Checks the memory estimate before building the tree or allocating anything large.
     PostflopSolver(SolveSpot spot, BetAbstraction abstraction, SolverLimits limits = {}, DcfrParams params = {});
+    ~PostflopSolver();
 
     PostflopSolver(const PostflopSolver&) = delete;
     PostflopSolver& operator=(const PostflopSolver&) = delete;
 
-    // Bytes a solve of this spot holds: the tree, hands, showdown tables, regrets,
-    // strategy sums and scratch. Builds the tree (small) but allocates nothing else.
-    static std::size_t estimate_bytes(const SolveSpot& spot, const BetAbstraction& abstraction);
+    // Bytes a solve of this spot holds with `threads` threads (as SolverLimits): the
+    // tree, hands, showdown tables, regrets, strategy sums and scratch (each extra
+    // thread adds its own). Counted from count_betting_tree without building the
+    // tree, so it is cheap even for a tree far too large to build; equal to
+    // allocated_bytes() on GCC. Throws std::invalid_argument for an invalid spot.
+    static std::size_t estimate_bytes(const SolveSpot& spot, const BetAbstraction& abstraction, int threads = 1);
 
     // Runs up to `iterations` more iterations, checking `stop` before each one.
     void run(int iterations, std::stop_token stop = {});
@@ -114,20 +136,35 @@ public:
     std::vector<float> average_strategy(int node) const;
     // Heap bytes actually held, from capacities: estimate_bytes bounds this.
     std::size_t allocated_bytes() const;
+    int threads() const { return threads_; }  // Threads in use, after the cap
 
 private:
+    // Points a walker (defined in the .cpp) at this solver's tree, tables and buffers.
+    template <typename W>
+    void attach(W& walker) const;
+    // The showdown and check-down tables, one task per table on the pool.
+    void build_tables(std::size_t full_boards, std::size_t checkdown_boards);
+
     BettingTree tree_;
     MatchupHands hands_;
     std::array<std::vector<double>, 2> weights_;
     std::vector<ShowdownTable> showdowns_;
     std::vector<int> showdown_of_board_;  // Index into showdowns_, or -1 for a partial board
+    std::vector<CheckDownTable> checkdowns_;
+    std::vector<int> checkdown_of_board_;  // Index into checkdowns_, or -1
     std::vector<std::size_t> offset_;     // Decision nodes: the first float of the node's block
     std::vector<float> regrets_;
     std::vector<float> strategy_sum_;
     mutable std::vector<double> scratch_;
+    std::size_t chance_offset_ = 0;   // scratch_: the first chance layer's per-card values
+    std::size_t workers_offset_ = 0;  // scratch_: workers 1.. scratch, worker_stride_ each
+    std::size_t worker_stride_ = 0;
+    Street parallel_street_ = Street::Preflop;  // The street the first chance layer deals
     SolverLimits limits_;
     DcfrParams params_;
+    int threads_ = 1;
     int iterations_ = 0;
+    std::unique_ptr<WorkerPool> pool_;  // Last: stopped and joined first
 };
 
 }  // namespace poker
