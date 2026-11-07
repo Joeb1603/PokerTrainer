@@ -1272,6 +1272,52 @@ No defect needed a code change. 491 tests pass in Release and Debug, zero warnin
 
 **Test changes (fixes)** (`tests/trainer_ui_test.cpp`): no assertion changed. `set_solver`'s Done advice now sets `target_pct = 0.8`, so its 1.8% stays converged and `PlayGtoUsesSolverWhenDone`, `PlayGtoUsesHeuristicForArchetypeLines`, `ExistingSidebarButtonsDidNotMove` and `EveryScreenDrawsWithFullData` pass unchanged. New helper `drawn_text()` (every text a frame draws, clipped or not, through ImGui's `LogToBuffer`). New tests: `UiTest.PlayGtoIgnoresAnUnconvergedSolve` (Done at 10% on the turn: the heuristic action and label, the muted note, no "(solver)"; no exploitability: heuristic; exactly 2.4%: solver), `UiTest.SolverHeadingSaysApproximate` (the heading and the long line; "Starting…" and no "0 iterations" while queued) and `SolverUsable.ThreeTimesTheTarget`.
 
+### Stage 9 matchups (`tools/advisor_matchup`), measured on `ebdf99c` plus the tool (committed as `0f0940c`)
+
+**Method.** `tools/advisor_matchup.cpp` puts a tool-only `AdvisorBot` in position 0. It calls `TrainingAdvisor::analyze(view)` and plays either the Baseline action (`hint.action`) or one type line's action (`hint.versus[k].action`), falling back to Baseline if the line is missing; it never was (0 fallbacks in every run). The other five places hold one bot type:
+- **nit:** 5 × `NitBot`, played by the Nit line.
+- **station:** 5 × `LooseBot`, the bot closest to a calling station, played by the Station line.
+- **maniac:** 5 × a tool-only maniac, `ProfileBot` on `loose_profile` with `bluff_freq` 0.6, `value_bet_strength` 0.15 and `bluff_raise_share` 0.6.
+- **gto (information only):** 5 × `GtoBot`, played by every line, to show what a misapplied exploit costs.
+
+The design is paired. Each hand index gets a fresh engine (deck seed), fresh bots (bot seeds) and a fresh advisor (advisor seed), all derived by splitmix64 from (`--seed`, matchup, hand index). Every line plays that same hand from 100 BB stacks, with the button on hand index mod 6. Hero's per-hand chip delta is recorded for each line, and the tool reports bb/100 ± SE per line and the paired difference (line − Baseline) ± the SE of the per-hand differences. After the play diverges, the bots' random streams fall differently, which is part of the noise in the difference. Baseline runs with `archetype_lines` off, which leaves its numbers bit-identical (Stage 5 batch B). Every hand checks that each action is legal and that the six stacks still sum to 6 × 2000.
+
+**Flags used:** `--hands 40000 --matchup <m> --advisor-rollouts 5000 --range-rollouts 3000 --bot-rollouts 5000 --seed 1 --csv <m>.csv`, with `--threads` at its default of 1. These are the game's own rollout settings, not the tool's cheaper defaults (1000 / 1000 / 500), because the runs had time to spare. The four matchups ran as four parallel processes on the 4-core container: nit 812 s, station 1885 s, maniac 1856 s and gto 2473 s, about 41 minutes of wall time. The full and test builds shared the machine for the first few minutes. A 200-hand estimate at the defaults took 2-6 s per matchup.
+
+**Results** (40,000 hands per line, bb/100 with BB = 20 chips):
+
+| Matchup | Hands | Baseline bb/100 | Line bb/100 | Paired diff (line − Baseline) | diff / SE | Decisions where the line differs |
+|---|---|---|---|---|---|---|
+| Nit line vs 5 × NitBot | 40,000 | −7.3 ± 4.0 | +12.5 ± 3.8 | **+19.8 ± 3.8** | +5.1 | 19.2% |
+| Station line vs 5 × LooseBot | 40,000 | +301.9 ± 20.1 | +337.0 ± 24.0 | **+35.0 ± 16.9** | +2.1 | 24.5% |
+| Maniac line vs 5 × maniac | 40,000 | +289.2 ± 20.5 | +476.4 ± 26.5 | **+187.2 ± 19.5** | +9.6 | 18.9% |
+
+Information only, vs 5 × GtoBot (40,000 hands; Baseline −7.7 ± 8.0):
+
+| Line | Line bb/100 | Paired diff | diff / SE | Differs |
+|---|---|---|---|---|
+| Nit | −94.3 ± 8.3 | −86.6 ± 7.9 | −11.0 | 22.0% |
+| Station | +38.6 ± 6.9 | +46.2 ± 6.5 | +7.1 | 19.3% |
+| Maniac | −1.0 ± 10.5 | +6.7 ± 7.8 | +0.9 | 20.4% |
+
+**Acceptance: met, with no retune.** Each type line beats Baseline against its own table, and by more than 2 SE in all three, where the plan needed two. Station clears 2 SE only narrowly (2.08). `ArchetypeParams` are unchanged.
+
+**Stability checks** (from the CSVs; the halves are hands 0-19,999 and 20,000-39,999):
+- **Nit:** +26.9 ± 5.7 in the first half and +12.7 ± 5.2 in the second. The two hands give the same result in 93% of hands.
+- **Station:** +28.9 ± 23.7 and +41.2 ± 24.0, neither half significant alone. The same result in 81% of hands.
+- **Maniac:** +160.9 ± 27.1 and +213.4 ± 28.1. The same result in 83% of hands.
+
+**Interpretation, and what this does not show**
+- **Nit:** the Nit line beats Baseline against Nits, and the same line loses 87 bb/100 against GtoBots. So its gain comes from Nit-specific play, not from a generally better strategy. Misapplying it is expensive, which is the cost the UI's "generic type, not a read" wording should warn about.
+- **Maniac:** the Maniac line's large edge against the maniac (+187) is close to neutral against GtoBots (+7 ± 8). It is mostly a specific exploit with little cost when misapplied, at least against these bots.
+- **Station is only partly specific.** The Station line beats Baseline by more against GtoBots (+46 ± 6.5) than against LooseBots (+35 ± 17). Much of its edge is therefore not Station-specific: the GtoBot also seems to call more, or fold less to value, than Baseline's model assumes. The bots run on random-hand equity with `bet_pressure` and call too wide by range standards, so the "Station" tilt (bigger value bets, fewer bluffs) suits them too. Against LooseBots, the Station gain is not statistically distinguishable from that general effect.
+- **The bots are very exploitable.** Even Baseline wins about 300 bb/100 against LooseBots and maniacs. A real loose player would be harder to beat, and these margins should not be read as real-world win rates.
+- **Not covered by this run:**
+  - The lines were not played against the other types' tables (for example, the Station line against Nits). The only cross-check is the GtoBot table.
+  - The tables are uniform and every hand starts at 100 BB. Mixed tables, deep or short stacks, and session play with busts were not measured.
+  - Results come from one seed. The halves agree in sign, but the Station first-half and second-half differences are individually within 2 SE of zero.
+  - The maniac is a tool-only profile, not one of the game's bots.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -1484,3 +1530,4 @@ No defect needed a code change. 491 tests pass in Release and Debug, zero warnin
   - New `Bench.StreetFieldSetsBoardAndScriptLimits` (0 / 0 ms): `"street"` parsing, the board size per street, a turn file's optional empty `river`, rejecting a river action in a turn file, an unknown street, and a river file without a `river` script.
   - New ctest `advisor_bench_turn_smoke` (0.19 / 1.1 s): one turn spot end to end, 20 iterations on 2 threads.
 - **`SolverService.NewDecisionCancelsQuickly`** (Stage 8 batch E follow-up): the cancel-latency bound went from < 200 ms to < 1000 ms. Measured latency is 6-8 ms in Release, but it hit 216 ms under ThreadSanitizer with a bench running alongside. The looser bound avoids failures on loaded or slow machines, and a full flop iteration (about 4 s) still fails it.
+- **Stage 9 batch A** (`CMakeLists.txt`): new ctest `advisor_matchup_smoke`, which runs `advisor_matchup --hands 6 --matchup all --advisor-rollouts 200 --range-rollouts 200 --bot-rollouts 100` (0.7 s Release, 2.2 s Debug, both measured while the matchup runs loaded the machine). It plays every matchup and line, and fails (exit 1) on an illegal action or when the six stacks don't sum to 6 × 2000 after a hand. No existing test changed.
