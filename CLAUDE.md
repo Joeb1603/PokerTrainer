@@ -104,7 +104,7 @@ Implement `HandLogger` writing one single-line JSON object per completed hand to
 
 ## 8. Current Status
 
-All five phases are complete, and v1.0.0 has been released. Later work added the hand name, Play GTO, Fold Early, Reveal Bot Hands, bet percentages, and the 25/50/75/Pot sizing ladder. Sections 1-7 are the original specification, except where section 5 was updated for the ladder and given a note on range equity; the rest of this file records how it was built.
+All five phases are complete. Releases: `v.1.0.0` (the initial release); `v1.1.0` (the hand name, Play GTO, Fold Early, Reveal Bot Hands, bet percentages, and the 25/50/75/Pot sizing ladder); and `v1.2.0` (the advisor upgrade below, built and published by the release workflow in section 9). Sections 1-7 are the original specification, except where section 5 was updated for the ladder and given a note on range equity; the rest of this file records how it was built.
 
 The advisor upgrade (range-based advice, player-type advice, solver mode) is done. `docs/advisor-upgrade-notes.md` is its decision log: every decision, deviation, measurement, unverified item and test change. Read it before changing the advisor, range model or solver. What it added:
 - **Range model** (`src/range`): combos, weighted ranges, exact per-combo equity vectors on every postflop street, a 169×169 preflop class matrix, and range inference from public actions for four generic player types: Baseline, Nit, Station, Maniac (`range_model.h`).
@@ -135,6 +135,13 @@ ctest --test-dir build -C Release --output-on-failure -j 8
   - `gen_preflop_tables` (about 200 s on 4 threads) and `gen_push_fold` (about 3 s) regenerate the committed tables in `src/range/generated` and `src/strategy/generated`, byte for byte.
   - `tools/advisor_matchup`: plays each player-type line against the bots, paired with Baseline, and reports bb/100.
 - Sanitizers (Linux, GCC): configure a separate build with `-DPOKER_BUILD_APP=OFF`, `-DCMAKE_BUILD_TYPE=RelWithDebInfo` and `CMAKE_CXX_FLAGS`/`CMAKE_C_FLAGS`/`CMAKE_EXE_LINKER_FLAGS` set to `-fsanitize=thread`, or to `-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined`, then run its `ctest`. Timing tests such as `SolverService.NewDecisionCancelsQuickly` can miss their bounds under TSan when the machine is busy; rerun them alone.
+- **Releases:** `.github/workflows/release.yml` builds and publishes them. It runs only by hand, from the Actions tab: "Windows release" > "Run workflow", with a tag, a title and a "publish" switch.
+  - It builds with MSVC on `windows-latest` (Visual Studio 2022, x64) in Release and Debug.
+  - It fails on any compiler or linker warning outside `_deps` (`.github/scripts/check-warnings.ps1`).
+  - It runs the full ctest suite in both configurations.
+  - With "publish" on, it creates the tag and the release from `.github/release-notes/<tag>.md`, with `poker_trainer.exe` attached.
+  - To release: write and push the notes file first, then run once with "publish" off to check, then again with it on.
+  - The GitHub tools available to Claude can't create a release directly, but they can trigger this workflow and read its logs.
 - Windowless UI tests are in `tests/trainer_ui_test.cpp`. They inject ImGui input at fixed coordinates, so layout changes mean updating those constants.
 - `main.cpp` has developer flags for reaching rare screens: `--seed`, `--log-dir`, `--exit-after-frames`, `--auto-shove`, `--stop-on live-side-pot|side-pot|showdown|flop|bust`, `--reveal`, `--bot-delay MS`, `--solver`, `--solver-budget MS`, `--solver-tier off|river|turn|flop`.
 - More developer flags for reviewing the UI: `--advice baseline|nit|station|maniac` (initial "Advice:" choice), `--hover X,Y` (holds the ImGui mouse there, for tooltips), `--size WxH` (window size, at least 1180x760), and `--screenshot PATH` (saves the last frame as a PNG, with `--exit-after-frames` or on close; works under `xvfb-run` on Linux).
@@ -183,7 +190,10 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - Fold Early has effectively no cancel window, because bots finish acting within a frame of arming it.
 - The sizing distribution is measured only for heads-up spots with no bet to face.
 - New Session has no confirmation, and quitting mid-hand can make the summary's `hands` count one higher than the logged hands.
-- **Unverified on Windows:** MSVC `/W4` builds of the upgrade, the Windows executable, `GlobalMemoryStatusEx` memory detection, Windows fonts and DPI scales other than 1 for the new UI. All measurements and screenshots come from a 4-core Linux container (Mesa under Xvfb).
+- **Windows:** the release workflow builds the upgrade with MSVC `/W4` with zero warnings in project code, and passes all 495 tests in Release and Debug on `windows-latest`.
+  - Those tests also call `GlobalMemoryStatusEx`, in `Hardware.DetectReturnsSomethingSane`.
+  - Not yet checked: running the app on a real Windows PC, Windows fonts and DPI scales other than 1 for the new UI, and the solver tiers on real Windows hardware.
+  - The benchmarks, timings and screenshots all come from a 4-core Linux container (Mesa under Xvfb).
 - Sanitizers have run only on Linux with GCC: ThreadSanitizer, and AddressSanitizer with UBSan, over the whole core test suite and a threaded turn-bench solve, with nothing reported. MSVC builds, clang's sanitizers and a Debug ASan build have not been run.
 
 **Range model and advice**
@@ -208,5 +218,5 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - Work directly on `main`. Don't create feature branches or pull requests, even if a session starts on another branch: switch to `main` first and push there.
 - When asked to analyze or plan, don't implement until told to go ahead.
 - Check poker math with real numbers before changing it, and report anything not verified.
-- Release tags should use `vX.Y.Z`. The first release's tag is `v.1.0.0`, with an extra dot, and `project(VERSION)` in `CMakeLists.txt` still says 0.1.0.
+- Release tags should use `vX.Y.Z`, as `v1.1.0` and `v1.2.0` do. The first release's tag is `v.1.0.0`, with an extra dot. `project(VERSION)` in `CMakeLists.txt` still says 0.1.0.
 

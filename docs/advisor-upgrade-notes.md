@@ -18,7 +18,7 @@
 - **Tests:** 355 at `e531106`, 495 at the end, passing in Release and Debug with zero GCC and clang warnings. ThreadSanitizer and AddressSanitizer + UBSan (GCC) reported nothing over the whole suite (Stage 8 batch E).
 
 **Where the caveats are**
-- "Unverified" below, per stage: chiefly MSVC `/W4` and the Windows build (never compiled here), Windows memory detection, hand-written bench ranges, type lines checked only against the bots, and judgment constants in the range model.
+- "Unverified" below, per stage: chiefly running the app on a real Windows PC (MSVC `/W4` and the Windows tests now pass in the release workflow; see "Release v1.2.0"), hand-written bench ranges, type lines checked only against the bots, and judgment constants in the range model.
 - "Stage 5 tuning" (overfitting caveat), "Stage 8 batch E" (the mixed holdout), "Stage 9 matchups" (what the matchups do not show) and the "Found, not fixed" lists in the stage reviews.
 - CLAUDE.md section 12 keeps the user-facing list of known limits.
 
@@ -1369,10 +1369,20 @@ Over the whole upgrade, `git diff e531106..HEAD`.
 
 **Results after the fixes:** 495 tests pass in Release (12.0 s wall) and Debug (48 s wall); GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `main.cpp`, `hardware.cpp` and `solver_test.cpp`; `advisor_bench` is unchanged at 0.694 BB and 57%.
 
+### Release v1.2.0 and the first Windows build
+
+- **Workflow:** `.github/workflows/release.yml` (commit `3dcdcfa`) builds with MSVC on GitHub's `windows-latest` runner (Visual Studio 2022, x64). It fails on any warning in project code and runs the full ctest suite in Release and Debug.
+- **Dry run** ([run 1](https://github.com/Joeb1603/PokerTrainer/actions/runs/42365438081)): it was the first MSVC build of the upgrade.
+  - Both configurations built with zero warnings in project code.
+  - All 495 tests passed in Release (17 s) and in Debug, with the 10 disabled reports skipped.
+  - `Hardware.DetectReturnsSomethingSane` ran `GlobalMemoryStatusEx` there and got known, consistent RAM figures.
+- **Publishing run** ([run 2](https://github.com/Joeb1603/PokerTrainer/actions/runs/42366692413)): it repeated the checks and published [v1.2.0](https://github.com/Joeb1603/PokerTrainer/releases/tag/v1.2.0) with `poker_trainer.exe` (2.2 MB) attached.
+- **Still not checked:** the GUI on a real Windows PC, Windows fonts and DPI scaling, and the solver tiers on real Windows hardware.
+
 ## Unverified
 
-- MSVC `/W4` builds and the Windows executable.
-- Windows memory detection for solver tiers (`GlobalMemoryStatusEx`).
+- ~~MSVC `/W4` builds and the Windows executable.~~ Resolved by the release workflow (see "Release v1.2.0"). The exe has not been run on a real Windows PC.
+- Windows memory detection for solver tiers (`GlobalMemoryStatusEx`): it runs on the Windows runner in `Hardware.DetectReturnsSomethingSane`. Tiers on real Windows hardware are unchecked.
 - Real GLFW mouse and keyboard input, which the spec's existing known limit already covers.
 - The combo tables (`combos.cpp`) are built at run time behind a function-local static rather than with `constexpr`, to stay clear of MSVC's constexpr step limit. Whether MSVC would actually hit that limit wasn't tested.
 - The multiway redraw cap (16,384) and the flop threading threshold (64 needed combos) were chosen, not tuned.
