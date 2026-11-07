@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -555,7 +556,11 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
         if (ImGui::Button("All-In", {u(68.0f), 0.0f})) raise_to_ = legal.max_raise_to;
         ImGui::EndDisabled();
 
-        if (s.hint) {
+        if (const SolverAdvice* solved = solver_advice()) {
+            // Solver mode, Baseline selected and the solve for this decision done.
+            const std::string gto_label = "Play GTO: " + solved->best_label + " (solver)";
+            if (ImGui::Button(gto_label.c_str(), {u(420.0f), u(30.0f)})) chosen = solved->best;
+        } else if (s.hint) {
             // Follows the "Advice:" selector; Baseline when no line is selected or available.
             const AdviceLine* line = selected_line(*s.hint);
             const std::string name = line ? "Play vs " + label_of(line->versus) : "Play GTO";
@@ -598,7 +603,7 @@ void TrainerUi::draw_sidebar(float x, float y, float w, float h) {
     }
     ImGui::EndDisabled();
     ImGui::Checkbox("Training Advisor", &show_advisor_);
-    // The rest of this row is kept free for the solver-mode checkbox (stage 8).
+    draw_solver_toggle();
     draw_advice_selector();
     ImGui::Separator();
 
@@ -642,6 +647,23 @@ const AdviceLine* TrainerUi::selected_line(const HintRecommendation& hint) const
 }
 
 void TrainerUi::draw_advisor() {
+    if (!controller_.solver_enabled()) {
+        draw_advisor_body(false);
+        return;
+    }
+    // Solver mode adds a section, so the panel scrolls when it would leave the action
+    // log less than a few lines; and while a solve applies, the heuristic reasoning
+    // moves into the action's tooltip.
+    const SolverState state = controller_.snapshot().solver.progress.state;
+    const bool compact = state == SolverState::Running || state == SolverState::Done;
+    const float max_h = std::max(u(120.0f), ImGui::GetContentRegionAvail().y - u(100.0f));
+    ImGui::SetNextWindowSizeConstraints({0.0f, 0.0f}, {FLT_MAX, max_h});
+    ImGui::BeginChild("##advisor", {0.0f, 0.0f}, ImGuiChildFlags_AutoResizeY);
+    draw_advisor_body(compact);
+    ImGui::EndChild();
+}
+
+void TrainerUi::draw_advisor_body(bool compact) {
     const TableSnapshot& s = controller_.snapshot();
     if (s.hint) {
         const HintRecommendation& hint = *s.hint;
@@ -654,13 +676,17 @@ void TrainerUi::draw_advisor() {
         ImGui::TextWrapped("%s", heading.c_str());
         ImGui::PopStyleColor();
         ImGui::PopFont();
+        if (compact) {
+            const std::string tip = line ? line->why + "\n\nBaseline: " + hint.rationale : hint.rationale;
+            wrapped_tooltip(tip.c_str());
+        }
         if (line) {
-            wrapped_tooltip(line->why.c_str());
+            if (!compact) wrapped_tooltip(line->why.c_str());
             if (line->best_action != hint.best_action) {
                 ImGui::TextColored(kMutedText, "Baseline: %s", hint.best_action.c_str());
             }
             // Also under the action, unless that would squeeze the action log too much.
-            if (ImGui::GetContentRegionAvail().y >= u(560.0f)) ImGui::TextWrapped("%s", line->why.c_str());
+            if (!compact && ImGui::GetContentRegionAvail().y >= u(560.0f)) ImGui::TextWrapped("%s", line->why.c_str());
         } else if (advice_focus_ != Archetype::Baseline) {
             ImGui::TextColored(kMutedText, "No %s line here; showing Baseline.", label_of(advice_focus_).c_str());
         }
@@ -686,7 +712,9 @@ void TrainerUi::draw_advisor() {
         }
 
         // Baseline's reasoning; muted when another line leads.
-        if (line) {
+        if (compact) {
+            // In the heading's tooltip instead
+        } else if (line) {
             ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
             ImGui::TextWrapped("Baseline: %s", hint.rationale.c_str());
             ImGui::PopStyleColor();
@@ -751,11 +779,14 @@ void TrainerUi::draw_advisor() {
             }
         }
 
+        if (controller_.solver_enabled()) draw_solver();
+
         ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
         ImGui::TextWrapped("Heuristic EVs vs assumed ranges, with a rule for bet size. Not solver output.");
         ImGui::PopStyleColor();
     } else {
         ImGui::TextColored(kMutedText, "Hints appear when it is your turn.");
+        if (controller_.solver_enabled()) draw_solver();  // The budget can be set between decisions
     }
 
     for (const HeroMistake& mistake : s.hand_mistakes) {
@@ -767,6 +798,122 @@ void TrainerUi::draw_advisor() {
         ImGui::PopStyleColor();
     }
     ImGui::Separator();
+}
+
+void TrainerUi::draw_solver_toggle() {
+    // Beside the advisor toggle, so the rows below stay where they were. The solver's
+    // output only shows, and Play GTO only follows it, while the advisor is shown.
+    const SolverPanel& panel = controller_.snapshot().solver;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!panel.available);
+    bool enabled = controller_.solver_enabled();
+    if (ImGui::Checkbox("Solver mode", &enabled)) controller_.set_solver_enabled(enabled);
+    ImGui::EndDisabled();
+    const std::string tip =
+        panel.available
+            ? panel.hardware_summary + ".\n\nSolves your heads-up postflop decisions in the background with an approximate "
+                                       "equilibrium solver (simplified bet sizes, assumed Baseline ranges), shown in the "
+                                       "advisor panel. Preflop and multiway spots keep the heuristic advice."
+            : "Unavailable on this machine: " + panel.hardware_summary + ".";
+    wrapped_tooltip(tip.c_str());  // Shown while disabled too (ImGui's tooltip flags allow it)
+}
+
+const SolverAdvice* TrainerUi::solver_advice() const {
+    const TableSnapshot& s = controller_.snapshot();
+    const SolverProgress& progress = s.solver.progress;
+    if (!show_advisor_ || advice_focus_ != Archetype::Baseline || !controller_.solver_enabled()) return nullptr;
+    if (s.phase != ControllerPhase::HeroToAct || progress.state != SolverState::Done || !progress.advice) return nullptr;
+    return &*progress.advice;
+}
+
+void TrainerUi::draw_solver() {
+    const TableSnapshot& s = controller_.snapshot();
+    const SolverPanel& panel = s.solver;
+    const SolverProgress& progress = panel.progress;
+    ImGui::Separator();
+
+    // Budget, in whole seconds. The flop tier goes to the full flop tree's minimum.
+    const bool flop_tier = panel.tier == SolverTier::Flop;
+    const int max_s = flop_tier ? kFlopFullMinBudgetMs / 1000 : 30;
+    int budget_s = std::clamp((controller_.solver_budget_ms() + 500) / 1000, 2, max_s);
+    const char* format = flop_tier && budget_s * 1000 >= kFlopFullMinBudgetMs ? "Budget %d s (full flop)" : "Budget %d s";
+    ImGui::SetNextItemWidth(u(150.0f));
+    if (ImGui::SliderInt("##solver_budget", &budget_s, 2, max_s, format, ImGuiSliderFlags_AlwaysClamp)) {
+        controller_.set_solver_budget_ms(budget_s * 1000);
+    }
+    wrapped_tooltip(flop_tier ? "Solver time per decision, from the next decision on. A full flop solve needs at least "
+                                "120 s; shorter budgets use the approximate flop tree (no river betting)."
+                              : "Solver time per decision, from the next decision on.");
+
+    switch (progress.state) {
+        case SolverState::Off:
+            return;
+        case SolverState::NotApplicable:
+        case SolverState::Failed:
+            ImGui::PushStyleColor(ImGuiCol_Text, progress.state == SolverState::Failed ? kWarnText : kMutedText);
+            ImGui::TextWrapped("%s", progress.note.c_str());
+            ImGui::PopStyleColor();
+            return;
+        case SolverState::Running:
+        case SolverState::Done:
+            break;
+    }
+
+    const bool done = progress.state == SolverState::Done;
+    ImGui::SameLine();
+    ImGui::ProgressBar(done ? 1.0f : static_cast<float>(std::clamp(progress.progress, 0.0, 1.0)), {-1.0f, 0.0f},
+                       done ? "Done" : nullptr);
+
+    // "Turn: 340 iterations, exploitability 1.8% of pot"
+    const std::string street = progress.advice ? progress.advice->street_label : progress.note;
+    char status[160];
+    if (progress.exploitability_pct) {
+        std::snprintf(status, sizeof status, "%s: %d iterations, exploitability %.1f%% of pot", street.c_str(),
+                      progress.iterations, *progress.exploitability_pct);
+    } else {
+        std::snprintf(status, sizeof status, "%s: %d iterations", street.c_str(), progress.iterations);
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
+    ImGui::TextWrapped("%s", status);
+    ImGui::PopStyleColor();
+    wrapped_tooltip(
+        "Exploitability: how much a perfect opponent could gain against this strategy, as a share of the pot. Lower is "
+        "closer to equilibrium.");
+
+    if (done && progress.advice) {
+        const SolverAdvice& advice = *progress.advice;
+        ImGui::PushFont(fonts_.bold);
+        ImGui::PushStyleColor(ImGuiCol_Text, kAccentText);
+        ImGui::TextWrapped("Solver: %s (most frequent)", advice.best_label.c_str());
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+
+        // Action | freq | EV, in the tree's order (the panel scrolls if it is too tall).
+        if (ImGui::BeginTable("##solver", 3, ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("action", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("freq", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableSetupColumn("ev", ImGuiTableColumnFlags_WidthFixed);
+            for (const SolverOption& option : advice.options) {
+                const bool best = option.label == advice.best_label;
+                const ImVec4 color = best ? kAccentText : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextColored(color, "%s", option.label.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextColored(color, "%3.0f%%", option.freq * 100.0);
+                ImGui::TableNextColumn();
+                const double rounded = std::round(option.ev_chips);
+                ImGui::TextColored(color, "%+.0f", rounded == 0.0 ? 0.0 : rounded);  // No "-0"
+            }
+            ImGui::EndTable();
+        }
+        wrapped_tooltip("How often the solver's strategy takes each action with your hand, and what each is worth in chips "
+                        "from here.");
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
+    ImGui::TextWrapped("Approximate solver: simplified bet sizes, assumed ranges.");
+    ImGui::PopStyleColor();
 }
 
 void TrainerUi::draw_action_log() {

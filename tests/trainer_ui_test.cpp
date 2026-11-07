@@ -36,6 +36,12 @@ constexpr ImVec2 kPlayGto{100.0f, kConsoleTop + 88.0f};
 constexpr ImVec2 kFoldEarly{100.0f, kConsoleTop + 27.0f};
 constexpr ImVec2 kReveal{356.0f, kConsoleTop + 27.0f};  // Right of Next Hand
 constexpr ImVec2 kAdvisorToggle{1037.0f, 97.0f};
+// Solver mode: beside the advisor toggle, on the same row.
+constexpr ImVec2 kSolverToggle{1200.0f, 97.0f};
+// The solver budget slider's two ends (150 px from the sidebar's left), with set_lines()'s
+// hint and the solve running (its rationale moves into a tooltip).
+constexpr ImVec2 kSolverBudgetMin{1030.0f, 341.0f};
+constexpr ImVec2 kSolverBudgetMax{1176.0f, 341.0f};
 // The "Advice:" selector under the advisor toggle: two rows of two radio buttons.
 constexpr ImVec2 kAdviceBaseline{1095.0f, 120.0f};
 constexpr ImVec2 kAdviceNit{1182.0f, 120.0f};
@@ -173,6 +179,22 @@ protected:
         return sidebar != nullptr && ImGui::GetCurrentContext()->HoveredIdPreviousFrame == sidebar->GetID(label);
     }
 
+    // True if the item under `pos` in the advisor panel (a child window of the sidebar
+    // while solver mode is on) has this ID label.
+    bool advisor_item_is(ImVec2 pos, const char* label) {
+        for (int i = 0; i < 3; ++i) frame();  // The child sizes itself from the frames before
+        ImGui::GetIO().AddMousePosEvent(pos.x, pos.y);
+        frame();
+        frame();
+        for (ImGuiWindow* window : ImGui::GetCurrentContext()->Windows) {
+            if (std::string(window->Name).rfind("Sidebar/##advisor", 0) == 0 &&
+                ImGui::GetCurrentContext()->HoveredIdPreviousFrame == window->GetID(label)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // A Baseline hint plus the three archetype lines, each with a different action.
     void set_lines() {
         set_hint({ActionType::Raise, 500});
@@ -193,6 +215,37 @@ protected:
         hint.versus = {line(Archetype::Nit, "CALL", {ActionType::Call}),
                        line(Archetype::Station, "RAISE to 300 (50% Pot)", {ActionType::Raise, 300}),
                        line(Archetype::Maniac, "FOLD", {ActionType::Fold})};
+    }
+
+    // Solver mode on, available, and the solve for this decision in `state`. Done comes
+    // with advice whose most frequent action is a call.
+    void set_solver(SolverState state, SolverTier tier = SolverTier::Turn) {
+        fake_.solver_on = true;
+        SolverPanel& panel = fake_.table.solver;
+        panel.available = true;
+        panel.tier = tier;
+        panel.hardware_summary = "4 threads, 15.6 GB free: solves river and turn, flop approximate";
+        SolverProgress& progress = panel.progress;
+        progress = {};
+        progress.state = state;
+        progress.progress = state == SolverState::Done ? 1.0 : 0.4;
+        progress.iterations = 340;
+        progress.exploitability_pct = 1.8;
+        progress.note = state == SolverState::NotApplicable ? "Heads-up postflop only: showing heuristic advice (multiway)"
+                        : state == SolverState::Failed      ? "Solver failed: out of memory"
+                                                            : "Turn";
+        if (state == SolverState::Done) {
+            SolverAdvice advice;
+            advice.options = {{"FOLD", {ActionType::Fold}, 0.1, 0.0},
+                              {"CALL 100", {ActionType::Call}, 0.62, 41.6},
+                              {"RAISE to 300 (50% Pot)", {ActionType::Raise, 300}, 0.2, 38.0},
+                              {"RAISE to 500 (100% Pot)", {ActionType::Raise, 500}, 0.08, 30.2},
+                              {"ALL-IN 1000", {ActionType::AllIn}, 0.0, -12.4}};
+            advice.best = {ActionType::Call};
+            advice.best_label = "CALL 100";
+            advice.street_label = "Turn";
+            progress.advice = advice;
+        }
     }
 
     void set_hint(const Action& action) {
@@ -501,15 +554,33 @@ TEST_F(UiTest, EveryScreenDrawsWithFullData) {
     t.seats[kHeroSeat].visible_hole = std::array<Card, 2>{ace, two};
     t.seats[2].shown_hand = "Pair of Aces";
 
-    for (const ControllerPhase phase : {ControllerPhase::HeroToAct, ControllerPhase::BotToAct,
-                                        ControllerPhase::HandComplete, ControllerPhase::SessionOver}) {
-        t.phase = phase;
-        t.waiting_on = "Nit";
-        for (int focus = 0; focus < kArchetypeCount; ++focus) {
-            ui_->set_advice_focus(static_cast<Archetype>(focus));
-            for (int i = 0; i < 3; ++i) frame();
+    const auto every_phase = [&] {
+        for (const ControllerPhase phase : {ControllerPhase::HeroToAct, ControllerPhase::BotToAct,
+                                            ControllerPhase::HandComplete, ControllerPhase::SessionOver}) {
+            t.phase = phase;
+            t.waiting_on = "Nit";
+            for (int focus = 0; focus < kArchetypeCount; ++focus) {
+                ui_->set_advice_focus(static_cast<Archetype>(focus));
+                for (int i = 0; i < 3; ++i) frame();
+            }
+        }
+    };
+    every_phase();
+
+    // Solver mode in every state, on each tier, with a status line long enough to wrap.
+    for (const SolverState state : {SolverState::Off, SolverState::NotApplicable, SolverState::Running,
+                                    SolverState::Done, SolverState::Failed}) {
+        for (const SolverTier tier : {SolverTier::River, SolverTier::Turn, SolverTier::Flop}) {
+            set_solver(state, tier);
+            if (t.solver.progress.advice) t.solver.progress.advice->street_label = "Flop (approximate: no river betting)";
+            t.hint = hint;
+            every_phase();
         }
     }
+    t.solver.progress.exploitability_pct.reset();
+    every_phase();
+    t.solver = {};  // Unavailable, with the mode still on
+    every_phase();
     EXPECT_GT(ImGui::GetDrawData()->TotalVtxCount, 0);
 }
 
@@ -575,11 +646,107 @@ TEST_F(UiTest, ExistingSidebarButtonsDidNotMove) {
     EXPECT_TRUE(sidebar_item_is(kAdviceStation, "Station"));
     EXPECT_TRUE(sidebar_item_is(kAdviceManiac, "Maniac"));
 
+    // Solver mode adds its checkbox beside the toggle and a section under the panel.
+    for (const SolverState state : {SolverState::Running, SolverState::Done}) {
+        set_solver(state);
+        EXPECT_TRUE(sidebar_item_is(kSolverToggle, "Solver mode"));
+        EXPECT_TRUE(sidebar_item_is(kNewSession, "New Session / Reset Freezeout"));
+        EXPECT_TRUE(sidebar_item_is(kAdvisorToggle, "Training Advisor"));
+        EXPECT_TRUE(sidebar_item_is(kAdviceBaseline, "Baseline"));
+        EXPECT_TRUE(sidebar_item_is(kAdviceManiac, "Maniac"));
+    }
+    fake_.solver_on = false;
+    fake_.table.solver = {};
+
     click(kNewSession);
     EXPECT_EQ(fake_.new_session_calls, 1);
     click(kAdvisorToggle);
     EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO"));
     EXPECT_TRUE(fake_.submitted.empty());
+}
+
+TEST_F(UiTest, SolverToggleCallsController) {
+    fake_.table.solver.available = true;
+    EXPECT_TRUE(sidebar_item_is(kSolverToggle, "Solver mode"));
+    click(kSolverToggle);
+    EXPECT_TRUE(fake_.solver_on);
+    click(kSolverToggle);
+    EXPECT_FALSE(fake_.solver_on);
+    EXPECT_TRUE(fake_.submitted.empty());
+}
+
+TEST_F(UiTest, SolverToggleDisabledWhenUnavailable) {
+    fake_.table.solver.available = false;
+    fake_.table.solver.hardware_summary = "1 thread, 0.5 GB free: solver unavailable (needs 2 threads and 1 GB free)";
+    click(kSolverToggle);
+    EXPECT_FALSE(fake_.solver_on);
+
+    // Its tooltip still explains why.
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(kSolverToggle.x, kSolverToggle.y);
+    for (int i = 0; i < 30; ++i) frame();
+    ImGuiWindow* tooltip = ImGui::FindWindowByName("##Tooltip_00");
+    EXPECT_TRUE(tooltip != nullptr && tooltip->LastFrameActive == ImGui::GetFrameCount());
+}
+
+// The budget slider's ends, in a hint with a one-line rationale: 2 to 30 s, or to the
+// full flop tree's 120 s on the flop tier.
+TEST_F(UiTest, SolverBudgetSliderSetsTheBudget) {
+    set_lines();
+    set_solver(SolverState::Running);
+    EXPECT_TRUE(advisor_item_is(kSolverBudgetMax, "##solver_budget"));
+    EXPECT_TRUE(advisor_item_is(kSolverBudgetMin, "##solver_budget"));
+    click(kSolverBudgetMax);
+    EXPECT_EQ(fake_.solver_budget, 30000);
+    click(kSolverBudgetMin);
+    EXPECT_EQ(fake_.solver_budget, 2000);
+
+    set_solver(SolverState::Running, SolverTier::Flop);
+    click(kSolverBudgetMax);
+    EXPECT_EQ(fake_.solver_budget, 120000);
+}
+
+TEST_F(UiTest, PlayGtoUsesSolverWhenDone) {
+    set_hint({ActionType::Raise, 500});
+    set_solver(SolverState::Done);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: CALL 100 (solver)"));
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Call);
+}
+
+TEST_F(UiTest, PlayGtoUsesHeuristicWhileRunning) {
+    set_hint({ActionType::Raise, 500});
+    for (const SolverState state : {SolverState::Running, SolverState::NotApplicable, SolverState::Failed}) {
+        set_solver(state);
+        fake_.submitted.clear();
+        EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: RAISE to 500 (100% Pot)"));
+        click(kPlayGto);
+        expect_single_action(fake_, ActionType::Raise, 500);
+    }
+
+    // A finished solve counts only while solver mode is on.
+    set_solver(SolverState::Done);
+    fake_.solver_on = false;
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: RAISE to 500 (100% Pot)"));
+}
+
+// The solver assumes Baseline ranges, so an archetype line keeps its own action; and
+// with the advisor hidden, the solver has no effect.
+TEST_F(UiTest, PlayGtoUsesHeuristicForArchetypeLines) {
+    set_lines();
+    set_solver(SolverState::Done);
+    click(kAdviceStation);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play vs Station: RAISE to 300 (50% Pot)"));
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Raise, 300);
+
+    fake_.submitted.clear();
+    click(kAdviceBaseline);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: CALL 100 (solver)"));
+    click(kAdvisorToggle);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO"));
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Raise, 500);
 }
 
 TEST_F(UiTest, TooltipAppearsOnHover) {

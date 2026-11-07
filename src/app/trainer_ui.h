@@ -38,9 +38,19 @@ private:
     void draw_sidebar(float x, float y, float w, float h);
     void draw_advice_selector();
     void draw_advisor();
+    // compact: the reasoning goes into the heading's tooltip (solver mode, to make room).
+    void draw_advisor_body(bool compact);
     // The selected archetype line, or nullptr for Baseline (also when the hint has
     // no lines, so the advice falls back to Baseline).
     const AdviceLine* selected_line(const HintRecommendation& hint) const;
+    // Solver mode: the checkbox beside the advisor toggle, and the section at the
+    // bottom of the advisor panel.
+    void draw_solver_toggle();
+    void draw_solver();
+    // The finished solve for Hero's current decision, when Play GTO should follow it:
+    // solver mode on, the advisor shown and Baseline selected (the solver assumes
+    // Baseline ranges). Otherwise nullptr, and the heuristic line is played.
+    const SolverAdvice* solver_advice() const;
     void draw_action_log();
     void handle_shortcuts();
 

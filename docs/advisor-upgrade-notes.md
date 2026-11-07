@@ -1120,6 +1120,45 @@ Every street also has all-in, and the flop tiers raise all-in only.
 - `SolverService::solve` is public and static, so tests and the timing report can run a job synchronously.
 - `SolverLimits::interrupt` is new solver API.
 
+### Stage 8 batch D (solver mode UI), uncommitted, on top of the batches B and C work
+
+**What it adds:** the "Solver mode" checkbox, a solver section in the advisor panel, and Play GTO following a finished solve. UI and tests only: no change to the controller, service, solver, advisor, snapshot or JSONL schema. The UI reads only `IGameController` (`solver_enabled`, `solver_budget_ms` and their setters) and `TableSnapshot::solver`.
+
+**Sidebar**
+- "Solver mode" sits on the Training Advisor row (`SameLine`), so `kNewSession`, `kAdvisorToggle` and the "Advice:" radios do not move. It shows `controller.solver_enabled()` and calls `set_solver_enabled`.
+- Disabled (`BeginDisabled`) when `solver.available` is false. Its tooltip shows while disabled too (ImGui's tooltip flags include `AllowWhenDisabled`):
+  - available: the hardware summary, then "Solves your heads-up postflop decisions in the background with an approximate equilibrium solver (simplified bet sizes, assumed Baseline ranges), shown in the advisor panel. Preflop and multiway spots keep the heuristic advice."
+  - unavailable: "Unavailable on this machine: <summary>." (the summary says what it needs).
+- **Decision: the checkbox stays visible and usable with the advisor off, but has an effect only while the advisor is shown.** With the advisor hidden, no solver output is drawn and Play GTO uses the heuristic line. The controller still solves in the background (the UI does not turn the mode off for it), so it costs CPU while hidden; showing the advisor again shows the current decision's result straight away.
+
+**Advisor panel, with solver mode on**
+- The panel goes in a child window (`##advisor`, `AutoResizeY`) whose height is capped at the sidebar's free height less 100 px (scaled), at least 120 px. When it is taller, it scrolls and the action log keeps about three lines. With solver mode off the panel is drawn as before, outside any child, so nothing moves.
+- While a solve applies (Running or Done), the heuristic rationale moves into the heading's tooltip (with a line selected: its `why`, then "Baseline: " and the rationale), and the line's `why` is not repeated under the action. That is what makes room for the solver section at 1360x860. NotApplicable, Failed and Off keep the full panel.
+- The solver section, after "Versus types" and above the heuristic disclaimer (also drawn under "Hints appear when it is your turn." between decisions, with only the slider):
+  - A budget slider, "Budget N s", 150 px wide: 2-30 s, or 2-120 s on the Flop tier, where 120 s reads "Budget 120 s (full flop)". Tooltip: "Solver time per decision, from the next decision on." plus, on the Flop tier, "A full flop solve needs at least 120 s; shorter budgets use the approximate flop tree (no river betting)." It calls `set_solver_budget_ms(seconds × 1000)`.
+  - Running or Done: a progress bar on the slider's row (`progress`, or full and "Done"), then the status line, muted: "<street label>: N iterations, exploitability X% of pot" (the street label is `advice.street_label` when done, else `note`; without an exploitability yet, just the iterations). Tooltip: "Exploitability: how much a perfect opponent could gain against this strategy, as a share of the pot. Lower is closer to equilibrium."
+  - Done: "Solver: CALL 125 (most frequent)" in bold accent, then a 3-column table, action | freq | EV (chips, rounded, no "-0"), in the tree's order, with the most frequent row in the accent colour. Its tooltip: "How often the solver's strategy takes each action with your hand, and what each is worth in chips from here."
+  - Running or Done: "Approximate solver: simplified bet sizes, assumed ranges." (muted). The heuristic disclaimer ("... Not solver output.") stays under it, since it describes the heuristic numbers above.
+  - NotApplicable: the service's note, muted (e.g. "Heads-up postflop only: showing heuristic advice (multiway)"). Failed: its note in the warning colour.
+
+**Play GTO** (console row 3)
+- When solver mode is on, the advisor shown, "Advice:" on Baseline and the solve for this decision Done: "Play GTO: <best_label> (solver)", submitting `advice.best`. The controller's stale-key check means a Done result is always the current decision's.
+- Running, NotApplicable, Failed, solver mode off, or the advisor hidden: the heuristic behaviour, unchanged.
+- **Decision: with an archetype selected, the archetype line is played**, because the solver models Baseline ranges only. The focus must be Baseline itself; an archetype whose line is missing (which falls back to the Baseline heuristic) also stays heuristic.
+
+**Header changes** (`trainer_ui.h`): private `draw_solver_toggle()`, `draw_solver()`, `solver_advice()` and `draw_advisor_body(bool compact)` (the old `draw_advisor` body). No snapshot helpers were added.
+
+**Screenshots** (Release under Xvfb, `--auto-shove --stop-on flop --solver --solver-tier turn --solver-budget 4000`, in `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/`):
+- `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_solver_running.png`: seed 9, 100 frames, 1360x860. Hero CO with J8o on Ts5c7s, heads-up against the BB, the approximate flop tree at 27%: "Flop (approximate: no river betting): 20 iterations, exploitability 17.9% of pot".
+- `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_solver_done.png`: seed 9, 900 frames. Done at 79 iterations, 3.0%; "Solver: BET 25 (50% Pot) (most frequent)", six options, "Play GTO: BET 25 (50% Pot) (solver)". The panel scrolls by about two lines (the disclaimers), and the action log keeps three lines.
+- `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_solver_min.png`: seed 8, 600 frames, `--size 1180x760`. Facing a 125 bet on JhAs3d: "Solver: CALL 125 (most frequent)" (FOLD 25%, CALL 54%, RAISE 20%, ...). The table scrolls inside the panel after four rows; the log keeps three lines. No horizontal overflow.
+- `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_solver_multiway.png`: seed 1, three-way flop: the multiway note, the full heuristic panel.
+- `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_solver_tip.png`: seed 9 with `--hover 1250,133`: the Solver mode tooltip ("4 threads, 15.0 GB free: solves river and turn, flop approximate (tier set to Turn). ...").
+- **Fixed after looking:** the first layout (slider, progress bar and status on their own rows, the rationale still inline, no child window) ran the sidebar past the window at 1360x860 when Done: the action log disappeared under a sidebar scrollbar. Now the slider and progress bar share a row, "Heuristic advice until the solve finishes." was dropped (the Play GTO label already says which advice it plays), the rationale moves to the heading's tooltip while a solve applies, and the panel scrolls inside a capped child.
+- Seeds were found with a scratch program driving `LocalGameController` the way `--stop-on flop` does: seeds 6-9, 14, 17, 19, 24, 25, 28, 30, 32, 33 and 40 reach a heads-up flop decision for Hero.
+
+**Tests:** 488 pass in Release (9.2 s wall) and Debug (36.2 s): 482 plus 6 new. GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `trainer_ui.cpp` and `trainer_ui_test.cpp`.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -1169,6 +1208,9 @@ Every street also has all-in, and the flop tiers raise all-in only.
 - Stage 8 batches B and C: ThreadSanitizer ran with GCC only, on the service, controller-solver and pool tests; clang's TSan and the full suite under TSan are batch E.
 - Stage 8 batches B and C: range inference, the tree build and river iterations are not interruptible. They were short in every measurement here (river iterations about 1 ms, inference a few ms), but a slow machine could stretch a cancel by their length.
 - Stage 8 batches B and C: the advice is the solver's average strategy when the budget ends, not a converged one. At the default 8 s on this box, the wide heads-up spot stopped at 1.81% of the pot on the turn and 5.77% on the approximate flop. How much Hero's own frequencies move between those and the targets was not measured.
+- Stage 8 batch D: the solver UI was tested with injected ImGui input and the real app under Xvfb (Mesa, DejaVu Sans) only; real GLFW mouse input, Windows fonts and DPI scales other than 1 were not checked. The Running and Done screenshots depend on frame timing under Xvfb, so the same flags can catch a different moment.
+- Stage 8 batch D: the 100 px kept for the action log and the choice to move the rationale into a tooltip while a solve applies were chosen from the two window sizes, not from user feedback. The advisor child sizes itself from the previous frame (`AutoResizeY`), so a new decision can draw one frame at the old height.
+- Stage 8 batch D: with the advisor hidden, the controller keeps solving in the background; the CPU this costs was not measured.
 
 ## Test changes
 
@@ -1311,3 +1353,12 @@ Every street also has all-in, and the flop tiers raise all-in only.
   - `Controller.SolverDoesNotChangeMistakesOrLogs` (1.2 / 3.1 s): 25 seeded hands with the Turn tier, solves running when Hero acts. JSONL byte-identical without session ids, same mistakes, EV lost and hands.
   - `Controller.SolverIsCancelledWhenHeroActs` (53 / 154 ms): turning the mode on mid-decision submits it, acting resets the panel to Off at once, and it stays Off over later ticks.
   - `FakeController` implements the four new methods. `player_boundary_test.cpp` includes `controller/solver_service.h` and `solver/hardware.h`. The text scan covers `src/controller/solver_service.*`.
+- **Stage 8 batch D** (`tests/trainer_ui_test.cpp`): no existing assertion changed. New constants `kSolverToggle` (1200, 97) and `kSolverBudgetMin` / `kSolverBudgetMax` (1030 / 1176, 341; with `set_lines()`'s hint and the solve running), helpers `set_solver(state, tier)` (solver mode on, available, 340 iterations at 1.8%, and for Done five options with CALL 100 most frequent) and `advisor_item_is` (finds the item in the `Sidebar/##advisor` child, after three frames so the child has sized itself). The `FakeController` already stored the mode and budget; tests set `table.solver` directly. Release / Debug times:
+  - `UiTest.SolverToggleCallsController` (0 / 1 ms): the checkbox is at `kSolverToggle`, and two clicks turn the fake's mode on and off.
+  - `UiTest.SolverToggleDisabledWhenUnavailable` (0 / 3 ms): a click changes nothing; hovering still shows the tooltip.
+  - `UiTest.SolverBudgetSliderSetsTheBudget` (0 / 3 ms): the slider's ends give 30,000 and 2,000 ms, and 120,000 ms on the Flop tier.
+  - `UiTest.PlayGtoUsesSolverWhenDone` (0 / 1 ms): "Play GTO: CALL 100 (solver)" submits a call while the heuristic says raise.
+  - `UiTest.PlayGtoUsesHeuristicWhileRunning` (0 / 3 ms): Running, NotApplicable and Failed keep "Play GTO: RAISE to 500 (100% Pot)" and submit it; a Done result with the mode off is ignored.
+  - `UiTest.PlayGtoUsesHeuristicForArchetypeLines` (1 / 4 ms): with Done, Station plays its own line; back on Baseline, the solver's label; with the advisor hidden, "Play GTO" plays the heuristic raise.
+  - `UiTest.ExistingSidebarButtonsDidNotMove` (1 / 6 ms) also checks the toggle, New Session, the advisor toggle and the radios with the solve Running and Done.
+  - `UiTest.EveryScreenDrawsWithFullData` (38 / 163 ms) also draws every phase and focus for each solver state (Off, NotApplicable, Running, Done, Failed) on the River, Turn and Flop tiers with the long approximate-flop label, without an exploitability, and unavailable with the mode on.
