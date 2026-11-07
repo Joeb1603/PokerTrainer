@@ -171,9 +171,10 @@ struct AdvisorOptions {
 // tables). A raise that is all in or at least 40% of Hero's starting stack sets
 // all_in_bb to the smaller starting stack of Hero and that opponent, so the
 // push/fold call ranges answer a short jam. size_ratio is the raise's street total
-// over a standard one: 2.5 big blinds plus one per caller first in, 3x the bet
-// plus one bet per caller against one raise, 2.3x against two, and all in after
-// that, as the chart bots size. The call ranges are scored on the preflop matrix,
+// over a standard one (standard_preflop_raise_to in range_model.h): 2.5 big blinds
+// plus one per caller first in, 3x the bet plus one bet per caller against one
+// raise (3.5x out of position, as from the blinds), 2.3x against two, and all in
+// after that. The call ranges are scored on the preflop matrix,
 // all in, so postflop play and position are left out; the chart prior below
 // stands in for them.
 //
@@ -196,19 +197,27 @@ struct AdvisorOptions {
 //   others. Every subset S of continuing players is enumerated (at most 2^5):
 //   V_S = sum over layers of (amount + the chips S adds to it) * e(layer's
 //   certain players and the players of S whose chips reach it) - to_call, with
-//   each j in S holding C_j. One Monte Carlo run serves every set, with the
-//   line's seed and rollouts, but at most about 30,000 deals in all (at least
-//   100 rollouts), by a 512-deal trial of how often the continuing ranges can be
-//   dealt together: call ranges are narrow and collide, and the redraws were what
-//   made this slow. When no trial deal fits, the independent-opponents product.
+//   each j in S holding C_j. Each S deals its own hands: the certain players
+//   from their ranges, each j in S from C_j and each j outside it from its fold
+//   part F_j (its range times the chance it folds, so it is dealt, removing its
+//   cards, but does not contest). A set of one opponent is the exact per-combo
+//   average, which leaves the folders' cards out. Each S with a set of several
+//   opponents gets its own Monte Carlo, with its own seed from the line's, and
+//   P(S) over the sum of P over those S of the line's rollouts, capped at about
+//   30,000 deals (a 512-deal trial of how often its ranges can be dealt together:
+//   call ranges are narrow and collide, and the redraws were what made this slow),
+//   at least 100. When no trial deal fits, the independent-opponents product.
 //   Call = (1 - P_sq) * sum_S P(S) V_S + P_sq * (sum_j q_j V_sq_j / sum_j q_j)
 // range_equity_pct is then sum_S P(S) e(the field of S) rather than the equity
 // against every player still in. A squeeze a player cannot make (it cannot cover
 // the bet), or one Hero cannot fold to (Hero's call is all in), counts as a call.
-// Approximations: the continues are independent, a player who folds still holds
-// cards from its call range in the Monte Carlo, an overcall of a short jam uses
-// the lone-call push/fold range, and the original bettor never re-raises. A check
-// is unchanged: at no price every player continues. Heads-up nothing changes.
+// Approximations: the continues are independent, the folders' cards are left out
+// where one opponent contests (measured in the decision log's two hand checks: the
+// call EV is about 0.8 chips low for it in the CO AQo spot, and about 1.3 chips
+// high on the UTG AQ flop, where the folders' fold parts hold Hero's outs), an
+// overcall of a short jam uses the lone-call push/fold range, and the original
+// bettor never re-raises. A check is unchanged: at no price every player
+// continues. Heads-up nothing changes.
 //
 // --- Bet size -----------------------------------------------------------------
 //
@@ -229,9 +238,10 @@ struct AdvisorOptions {
 // --- Preflop chart prior --------------------------------------------------------
 //
 // Preflop, the 6-max charts act as a prior (advisor_chart in advisor_charts.h:
-// the bots' chart_response with the positional answers to 3-bets and 4-bets, and
-// the push/fold tables at 15 big blinds or less; it also turns a fold into a call
-// at a tiny price). Options the chart rejects lose a big blind plus a quarter of
+// the bots' chart_response with the advisor's own answers to an open, the
+// positional answers to 3-bets and 4-bets, and the push/fold tables at 15 big
+// blinds or less against a short jam; it also turns a fold into a call at a tiny
+// price). A deep jam into a short Hero has no chart, so no prior. Options the chart rejects lose a big blind plus a quarter of
 // the chips they risk: the bigger the play, the more the range it faces matters.
 // A call the chart picks gains the same, and a raise it picks gains just the big
 // blind. Where the push/fold table says jam, only the all-in counts as that raise;

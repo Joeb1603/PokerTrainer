@@ -70,6 +70,9 @@ Each stage is committed to `main` when its tests pass.
 - **Stage 5, preflop all-in rule:** decision 16 is new, a fix to a clear model bug rather than tuning.
 
 - **Stage 6 batch C, BB 3-bet share against a CO open:** the acceptance band was 8-15% of hands. The advice is 4.5%, exactly the bots' BB-versus-CO 3-bet chart (`vs_open_ranges(BB, CO).raise`, 4.5%), which this stage may not change because the bots share it. `Advisor.BbVsCoOpenThreeBetShareIsPlausible` therefore asserts at least the chart's own share and at most 15%. The band would need a wider advisor-only BB 3-bet chart, which is chart authoring rather than integration.
+- **Stage 6 follow-ups, the BB 3-bet band:** resolved by the advisor-only vs-open tables: the BB 3-bets 11.5% against a CO open, and the test asserts 8-15% again.
+- **Stage 6 follow-ups, the flop hand check's -17.7:** the reviewer's reference was computed on the Stage 6 ranges. Fix 1 changed the flat and defend ranges in that spot, so the acceptance was checked against the same reference recomputed on the new ranges (-12.1 with the folders out, -14.7 with them dealt), not against -17.7.
+- **Stage 6 follow-ups, folders in heads-up scenarios:** the folders' fold parts are dealt only where several opponents contest. With one opponent the exact per-combo average is kept, which leaves the folders' cards out (about +0.8 to -1.3 chips in the two hand checks), because a Monte Carlo there would add several chips of noise to the dominant scenario.
 - **Stage 6 batch C, "BTN AJs is about 45% heads-up against the CO":** the plan's figure is not what the range model gives. Heads-up against the Baseline CO open range AJs has 58.3% (all-in, preflop matrix), so the acceptance was read as "within a few pp of 58.3%". The advice is 52.4%, 5.9 pp below, because, predicted against the CO's open, the BB overcalls 24.6% and squeezes 3.6%, and the SB overcalls 8.5% and squeezes 6.2%.
 - **Stage 6 batch C, "always opens 3.5 BB":** measured at `d623daf`, the advice opened mostly to the minimum (2 BB), and 3.5 BB with premiums (table below). The cause was the same, calls that did not respond below the standard size, plus `implied`.
 
@@ -786,6 +789,84 @@ Judgement: the open ranges and the 12 BB jams are in line with common 6-max char
 
 **Test changes:** none to assertions. The `DISABLED_LatencyByStreet` comment, which batch C's new tests had separated from its test, is back above it.
 
+### Stage 6 follow-ups, uncommitted, on top of `25faff8`
+
+Five fixes from the Stage 6 review. The bots, the JSONL schema, the snapshot and mistakes on `base_ev` are unchanged; `VsReraises.BotsChartsUnchanged` now also pins the bots' answers to an open for every hero, opener and table size.
+
+**1. Advisor-only answers to an open** (`advisor_vs_open_ranges` in `preflop_charts.{h,cpp}`)
+- The bots' `vs_open_ranges` stays for the bots. The advisor's chart (`advisor_chart`, one raise and no commit) and the range model (inference and prediction of 3-bets and flats facing one raise, and a SB flat, read as the BTN's call range against that opener) use the new tables.
+- Authored at 100 BB, open to about 2.5 BB, in the style of published 6-max solver outputs (not solved, not compared with a specific one). The BB tables are written as the 3-bets plus everything defended, the call range being the difference, so nesting is easy to see. Every 3-bet range has value plus a polarized share: suited wheel aces in all of them, suited connectors (54s-T9s for the BB, 65s/54s/76s/87s for the BTN and CO, 87s/98s for the SB) and suited broadways. AJs and AJo flat on the button (see the min-3-bet finding below).
+- One per hero and opener: HJ, CO and BTN against each earlier opener (a non-blind hero against a later or blind opener reads BTN vs CO), the SB against UTG, HJ, CO and BTN or later, the BB against each opener and heads-up. Each 3-bet range and each defended range contains the one against an earlier opener, and against an earlier hero for the same opener (tested).
+
+Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the advice equals the chart in all 169 classes of every row, measured with the Baseline advisor, lines off, open to 50):
+
+| Hero vs opener | Bots: 3-bet / call / defend | Advisor: 3-bet / call / defend |
+|---|---|---|
+| HJ vs UTG | 3.2 / 6.3 / 9.5 | 5.1 / 3.3 / 8.4 |
+| CO vs UTG | 3.2 / 6.3 / 9.5 | 5.4 / 4.1 / 9.5 |
+| BTN vs UTG | 3.2 / 6.3 / 9.5 | 5.4 / 7.1 / 12.5 |
+| CO vs HJ | 3.2 / 6.3 / 9.5 | 6.3 / 4.4 / 10.7 |
+| BTN vs HJ | 3.2 / 6.3 / 9.5 | 7.8 / 8.6 / 16.4 |
+| BTN vs CO | 5.7 / 8.6 / 14.3 | 9.5 / 9.4 / 18.9 |
+| SB vs UTG | 4.2 / 0 / 4.2 | 6.5 / 0 / 6.5 |
+| SB vs HJ | 4.2 / 0 / 4.2 | 8.1 / 0 / 8.1 |
+| SB vs CO | 7.7 / 0 / 7.7 | 10.7 / 0 / 10.7 |
+| SB vs BTN | 13.7 / 0 / 13.7 | 14.2 / 0 / 14.2 |
+| BB vs UTG | 2.9 / 16.9 / 19.8 | 8.1 / 24.0 / 32.1 |
+| BB vs HJ | 2.9 / 16.9 / 19.8 | 9.5 / 28.7 / 38.2 |
+| BB vs CO | 4.5 / 23.7 / 28.2 | 11.5 / 37.6 / 49.0 |
+| BB vs BTN | 6.5 / 37.4 / 43.9 | 13.4 / 44.6 / 58.1 |
+| BB vs SB | 8.4 / 43.6 / 52.0 | 16.3 / 49.6 / 65.9 |
+| BB vs BTN, heads-up | 8.4 / 57.8 / 66.2 | 16.9 / 55.7 / 72.5 |
+
+- **Acceptance:** BB vs a CO open, the advice 3-bets 11.5% (was 4.5%; band 8-15%), 72o folds, AA 3-bets, every 3-bet to 133 or 160 (at least twice the open). BB vs a BTN 2.5 BB open defends 58.1% (13.4% 3-bets to 160, 44.6% calls; was 43.9% with 6.5%), and against a 2 BB open the same 58.1% (3-bets to 130). BTN vs CO 3-bets 9.5%, SB vs BTN 14.2%.
+- **Sanity, 100 BB first in:** the open ranges are unchanged (UTG 15.8%, HJ 20.4%, CO 27.9%, BTN 46.0%, SB 42.7%, every class per `advisor_chart`), but the sizes moved, because the blinds now defend wider: UTG 2 / 2.25 / 2.9 / 3.5 BB 8.4 / 3.2 / 0.5 / 3.8% (was 8.0 / 4.8 / 0.5 / 2.6), HJ 9.4 / 4.5 / 0.8 / 5.7, CO 11.5 / 5.4 / 2.1 / 8.9, BTN 11.5 / 17.8 / 5.0 / 11.8 (was 2.4 / 30.5 / 5.0 / 8.1), SB 2 / 2.5 / 3 BB 0.6 / 15.1 / 27.0. The 3.5 BB size tell with strong hands (batch C) is a little larger. 12 BB first in is still exactly the push/fold tables.
+- **Found, not fixed: min-3-bets.** The preflop ladder's EVs are flat within about 0.5-4 chips from 1.7x to 3.6x for medium hands, and the smallest rung (83 over an open of 50) wins some: HJ vs UTG with AQs, KQs, AQo, A5s and A4s (AQs: 53.3 at 83, 53.2 at 115, 49.4 at 148), and, before they were moved to the flats, AJs and AJo from the BTN against the CO and AJs from the CO against the HJ (AJs: 58.1 at 83 against 57.6 at 115). Below the standard size the opener's calls grow by ratio^-1, so a cheap 3-bet gets called more by hands it beats; position and postflop play are not counted. Every other spot measured 3-bets at least twice the open.
+
+**2. A deep jam into a short Hero** (`advisor_charts.{h,cpp}`)
+- Facing a lone all-in, push/fold now applies only when the jam is short: its depth, read as the range model reads it, is at most 15 BB. Jam depth = min(the jammer's street total, the deepest starting stack among the other players dealt in who had not folded when it was made, Hero included). So a SB jam of 100 BB into a 10 BB BB after everyone folded is a 10 BB jam (table), but a BTN jam of 100 BB with a 100 BB SB still behind is a 100 BB jam.
+- A deeper jam with Hero's effective stack at most 15 BB gets no chart (`AdvisorChart::neutral`, no prior): the range EV against the jammer's commit range (JJ+, AK at 100 BB) decides. Hero deeper than 15 BB keeps the old path (`vs_four_bet_response` when the call commits).
+- Why no prior rather than the commit chart (JJ+, AK as a call range): Hero's price depends on Hero's stack, and the fixed chart is wrong at one end. The reviewer's spot (BB 10 BB, SB 100 BB, BTN jams 100 BB), model call EVs in chips: 22 -50.0, 55 -43.9, 99 -43.8, TT -42.0, JJ -30.0, QQ +14.1, KK +76.7, AA +162.1, AKo -16.8, AKs -4.6, AQs -48.7 (the call needs 180 / 410 = 43.9%; AKo has 39.8%). The commit chart would add +65 to JJ and AK and call them at -30 and -17. With a 3 BB Hero the price is 40 / 130 = 30.8%, and 22-TT, AQs and AK are all +1 to +16: the commit chart would fold 22-TT and AQs at -30. Before, 22 and 55 called (prior +65 on a model -50 and -43.9).
+- Acceptance: in the reviewer's spot 22 and 55 fold and QQ, KK, AA call (`DeepJamIntoAShortStackHasNoChartPrior`, which also checks that the call EV is exactly the range EV and that with the SB at 10 BB the table applies again).
+
+**3. Folders hold their fold parts** (`training_advisor.cpp`, `call_value` and `RangeEquities::with_ranges`)
+- Each scenario of the players still to act deals its own hands: the certain players from their ranges, the callers from their call ranges and the folders from their fold parts (range x P(fold), so they hold cards but do not contest). A set of one opponent stays the exact per-combo average, which leaves the folders' cards out. Each scenario with a multiway set gets its own Monte Carlo (seed from the line's and the scenario), P(S) over the sum of P over those scenarios of the line's rollouts (capped at 30,000 x the scenario's 512-deal acceptance), at least 100.
+- Hand checks, call EV without the chart prior (the reviewer's two spots; "folders out" deals only the scenario's players, as the reviewer did):
+
+| Spot | Before (Stage 6) | Now, seed of the check | Now, 20 seeds | Folders from call ranges, same ranges, 20 seeds | Reference: folders out | Folders from fold parts | As the model deals |
+|---|---|---|---|---|---|---|---|
+| CO AcQd vs a 10 BB UTG jam | +18.1 | +21.2 (48.7%) | +21.8 ± 0.9 | +19.1 ± 1.1 | +22.9 | +23.8 | +21.8 (in-test) |
+| UTG AcQc on 2c7dJh, BB bets 100 into 210, CO and BTN behind | -21.7 | -11.9 (20.8%) | -12.5 ± 2.2 | -11.8 ± 2.9 | -12.1 | -14.7 | about -13.4 |
+
+  - The AQo ranges are push/fold ranges, unchanged by fix 1. The model is 1.7 chips under the reviewer's +22.9, but within 0.6 of a reference that scores the nobody-calls scenario as the model does: about 0.6-1.4 chips of the gap is the class matrix there (AQo against the UTG range 53.80% against 53.97% exact, 54.22% with the folders' cards out), and the rest Monte Carlo noise (sd 0.9).
+  - The flop spot's ranges changed with fix 1 (the CO and BTN flat a UTG open from the advisor's tables and the BB defends 32%), so the reviewer's -17.7 (on the old ranges) no longer applies; the same reference on the new ranges is -12.1, and -14.7 with every folder dealt. The model's -12.5 ± 2.2 sits between them; leaving the folders out of the heads-up scenario is worth about +1.3 here (the folders' fold parts hold AQ's outs: AQ's heads-up equity against the BB is 31.9% exact and 30.1% with them dealt). In this spot the old treatment differed little on the new ranges (-11.8).
+- Latency: below.
+
+**4. Inferred calls respond to raise size** (`range_model.{h,cpp}`)
+- The walk records each preflop raise's size_ratio, as the advisor does (`standard_preflop_raise_to`, now public in `range_model.h`, shared by both). A call that is not all in and does not commit uses `call_size_scale(size_ratio)` as the prediction does: Cc resized by min(1, f), and below the standard size `add_calls_for_size` on the range so far. A limper's call scales its call width the same way. Measured: the BB's flat of a BTN open of 2 / 2.5 / 3 BB holds 59.1 / 47.3 / 43.4% of combos, slowplayed 3-bets included (before: 47.3% at every size), each exactly the predicted call range (`InferredFlatsRespondToRaiseSize`).
+- **The standard 3-bet out of position is 3.5x** (a 3-bettor who acts first after the flop, as the blinds do), 3x in position: the sizes the positional vs-3-bet tables assume ("3x in position, 3.5-4x from the blinds"). With the bots' 3x everywhere, the bench's SB 3-bet to 180 (3.6x) read as 1.2x standard, narrowed the BTN's flat, and the bench went to 0.743. Bench by the out-of-position multiple: 3.0 0.743, 3.5 0.694, 3.6 0.691 (the bench's own size, ratio 1), 3.75 0.756. 3.5 was taken as the low end of the tables' stated size, not fitted; the bench is this sensitive because a few SB-vs-BTN 3-bet spots move 1-2 BB on small range changes (dry-xx 2.95 at 3.5 and 3.6, 3.90 at 3.75).
+- The advisor uses the same standard for Hero's raises, so its 3-bets from the blinds are bigger now (BB vs BTN and BB vs CO mostly 160, the pot rung).
+
+**5. Known limitation, push/fold rounding (no code change).** The multiway push/fold sets are rounded from fictitious play's mixed averages (each class whose average is at least 0.5), so the pure sets are slightly off a best response to each other: in the review's check (UTG-BTN at 4, 8, 10, 12 and 15 BB), 0-9 jam classes and 1-15 call classes per game sit on the wrong side of indifference, worth up to 0.40 BB per hand of that class (CO and BTN folding KQs to a 12 BB HJ jam; the BB folding A9s to a 10 BB UTG jam, 0.25), about 1 mBB per hand dealt. Heads-up and SB-vs-BB sets are within 0.32 mBB.
+
+**River bench** (`advisor_bench`, defaults): overall **0.694 BB, 57% agree** (was 0.708, 56%). BTN vs BB 0.288 → 0.320, CO vs BTN 0.435 → 0.421, SB vs BTN 3-bet 1.402 → 1.342; dry 0.695, wet 0.342, paired 0.675, monotone 1.065. Fix 1 alone gave 0.690; the bench's ranges are fixed, but the advisor reads the opponents' preflop ranges through the walk.
+
+**Hint latency** (`Advisor.DISABLED_LatencyByStreet`, Release, default options, ms, p50 / p95 / max, run alone)
+
+| Spot | Lines off, auto threads | Lines on, auto threads | Lines off, 1 thread | Lines on, 1 thread |
+|---|---|---|---|---|
+| Preflop 3+ way (2010) | 3.4 / 7.6 / 17 | 6.5 / 10.1 / 19 | 4.5 / 7.4 / 17 | 14.9 / 26.2 / 59 |
+| Flop 3+ way (1774) | 6.6 / 11.4 / 19 | 8.5 / 12.7 / 24 | 9.7 / 20.9 / 30 | 21.8 / 34.9 / 51 |
+| Flop heads-up (300) | 4.1 / 4.7 / 5.5 | 5.0 / 6.0 / 8.1 | 11.7 / 12.4 / 19 | 13.8 / 14.6 / 18 |
+| Turn 3+ way (1588) | 4.3 / 8.2 / 19 | 5.8 / 10.5 / 33 | 4.9 / 8.8 / 42 | 11.3 / 23.9 / 60 |
+| Turn heads-up (300) | 1.5 / 1.7 / 2.6 | 2.1 / 2.8 / 4.5 | 1.5 / 1.6 / 2.3 | 2.5 / 2.7 / 3.5 |
+| River 3+ way (1434) | 4.1 / 8.4 / 114 | 5.3 / 11.1 / 110 | 4.4 / 8.8 / 260 | 10.6 / 23.8 / 284 |
+| River heads-up (300) | 1.3 / 1.5 / 2.3 | 1.8 / 2.2 / 2.6 | 1.3 / 1.4 / 2.7 | 2.8 / 3.0 / 4.1 |
+
+- With automatic threads every 3+ way p95 is at most 12.7 ms (target 15): preflop 10.1 (was 8.2), flop 12.7 (11.3), turn 10.5 (9.0), river 11.1 (9.7). The preflop rise is the per-scenario Monte Carlo runs (most below the threading threshold, so inline) and the wider blind ranges (more scenarios with a caller). One thread with the lines on is slower than before (preflop p95 26 against 17.9), as each scenario now has its own run.
+
+**Tests:** 453 pass in Release (7.8 s) and Debug (30.3 s), 447 + 6 new; GCC Release/Debug and clang build with zero warnings; `strict.sh` is clean on `preflop_charts.cpp`, `advisor_charts.cpp`, `training_advisor.cpp` and `range_model.cpp`. Each new test takes at most 0.14 s in Release (0.35 s in Debug).
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -813,6 +894,11 @@ Judgement: the open ranges and the 12 BB jams are in line with common 6-max char
 - Stage 6 batch C: the continuing Monte Carlo's 30,000-deal budget was chosen for latency. Spots where it bites (acceptance below 10%) get fewer rollouts, down to 100; their error was not measured.
 - Stage 6 batch C: the 15-25 BB blend (linear, into the commit range for jams and the chart answer for predicted calls) and the size exponents (ratio^-1 below standard, ratio^-0.5 above) are judgment, not fitted. The BB's defend shares against 2 and 2.5 BB opens (55% and 45% with 3-bets) look a little tight next to published solver outputs; not compared with any.
 - Stage 6 batch C: `implied` 0 preflop was checked through the 169-class spots and the test suite only; its effect on preflop mistakes in real play was not measured. The AQo call EV was checked approximately by hand (+24 against the model's +18.1), not exactly.
+
+- Stage 6 follow-ups: the advisor's vs-open tables are hand-authored to the stated bands, in the style of published 100 BB 6-max outputs; they were not solved or compared with a specific solver. The cold callers' flats and the SB's pure 3-bet-or-fold are simplifications.
+- Stage 6 follow-ups: the 3.5x out-of-position standard 3-bet was chosen from the tables' stated size; the bench was checked at 3.0, 3.5, 3.6 and 3.75 only, and its sensitivity there (0.69-0.76) is larger than any principled reason to prefer one of them.
+- Stage 6 follow-ups: the per-scenario rollout split (by chance, at least 100) was chosen for latency; the hand checks' seed spread (sd 0.9 and 2.2 chips) was measured only in the two review spots.
+- Stage 6 follow-ups: the multiway push/fold sets are rounded from mixed strategies (fix 5), up to 0.40 BB per hand for the worst classes, about 1 mBB per hand dealt; not corrected.
 
 ## Test changes
 
@@ -902,3 +988,32 @@ Judgement: the open ranges and the 12 BB jams are in line with common 6-max char
   - The `six_max` helper takes an optional stack (default 2000); no assertion changed.
   - **New tests:** `RangeModel.ShortAllInUsesPushFoldTables` (the jam table at 3, 5, 10 and 15 BB, the 16-25 BB blend class by class, falling mass, 16 BB above 85% of 15 BB, the commit range at 25 and 100 BB, a re-jam over the CO, the SB's call and the BB's overcall), `RangeModel.SmallRaisesGetCalledMore`, `Advisor.AdvisorChartMatchesTheBotsChartOutsideItsOwnTables`, `Advisor.ShortStackFirstInIsPushOrFold` (four positions at 10 BB, and no push/fold at 16 BB), `Advisor.ShortStackCallsAJamPerTable`, `Advisor.BbVsCoOpenThreeBetShareIsPlausible` (BB vs CO between the chart's 4.5% and 15%, 72o folds and AA 3-bets, no 3-bet below twice the open; BTN vs CO 4-15%, SB vs BTN 8-20%), and `Advisor.PlayersBehindAreNotCertainCallers` (the AQo jam spot calls, within 7 pp of heads-up and more than 10 above four-way; the AJs spot plays, within 7 pp below heads-up, every line more than 5 pp above its three-way equity; a multiway flop call above the equity against all three).
   - `tests/player_boundary_test.cpp` also includes `advisor/advisor_charts.h`.
+
+- **Stage 6 follow-ups:**
+  - Oracle switch to `advisor_vs_open_ranges` (the range model now reads one raise from it): `RangeModel.BbDefendVsBtnIsChartCallPlusTraps`, `RangeModel.PredictPreflopResponseShrinksWithSize`, `RangeModel.SmallRaisesGetCalledMore` (also a comment: 0.53 is of a 3x 3-bet) and the BTN's 3-bet in `RangeModel.ThreeBetAndFourBetUseTheCharts`. No bound changed in them.
+  - `RangeModel.ThreeBetAndFourBetUseTheCharts`:
+    - **Old:** after the BTN calls the CO's 4-bet, TT has weight 0.
+    - **New:** 99 has weight 0.
+    - **Reason:** TT is now in the BTN's 3-bet range against the CO and in the in-position call range against a 4-bet, so it flats at 0.8; 99 is outside the 3-bet range. The per-combo comparison is unchanged.
+  - `RangeModel.UsersSpotIsPlausible`:
+    - **Old:** 88 on Ah9s4c has 40-55% against the BB's defend range.
+    - **New:** 40-62% (measured 59.4%).
+    - **Reason:** the BB defends 58% of hands against the BTN, many of them weak offsuit, so 88 is a favourite. The check-call bound is unchanged (46.8%).
+  - `RangeModel.CbetFrequenciesArePlausible`:
+    - **Old:** the BB's 3-bet range c-bets a third of the pot on K83r at least 70% of the time.
+    - **New:** at least 50% (measured 56%, was 77.7%); comment rewritten.
+    - **Reason:** the BB's 3-bet against UTG is polarized now (suited wheel aces and 54s-T9s), and the connectors that miss K83 check some of the time. The single-raised-pot bounds are unchanged (62%).
+  - `Advisor.AdvisorChartMatchesTheBotsChartOutsideItsOwnTables` is replaced by `Advisor.AdvisorChartFacingAnOpenUsesItsOwnTable`:
+    - **Old:** in a 100 BB single-raise spot (BB vs CO) `advisor_chart_response` equals the bots' `chart_response` for all 169 classes.
+    - **New:** it equals `advisor_vs_open_ranges(BB, CO)`'s answer for all 169 classes, is never push/fold, and differs from `chart_response` in more than 20 classes.
+    - **Reason:** the advisor no longer uses the bots' vs-open chart, by design.
+  - `Advisor.BbVsCoOpenThreeBetShareIsPlausible`:
+    - **Old:** the BB's advised 3-bet share is at least the bots' chart (4.5%) and at most 15%.
+    - **New:** 8-15% (measured 11.5%). The BTN (4-15%, measured 9.5%) and SB (8-20%, 14.2%) bounds, 72o folding and the two-times-the-open size floor are unchanged.
+    - **Reason:** the plan's band, now that the advisor has its own BB-vs-CO chart.
+  - `Advisor.PlayersBehindAreNotCertainCallers`, BTN AJs facing a CO open:
+    - **Old:** range equity within 7 pp below heads-up.
+    - **New:** within 9 pp (measured 50.7% against 58.3% heads-up; was 52.4%). The "more than 10 pp above three-way" and archetype-line bounds are unchanged.
+    - **Reason:** the blinds defend from the advisor's tables (the BB 49% against a CO open, the SB 3-bets 10.7% and flats like the BTN), so the field is three-way about half the time.
+  - `VsReraises.BotsChartsUnchanged`: extended with a 169-class snapshot of the bots' ten vs-open tables and a check of which table each hero, opener and table size (6 and 2 players) reads.
+  - **New tests:** `AdvisorVsOpen.SharesAreInTheirBands` (3-bet and defend shares per table in the bands above, raise and call disjoint, the SB's call empty), `AdvisorVsOpen.NestsAndIsWiderThanTheBots`, `AdvisorVsOpen.ThreeBetsArePolarizedAndPremiumsAlwaysRaise` (plus known decisions), `RangeModel.InferredFlatsRespondToRaiseSize` (flats of 2, 2.5 and 3 BB opens equal the predicted call ranges, the 2 BB flat wider and containing the standard one; the BTN's flat of a 3.5x SB 3-bet is the ratio-1 answer; `standard_preflop_raise_to` values), `Advisor.PlayersBehindWhoFoldHoldTheirFoldParts` (the AQo call within 2 chips of a reference rebuilt from public functions with 60,000 rollouts per scenario, +21.2 against +21.8, and that reference more than 2 chips above the same with folders dealt from their call ranges, +18.8), and `Advisor.DeepJamIntoAShortStackHasNoChartPrior`.

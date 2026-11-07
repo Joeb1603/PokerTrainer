@@ -64,6 +64,12 @@ constexpr double kPushFoldBlendTo = 25.0;
 constexpr double kCallSizeExponentAbove = 0.5;
 constexpr double kCallSizeExponentBelow = 1.0;
 constexpr double kCommitStackShare = 0.40;
+// Standard preflop sizes: the chart bots' (preflop_size in gto_heuristic_engine.cpp),
+// but a 3-bet from out of position is bigger, as the positional tables assume.
+constexpr double kStandardOpenBigBlinds = 2.5;
+constexpr double kStandardIsoMultiple = 3.0;
+constexpr double kStandardIsoMultipleOutOfPosition = 3.5;
+constexpr double kStandardFourBetMultiple = 2.3;
 constexpr int kCommitPriceBigBlinds = 10;
 constexpr int kCommitAlwaysBigBlinds = 50;
 
@@ -470,9 +476,10 @@ void add_calls_for_size(ChartAnswer& answer, const WeightedRange& range, double 
 ChartAnswer facing_raise_answer(Position pos, Position raiser, int raises, int players, bool reraised,
                                 double call_scale, const ArchetypeParams& p) {
     if (raises <= 1) {
-        const VsRaiseRanges& chart = vs_open_ranges(pos, raiser, players);
+        const VsRaiseRanges& chart = advisor_vs_open_ranges(pos, raiser, players);
         // The SB charts are 3-bet or fold; a SB that flats plays like a caller in position.
-        const HandRange& calls = chart.call.empty() ? vs_open_ranges(Position::BTN, raiser, players).call : chart.call;
+        const HandRange& calls =
+            chart.call.empty() ? advisor_vs_open_ranges(Position::BTN, raiser, players).call : chart.call;
         return chart_answer(chart, calls, p.three_bet_width, p.flat_width, call_scale, p);
     }
     const ExtraCharts& extra = extra_charts();
@@ -734,6 +741,17 @@ private:
             }
         }
 
+        if (aggressive && street_ == Street::Preflop) {
+            // Against one raise, out of position: before its maker after the flop.
+            const bool oop = preflop_raise_records_ == 1 && level_seat(1) >= 0 &&
+                             postflop_acting_order(position_of(a.seat)) < postflop_acting_order(position_of(level_seat(1)));
+            const double standard =
+                standard_preflop_raise_to(view_.big_blind, preflop_raise_records_, preflop_calls_, current_bet_, oop);
+            last_raise_ratio_ = standard > 0.0 ? a.street_total / standard : 1.0;
+            ++preflop_raise_records_;
+        } else if (a.type == ActionType::Call && street_ == Street::Preflop) {
+            ++preflop_calls_;
+        }
         if (aggressive) {
             const int increment = std::max(0, a.street_total - current_bet_);
             const double pot_after_call = pot_before + facing;
@@ -855,8 +873,12 @@ private:
         if (call_is_committing(a, t)) {
             return WeightedRange::from_hand_range(resized(extra.commit, p_.call_3bet_width, p_));
         }
-        if (limper_facing_raise) return limper_answer(pos, players_, 1.0, p_).call;
-        return facing_raise_answer(pos, raiser(), raises_, players_, reraised(a.seat), 1.0, p_).call;
+        // The calls respond to the raise's size as predict_preflop_response's do.
+        const double scale = call_size_scale(last_raise_ratio_);
+        if (limper_facing_raise) return limper_answer(pos, players_, scale, p_).call;
+        ChartAnswer answer = facing_raise_answer(pos, raiser(), raises_, players_, reraised(a.seat), scale, p_);
+        add_calls_for_size(answer, t.range, scale, p_);
+        return answer.call;
     }
 
     // The standing of every combo against the players `i` plays against: the
@@ -919,6 +941,11 @@ private:
     static constexpr int kTrackedLevels = 8;
     std::array<int, kTrackedLevels> level_seat_{-1, -1, -1, -1, -1, -1, -1, -1};  // Who made each raise level
     double last_aggression_size_ = 0.0;
+    // Preflop: raise records and calls so far, and the latest raise's street total
+    // over the standard one (standard_preflop_raise_to before it was made).
+    int preflop_raise_records_ = 0;
+    int preflop_calls_ = 0;
+    double last_raise_ratio_ = 1.0;
     bool last_aggression_all_in_ = false;
     int last_aggression_total_ = 0;
     int street_aggressor_ = -1;    // Last to bet or raise on this street
@@ -1114,6 +1141,16 @@ Response predict_postflop_response(const WeightedRange& range, const StreetStren
                                    const WeightedRange* bettor_range) {
     const OwnedFooting f(range, bettor_range, strength);
     return postflop_response_at(range, strength, f.footing(), street, safe_size(size_pots), pot_odds, params);
+}
+
+double standard_preflop_raise_to(int big_blind, int raises, int callers, int current, bool out_of_position) {
+    switch (raises) {
+        case 0: return big_blind * (kStandardOpenBigBlinds + callers);
+        case 1:
+            return current * ((out_of_position ? kStandardIsoMultipleOutOfPosition : kStandardIsoMultiple) + callers);
+        case 2: return current * kStandardFourBetMultiple;
+        default: return 0.0;
+    }
 }
 
 Response predict_preflop_response(const WeightedRange& villain_range_so_far, const PreflopSpot& spot,

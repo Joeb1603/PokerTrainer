@@ -47,11 +47,6 @@ constexpr double kChartPriorCallShare = 0.25;
 // The chart prior's weight in the archetype lines (training_advisor.h).
 constexpr double kArchetypePriorScale = 1.0;
 
-// The chart bots' preflop sizes (preflop_size in gto_heuristic_engine.cpp).
-constexpr double kOpenBigBlinds = 2.5;
-constexpr int kIsoMultiple = 3;
-constexpr double kFourBetMultiple = 2.3;
-
 constexpr int kMinRangeRollouts = 100;
 // The archetype lines' multiway Monte Carlo: postflop, this many times fewer
 // rollouts than Baseline's (with its seed, so the first chunk's deals are the
@@ -98,7 +93,7 @@ struct PreflopLevels {
     int last_full = 0;
     std::array<int, 8> level_seats{-1, -1, -1, -1, -1, -1, -1, -1};  // Who made each level (index level - 1)
     // The latest raise record: its maker, street total, all-in flag and its size
-    // over the standard one (standard_raise_to at the time it was made).
+    // over the standard one (standard_preflop_raise_to at the time it was made).
     int last_raiser = -1;
     int last_total = 0;
     bool last_all_in = false;
@@ -111,16 +106,12 @@ struct PreflopLevels {
     }
 };
 
-// The chart bots' raise-to for the next raise after `raises` raise records and
-// `callers` calls, with `current` the bet to match: preflop_size in
-// gto_heuristic_engine.cpp. 0 for a raise past the 4-bet, which goes all in.
-double chart_raise_to(int big_blind, int raises, int callers, int current) {
-    switch (raises) {
-        case 0: return big_blind * (kOpenBigBlinds + callers);
-        case 1: return static_cast<double>(current) * (kIsoMultiple + callers);
-        case 2: return current * kFourBetMultiple;
-        default: return 0.0;
-    }
+// A raise by `raiser` over the first raise only, made by `opener`, from out of
+// position (before it after the flop): the standard 3-bet is bigger there.
+bool three_bets_out_of_position(const PlayerView& view, int raises, int raiser, int opener) {
+    if (raises != 1 || raiser < 0 || opener < 0) return false;
+    const auto order = [&](int i) { return postflop_acting_order(view.seats[at(i)].position.value_or(Position::BTN)); };
+    return order(raiser) < order(opener);
 }
 
 PreflopLevels preflop_levels(const PlayerView& view) {
@@ -131,7 +122,8 @@ PreflopLevels preflop_levels(const PlayerView& view) {
         if (a.street != Street::Preflop) continue;
         if (a.type == ActionType::Call) ++out.callers;
         if (a.type != ActionType::Bet && a.type != ActionType::Raise) continue;
-        const double standard = chart_raise_to(view.big_blind, out.raises, out.callers, current);
+        const bool oop = three_bets_out_of_position(view, out.raises, a.seat, out.level_seat(1));
+        const double standard = standard_preflop_raise_to(view.big_blind, out.raises, out.callers, current, oop);
         out.last_size_ratio = standard > 0.0 ? a.street_total / standard : 1.0;
         out.last_raiser = a.seat;
         out.last_total = a.street_total;
@@ -149,13 +141,14 @@ PreflopLevels preflop_levels(const PlayerView& view) {
     return out;
 }
 
-// The street total the chart bots would raise to here: preflop_size.
+// The standard street total for Hero's raise here (standard_preflop_raise_to).
 double standard_raise_to(const PlayerView& view, const PreflopLevels& pre) {
     const PublicSeat& me = view.seats[at(view.seat)];
+    const bool oop = three_bets_out_of_position(view, pre.raises, view.seat, pre.level_seat(1));
     switch (pre.raises) {
         case 0:
         case 1:
-        case 2: return chart_raise_to(view.big_blind, pre.raises, pre.callers, view.current_bet);
+        case 2: return standard_preflop_raise_to(view.big_blind, pre.raises, pre.callers, view.current_bet, oop);
         default: return me.street_bet + me.stack;
     }
 }
@@ -272,16 +265,24 @@ public:
     void treat_as_independent() { independent_ = true; }
 
     // The same view, per-combo vector and options over other ranges, which the
-    // vector must cover (subsets of these ranges do).
-    // Multiway, it draws about kContinueDealBudget deals at most (at least
-    // kMinRangeRollouts rollouts, at most this one's), by a trial of how often the
-    // new ranges can be dealt together; none fitting means independent opponents.
-    RangeEquities with_ranges(std::array<std::optional<WeightedRange>, kMaxSeats> ranges) const {
-        const double acceptance = deal_acceptance(ranges, mix(options_.seed ^ kContinueSeedSalt));
+    // vector must cover (subsets of these ranges do), for one scenario of the
+    // players still to act. `share` of this one's rollouts, but of at most about
+    // kContinueDealBudget deals, by a trial of how often the new ranges can be dealt
+    // together (at least kMinRangeRollouts rollouts, at most this one's); none
+    // fitting means independent opponents. `salt` picks the scenario's seeds. With
+    // multiway false no set of several opponents will be asked for, so no trial runs.
+    RangeEquities with_ranges(std::array<std::optional<WeightedRange>, kMaxSeats> ranges, double share,
+                              std::uint64_t salt, bool multiway) const {
         RangeEquityOptions options = options_;
-        options.multiway_rollouts =
-            std::clamp(static_cast<int>(std::min<double>(options_.multiway_rollouts, kContinueDealBudget * acceptance)),
-                       std::min(kMinRangeRollouts, options_.multiway_rollouts), options_.multiway_rollouts);
+        options.seed = mix(options_.seed ^ kContinueSeedSalt ^ salt);
+        double acceptance = 1.0;
+        if (multiway) {
+            acceptance = deal_acceptance(ranges, mix(options.seed ^ kContinueSeedSalt));
+            const double budget = std::min<double>(options_.multiway_rollouts, kContinueDealBudget * acceptance);
+            options.multiway_rollouts = std::clamp(static_cast<int>(std::lround(budget * std::clamp(share, 0.0, 1.0))),
+                                                   std::min(kMinRangeRollouts, options_.multiway_rollouts),
+                                                   options_.multiway_rollouts);
+        }
         RangeEquities out(view_, std::move(ranges), *combos_, options);
         out.independent_ = independent_ || !(acceptance > 0.0);
         return out;
@@ -578,8 +579,10 @@ std::optional<CallValue> call_value(const PlayerView& view, const PotMath& math,
         double squeezed_value = 0.0;
     };
     std::vector<Answer> answers;
-    std::array<std::optional<WeightedRange>, kMaxSeats> continuing;
-    for (int i = 0; i < kMaxSeats; ++i) continuing[at(i)] = equities.range(i);
+    // Per pending player, in spot.pending's order: its call range, and its fold
+    // part (its range times the chance it folds), which it holds when it folds.
+    std::vector<std::optional<WeightedRange>> call_ranges;
+    std::vector<std::optional<WeightedRange>> fold_ranges;
     std::uint8_t pending_bits = 0;
     double no_squeeze = 1.0;
     for (const PendingPlayer& p : spot.pending) {
@@ -608,6 +611,16 @@ std::optional<CallValue> call_value(const PlayerView& view, const PotMath& math,
         Answer answer;
         double call = std::clamp(response.call, 0.0, 1.0);
         double raise = std::clamp(response.raise, 0.0, 1.0 - call);
+        std::optional<WeightedRange> folds;
+        if (range) {
+            WeightedRange part;
+            for (int combo = 0; combo < kComboCount; ++combo) {
+                const float rest = range->weight(combo) - response.call_range.weight(combo) -
+                                   response.raise_range.weight(combo);
+                if (rest > 0.0f) part.set(combo, rest);
+            }
+            if (part.total() > 0.0) folds = std::move(part);
+        }
         WeightedRange calls = std::move(response.call_range);
         // A raise Hero cannot fold to (Hero all in), or one the player cannot make
         // (it cannot cover the bet), is a call.
@@ -633,8 +646,10 @@ std::optional<CallValue> call_value(const PlayerView& view, const PotMath& math,
         answer.squeeze = raise;
         answer.call = raise < 1.0 ? call / (1.0 - raise) : 0.0;
         no_squeeze *= 1.0 - raise;
-        continuing[at(p.index)] = calls.total() > 0.0 ? std::optional<WeightedRange>(std::move(calls)) : std::nullopt;
-        if (!continuing[at(p.index)]) answer.call = 0.0;
+        call_ranges.push_back(calls.total() > 0.0 ? std::optional<WeightedRange>(std::move(calls)) : std::nullopt);
+        if (!call_ranges.back()) answer.call = 0.0;
+        if (!(answer.call < 1.0)) folds.reset();
+        fold_ranges.push_back(std::move(folds));
         answers.push_back(answer);
     }
 
@@ -648,19 +663,11 @@ std::optional<CallValue> call_value(const PlayerView& view, const PotMath& math,
     const std::size_t k = spot.pending.size();
     struct Scenario {
         double chance = 0.0;
-        std::uint8_t in = 0;  // The pending players who call
+        std::uint32_t mask = 0;  // Bit j: spot.pending[j] calls
+        std::uint8_t in = 0;     // The pending players who call, by index
+        std::vector<std::uint8_t> sets;
+        bool multiway = false;   // Some set has several opponents: a Monte Carlo
     };
-    std::vector<Scenario> scenarios;
-    for (std::uint32_t mask = 0; mask < (1u << k); ++mask) {
-        Scenario sc;
-        sc.chance = 1.0;
-        for (std::size_t j = 0; j < k; ++j) {
-            const bool calls = ((mask >> j) & 1u) != 0;
-            sc.chance *= calls ? answers[j].call : 1.0 - answers[j].call;
-            if (calls) sc.in = static_cast<std::uint8_t>(sc.in | (1u << spot.pending[j].index));
-        }
-        if (sc.chance > 0.0) scenarios.push_back(sc);
-    }
     // The players contesting a layer in a scenario: its certain players, and the
     // callers whose chips reach past the layer below.
     const auto layer_set = [&](std::size_t layer, std::uint8_t in) {
@@ -672,17 +679,46 @@ std::optional<CallValue> call_value(const PlayerView& view, const PotMath& math,
         return set;
     };
     const auto field = [&](std::uint8_t in) { return static_cast<std::uint8_t>((everyone & ~pending_bits) | in); };
-    std::vector<std::uint8_t> sets;
-    for (const Scenario& sc : scenarios) {
-        sets.push_back(field(sc.in));
-        for (std::size_t l = 0; l < layers.size(); ++l) sets.push_back(layer_set(l, sc.in));
+    std::vector<Scenario> scenarios;
+    double multiway_chance = 0.0;
+    for (std::uint32_t mask = 0; mask < (1u << k); ++mask) {
+        Scenario sc;
+        sc.chance = 1.0;
+        sc.mask = mask;
+        for (std::size_t j = 0; j < k; ++j) {
+            const bool calls = ((mask >> j) & 1u) != 0;
+            sc.chance *= calls ? answers[j].call : 1.0 - answers[j].call;
+            if (calls) sc.in = static_cast<std::uint8_t>(sc.in | (1u << spot.pending[j].index));
+        }
+        if (!(sc.chance > 0.0)) continue;
+        sc.sets.push_back(field(sc.in));
+        for (std::size_t l = 0; l < layers.size(); ++l) sc.sets.push_back(layer_set(l, sc.in));
+        sc.multiway = std::any_of(sc.sets.begin(), sc.sets.end(),
+                                  [](std::uint8_t set) { return std::popcount(static_cast<unsigned>(set)) >= 2; });
+        if (sc.multiway) multiway_chance += sc.chance;
+        scenarios.push_back(std::move(sc));
     }
-    RangeEquities cont = equities.with_ranges(std::move(continuing));
-    cont.prepare(sets);
 
+    // Each scenario deals its own hands: the certain players from their ranges, the
+    // callers from their call ranges and the folders from their fold parts (dealt,
+    // so their cards are gone, but not contesting). One opponent alone is the exact
+    // per-combo average, which leaves the folders' cards out. The Monte Carlo
+    // budget is shared out by the scenarios' chances.
     double no_squeeze_value = 0.0;
     CallValue out;
     for (const Scenario& sc : scenarios) {
+        std::array<std::optional<WeightedRange>, kMaxSeats> dealt;
+        for (int i = 0; i < kMaxSeats; ++i) {
+            if (((pending_bits >> i) & 1u) == 0) dealt[at(i)] = equities.range(i);
+        }
+        for (std::size_t j = 0; j < k; ++j) {
+            const bool calls = ((sc.mask >> j) & 1u) != 0;
+            dealt[at(spot.pending[j].index)] = calls ? call_ranges[j] : fold_ranges[j];
+        }
+        const double share = multiway_chance > 0.0 ? sc.chance / multiway_chance : 1.0;
+        RangeEquities cont = equities.with_ranges(std::move(dealt), share, sc.mask + 1, sc.multiway);
+        cont.prepare(sc.sets);
+
         double won = 0.0;
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const int previous = l == 0 ? 0 : spot.layer_tops[l - 1];
@@ -813,6 +849,7 @@ struct Decision {
     std::vector<PotLayer> layers;
     PreflopResponse chart_choice = PreflopResponse::Fold;
     bool push_fold = false;  // The chart is the push/fold table: its raise is the all-in
+    bool chart_neutral = false;  // No chart applies (a deep jam into a short Hero): no prior
     RaiseInputs inputs;  // Without equities, params and pot_kept_share, which each line sets
     CallSpot call;       // Players still to act behind a call
     const StreetStrength* strength = nullptr;  // Postflop, when a raise or a call needs it
@@ -895,7 +932,7 @@ LineResult evaluate_line(const Decision& d, RangeEquities& equities, const Arche
     // With the push/fold table the chart's raise is the all-in, so every smaller
     // raise counts as rejected.
     const auto prior = [&](PreflopResponse option, int risked, bool all_in = false) {
-        if (!preflop) return 0.0;
+        if (!preflop || d.chart_neutral) return 0.0;
         const double flat = kChartPriorBigBlinds * view.big_blind * prior_scale;
         const double scaled = kChartPriorCallShare * risked * prior_scale;
         const bool rung_for_a_jam = d.push_fold && option == PreflopResponse::Raise && !all_in;
@@ -1246,6 +1283,7 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
         const AdvisorChart chart = advisor_chart(view);
         d.chart_choice = chart.response;
         d.push_fold = chart.push_fold;
+        d.chart_neutral = chart.neutral;
     }
     if (d.chart_choice == PreflopResponse::Raise && !d.may_raise) d.chart_choice = PreflopResponse::Call;
 

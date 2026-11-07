@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdint>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -15,11 +16,16 @@ namespace {
 HandClass hc(const char* text) { return HandClass::parse(text).value(); }
 
 constexpr std::array<Position, 5> kOpeners{Position::UTG, Position::HJ, Position::CO, Position::BTN, Position::SB};
+constexpr std::array<Position, 6> kAllPositions{Position::UTG, Position::HJ, Position::CO,
+                                                Position::BTN, Position::SB, Position::BB};
 
 PreflopResponse respond_for_test(const VsRaiseRanges& ranges, HandClass hand) {
     if (ranges.raise.contains(hand)) return PreflopResponse::Raise;
     return ranges.call.contains(hand) ? PreflopResponse::Call : PreflopResponse::Fold;
 }
+
+// Share of all 1326 combos, in percent.
+double share(const HandRange& range) { return range.percent(); }
 
 HandRange defended(const VsRaiseRanges& ranges) {
     HandRange all = ranges.call;
@@ -265,6 +271,117 @@ TEST(VsOpen, KnownDecisions) {
     EXPECT_EQ(vs_open_response(hc("76s"), Position::SB, Position::UTG), PreflopResponse::Fold);
 }
 
+// --- The advisor's answers to an open ------------------------------------------
+
+TEST(AdvisorVsOpen, SharesAreInTheirBands) {
+    struct Band {
+        Position hero;
+        Position opener;
+        int players;
+        double raise_lo, raise_hi, defend_lo, defend_hi;
+    };
+    // 6-max 100 BB solver-style outputs: the BB defends ~55-65% against a BTN open
+    // with ~12-15% 3-bets, 3-bets ~10-13% against the CO and ~8-10% against UTG/HJ;
+    // the SB plays 3-bet or fold, ~10-15% against the BTN.
+    const std::array<Band, 16> bands{{
+        {Position::BB, Position::UTG, 6, 8.0, 10.0, 28.0, 36.0},
+        {Position::BB, Position::HJ, 6, 8.0, 10.0, 34.0, 42.0},
+        {Position::BB, Position::CO, 6, 10.0, 13.0, 44.0, 54.0},
+        {Position::BB, Position::BTN, 6, 12.0, 15.0, 55.0, 65.0},
+        {Position::BB, Position::SB, 6, 14.0, 19.0, 60.0, 72.0},
+        {Position::BB, Position::BTN, 2, 14.0, 20.0, 65.0, 80.0},
+        {Position::SB, Position::UTG, 6, 5.0, 8.0, 5.0, 8.0},
+        {Position::SB, Position::HJ, 6, 6.5, 9.5, 6.5, 9.5},
+        {Position::SB, Position::CO, 6, 8.5, 12.5, 8.5, 12.5},
+        {Position::SB, Position::BTN, 6, 10.0, 15.0, 10.0, 15.0},
+        {Position::HJ, Position::UTG, 6, 4.0, 6.5, 6.0, 11.0},
+        {Position::CO, Position::UTG, 6, 4.0, 6.5, 7.0, 12.0},
+        {Position::BTN, Position::UTG, 6, 4.0, 6.5, 9.0, 15.0},
+        {Position::CO, Position::HJ, 6, 5.0, 8.0, 8.0, 13.0},
+        {Position::BTN, Position::HJ, 6, 6.0, 9.0, 13.0, 19.0},
+        {Position::BTN, Position::CO, 6, 8.0, 12.0, 15.0, 22.0},
+    }};
+    for (const Band& b : bands) {
+        SCOPED_TRACE(std::string(to_string(b.hero)) + " vs " + std::string(to_string(b.opener)) + " " +
+                     std::to_string(b.players));
+        const VsRaiseRanges& r = advisor_vs_open_ranges(b.hero, b.opener, b.players);
+        EXPECT_GE(share(r.raise), b.raise_lo);
+        EXPECT_LE(share(r.raise), b.raise_hi);
+        EXPECT_GE(share(defended(r)), b.defend_lo);
+        EXPECT_LE(share(defended(r)), b.defend_hi);
+        for (const HandClass hand : hand_classes_by_strength()) {
+            EXPECT_FALSE(r.raise.contains(hand) && r.call.contains(hand)) << hand.to_string();
+        }
+    }
+    // The SB plays 3-bet or fold.
+    for (const Position opener : kOpeners) EXPECT_TRUE(advisor_vs_open_ranges(Position::SB, opener).call.empty());
+}
+
+TEST(AdvisorVsOpen, NestsAndIsWiderThanTheBots) {
+    const auto bb = [](Position opener) { return advisor_vs_open_ranges(Position::BB, opener); };
+    const std::array<Position, 5> later{Position::UTG, Position::HJ, Position::CO, Position::BTN, Position::SB};
+    for (std::size_t i = 1; i < later.size(); ++i) {
+        SCOPED_TRACE(std::string(to_string(later[i])));
+        EXPECT_TRUE(bb(later[i]).raise.contains_all(bb(later[i - 1]).raise));
+        EXPECT_TRUE(defended(bb(later[i])).contains_all(defended(bb(later[i - 1]))));
+    }
+    const VsRaiseRanges& heads_up = advisor_vs_open_ranges(Position::BB, Position::BTN, 2);
+    EXPECT_TRUE(heads_up.raise.contains_all(bb(Position::SB).raise));
+    EXPECT_TRUE(defended(heads_up).contains_all(defended(bb(Position::SB))));
+    const auto sb = [](Position opener) { return advisor_vs_open_ranges(Position::SB, opener).raise; };
+    EXPECT_TRUE(sb(Position::HJ).contains_all(sb(Position::UTG)));
+    EXPECT_TRUE(sb(Position::CO).contains_all(sb(Position::HJ)));
+    EXPECT_TRUE(sb(Position::BTN).contains_all(sb(Position::CO)));
+    const auto ip = [](Position hero, Position opener) { return advisor_vs_open_ranges(hero, opener); };
+    // Later heroes and later openers: the 3-bets and the defence widen.
+    EXPECT_TRUE(ip(Position::CO, Position::UTG).raise.contains_all(ip(Position::HJ, Position::UTG).raise));
+    EXPECT_TRUE(ip(Position::BTN, Position::UTG).raise.contains_all(ip(Position::CO, Position::UTG).raise));
+    EXPECT_TRUE(ip(Position::BTN, Position::HJ).raise.contains_all(ip(Position::BTN, Position::UTG).raise));
+    EXPECT_TRUE(ip(Position::BTN, Position::CO).raise.contains_all(ip(Position::BTN, Position::HJ).raise));
+    EXPECT_TRUE(defended(ip(Position::CO, Position::UTG)).contains_all(defended(ip(Position::HJ, Position::UTG))));
+    EXPECT_TRUE(defended(ip(Position::BTN, Position::UTG)).contains_all(defended(ip(Position::CO, Position::UTG))));
+    EXPECT_TRUE(defended(ip(Position::BTN, Position::HJ)).contains_all(defended(ip(Position::BTN, Position::UTG))));
+    EXPECT_TRUE(defended(ip(Position::BTN, Position::CO)).contains_all(defended(ip(Position::BTN, Position::HJ))));
+    // The blinds defend and 3-bet more than in the bots' tables.
+    for (const Position opener : kOpeners) {
+        SCOPED_TRACE(std::string(to_string(opener)));
+        EXPECT_GT(share(defended(bb(opener))), share(defended(vs_open_ranges(Position::BB, opener))));
+        EXPECT_GT(share(bb(opener).raise), share(vs_open_ranges(Position::BB, opener).raise));
+        EXPECT_GE(share(sb(opener)), share(vs_open_ranges(Position::SB, opener).raise));
+    }
+}
+
+TEST(AdvisorVsOpen, ThreeBetsArePolarizedAndPremiumsAlwaysRaise) {
+    for (const int players : {2, 6}) {
+        for (const Position opener : kAllPositions) {
+            for (const Position hero : kAllPositions) {
+                if (players == 2 && hero != Position::BB) continue;
+                SCOPED_TRACE(std::string(to_string(hero)) + " vs " + std::string(to_string(opener)));
+                const VsRaiseRanges& r = advisor_vs_open_ranges(hero, opener, players);
+                for (const char* premium : {"AA", "KK", "QQ", "AKs", "AKo"}) {
+                    EXPECT_TRUE(r.raise.contains(hc(premium))) << premium;
+                }
+                EXPECT_FALSE(r.raise.contains(hc("72o")) || r.call.contains(hc("72o")));
+                // A polarized part: a suited wheel ace, and outside the blinds' and
+                // early cold 3-bets a suited connector too.
+                EXPECT_TRUE(r.raise.contains(hc("A5s")) || r.raise.contains(hc("A4s")));
+            }
+        }
+    }
+    for (const Position opener : kOpeners) {
+        const VsRaiseRanges& bb = advisor_vs_open_ranges(Position::BB, opener);
+        EXPECT_TRUE(bb.raise.contains(hc("54s")) && bb.raise.contains(hc("76s"))) << to_string(opener);
+    }
+    EXPECT_TRUE(advisor_vs_open_ranges(Position::BTN, Position::CO).raise.contains(hc("65s")));
+    EXPECT_TRUE(advisor_vs_open_ranges(Position::SB, Position::BTN).raise.contains(hc("87s")));
+    // Known decisions.
+    EXPECT_EQ(respond_for_test(advisor_vs_open_ranges(Position::BB, Position::BTN), hc("K2o")), PreflopResponse::Call);
+    EXPECT_EQ(respond_for_test(advisor_vs_open_ranges(Position::BB, Position::CO), hc("TT")), PreflopResponse::Raise);
+    EXPECT_EQ(respond_for_test(advisor_vs_open_ranges(Position::BB, Position::UTG), hc("K9o")), PreflopResponse::Fold);
+    EXPECT_EQ(respond_for_test(advisor_vs_open_ranges(Position::BTN, Position::CO), hc("AJo")), PreflopResponse::Call);
+    EXPECT_EQ(respond_for_test(advisor_vs_open_ranges(Position::SB, Position::CO), hc("AJo")), PreflopResponse::Raise);
+}
+
 TEST(VsReraises, RangesNarrowAsRaisesEscalate) {
     EXPECT_EQ(vs_three_bet_response(hc("AA")), PreflopResponse::Raise);
     EXPECT_EQ(vs_three_bet_response(hc("TT")), PreflopResponse::Call);
@@ -279,9 +396,6 @@ TEST(VsReraises, RangesNarrowAsRaisesEscalate) {
 // --- Positional responses to a 3-bet and a 4-bet (the advisor's) -----------------
 
 namespace {
-
-constexpr std::array<Position, 6> kAllPositions{Position::UTG, Position::HJ, Position::CO,
-                                                Position::BTN, Position::SB, Position::BB};
 
 double continue_share(const VsRaiseRanges& ranges, const HandRange& open) {
     return 100.0 * defended(ranges).combos() / open.combos();
@@ -487,6 +601,174 @@ TEST(VsReraises, BotsChartsUnchanged) {
     EXPECT_EQ(vs_three_bet_response(hc("TT")), PreflopResponse::Call);
     EXPECT_EQ(vs_three_bet_response(hc("A5s")), PreflopResponse::Raise);
     EXPECT_EQ(vs_four_bet_response(hc("JJ")), PreflopResponse::Call);
+
+    // The bots' answers to an open, snapshotted when the advisor got its own
+    // tables (Stage 6 follow-ups): the ten tables, then which one every hero,
+    // opener and table size reads.
+    constexpr std::array<std::string_view, 10> kVsOpen{
+        // kInPositionVsEarly
+        "RRCCCFFFFRRFF"
+        "RRCCFFFFFFFFF"
+        "CFRCFFFFFFFFF"
+        "FFFCCFFFFFFFF"
+        "FFFFCCFFFFFFF"
+        "FFFFFCCFFFFFF"
+        "FFFFFFCFFFFFF"
+        "FFFFFFFCFFFFF"
+        "FFFFFFFFCFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF",
+        // kInPositionVsLate
+        "RRRCCCCFFRRRF"
+        "RRRRCFFFFFFFF"
+        "RCRCCFFFFFFFF"
+        "CFFRCCFFFFFFF"
+        "FFFFCCFFFFFFF"
+        "FFFFFCCFFFFFF"
+        "FFFFFFCCFFFFF"
+        "FFFFFFFCFFFFF"
+        "FFFFFFFFCFFFF"
+        "FFFFFFFFFCFFF"
+        "FFFFFFFFFFCFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF",
+        // kSbVsEarly
+        "RRRFFFFFFRRFF"
+        "RRRFFFFFFFFFF"
+        "FFRFFFFFFFFFF"
+        "FFFRFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF",
+        // kSbVsCutoff
+        "RRRRRFFFFRRRR"
+        "RRRRRFFFFFFFF"
+        "RFRRFFFFFFFFF"
+        "FFFRFFFFFFFFF"
+        "FFFFRFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF",
+        // kSbVsButton
+        "RRRRRRRFFRRRR"
+        "RRRRRFFFFFFFF"
+        "RRRRRFFFFFFFF"
+        "RRFRRFFFFFFFF"
+        "RFFFRRFFFFFFF"
+        "FFFFFRFFFFFFF"
+        "FFFFFFRFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF"
+        "FFFFFFFFFFFFF",
+        // kBbVsEarly
+        "RRCCCCCCCRCCC"
+        "RRCCCCFFFFFFF"
+        "CCRCCCFFFFFFF"
+        "CCFCCCFFFFFFF"
+        "CFFFCCCFFFFFF"
+        "FFFFFCCFFFFFF"
+        "FFFFFFCCFFFFF"
+        "FFFFFFFCCFFFF"
+        "FFFFFFFFCCFFF"
+        "FFFFFFFFFCCFF"
+        "FFFFFFFFFFCFF"
+        "FFFFFFFFFFFCF"
+        "FFFFFFFFFFFFC",
+        // kBbVsCutoff
+        "RRRCCCCCCRRRC"
+        "RRRCCCCCCFFFF"
+        "CCRCCCCFFFFFF"
+        "CCCRCCCFFFFFF"
+        "CCCCCCCCFFFFF"
+        "CFFFFCCCFFFFF"
+        "CFFFFFCCCFFFF"
+        "FFFFFFFCCCFFF"
+        "FFFFFFFFCCCFF"
+        "FFFFFFFFFCCFF"
+        "FFFFFFFFFFCFF"
+        "FFFFFFFFFFFCF"
+        "FFFFFFFFFFFFC",
+        // kBbVsButton
+        "RRRRCCCCCRRRR"
+        "RRRCCCCCCCCCC"
+        "RCRCCCCCCCFFF"
+        "CCCRCCCCCFFFF"
+        "CCCCRCCCCFFFF"
+        "CCCCCCCCCFFFF"
+        "CCFFCCCCCCFFF"
+        "CFFFFFCCCCCFF"
+        "CFFFFFFFCCCCF"
+        "CFFFFFFFFCCCF"
+        "CFFFFFFFFFCCF"
+        "FFFFFFFFFFFCF"
+        "FFFFFFFFFFFFC",
+        // kBbVsSb
+        "RRRRRCCCCRRRR"
+        "RRRRCCCCCCCCC"
+        "RCRCCCCCCCCCC"
+        "RCCRCCCCCCCFF"
+        "CCCCRCCCCFFFF"
+        "CCCCCRCCCCFFF"
+        "CCCCCCCCCCFFF"
+        "CCFFFCCCCCCFF"
+        "CFFFFFFCCCCCF"
+        "CFFFFFFFFCCCF"
+        "CFFFFFFFFFCCF"
+        "CFFFFFFFFFFCF"
+        "CFFFFFFFFFFFC",
+        // kBbHeadsUp
+        "RRRRRCCCCRRRR"
+        "RRRRCCCCCCCCC"
+        "RCRCCCCCCCCCC"
+        "RCCRCCCCCCCCC"
+        "CCCCRCCCCCCCF"
+        "CCCCCRCCCCCCF"
+        "CCCCCCCCCCCFF"
+        "CCCCCCCCCCCFF"
+        "CCCFFFCCCCCCF"
+        "CCCFFFFFCCCCC"
+        "CCFFFFFFFFCCC"
+        "CCFFFFFFFFFCC"
+        "CCFFFFFFFFFFC"};
+    enum Table : std::uint8_t { kIpEarly, kIpLate, kSbEarly, kSbCo, kSbBtn, kBbEarly, kBbCo, kBbBtn, kBbSb, kBbHu };
+    const auto table_for = [](Position hero, Position opener, int players) {
+        const bool early = opener == Position::UTG || opener == Position::HJ;
+        if (hero == Position::BB) {
+            if (players == 2) return kBbHu;
+            if (early) return kBbEarly;
+            return opener == Position::CO ? kBbCo : opener == Position::BTN ? kBbBtn : kBbSb;
+        }
+        if (hero == Position::SB) return early ? kSbEarly : opener == Position::CO ? kSbCo : kSbBtn;
+        return early ? kIpEarly : kIpLate;
+    };
+    for (const int players : {2, 6}) {
+        for (const Position hero : kAllPositions) {
+            for (const Position opener : kAllPositions) {
+                const std::string_view expected = kVsOpen[table_for(hero, opener, players)];
+                for (const HandClass hand : hand_classes_by_strength()) {
+                    const auto index = static_cast<std::size_t>(hand.index());
+                    EXPECT_EQ(letter(vs_open_response(hand, hero, opener, players)), expected[index])
+                        << to_string(hero) << " vs " << to_string(opener) << " " << players << " " << hand.to_string();
+                }
+            }
+        }
+    }
 }
 
 // --- Tiers -------------------------------------------------------------------

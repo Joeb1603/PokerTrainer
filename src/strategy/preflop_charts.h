@@ -84,6 +84,10 @@ private:
 const HandRange& rfi_range(Position position, int players = kMaxSeats);
 bool should_open(HandClass hand, Position position, int players = kMaxSeats);
 
+// Acting order after the flop, 0 first: SB, BB, UTG, HJ, CO, BTN. Heads-up the
+// button (which posts the small blind) acts last, as here.
+int postflop_acting_order(Position position);
+
 enum class PreflopResponse : std::uint8_t { Fold, Call, Raise };
 
 constexpr std::string_view to_string(PreflopResponse response) {
@@ -100,6 +104,19 @@ struct VsRaiseRanges {
 // enforced: a hero who limped and got raised uses the same table.
 const VsRaiseRanges& vs_open_ranges(Position hero, Position opener, int players = kMaxSeats);
 PreflopResponse vs_open_response(HandClass hand, Position hero, Position opener, int players = kMaxSeats);
+
+// The advisor's and range model's answers to a single raise, at 100 BB 6-max with
+// an open to about 2.5 BB: wider than the bots' vs_open_ranges, in the style of
+// published solver outputs, and with 3-bets that mix value and a polarized share
+// (suited wheel aces, suited connectors and broadways). The BB defends about 32%
+// against UTG, 38% HJ, 49% CO, 58% BTN and 66% SB (3-bets 8.1, 9.5, 11.5, 13.4 and
+// 16.3%), and 72% heads-up (16.9%). The SB plays 3-bet or fold (6.5% against UTG
+// up to 14.2% against the BTN), so its call range is empty. A non-blind hero cold
+// 3-bets 5-10% and flats 3-9%, more on the button and against later opens. Each
+// 3-bet range and each defended range contains the one against an earlier opener.
+// Order is not enforced, as for vs_open_ranges: a non-blind hero facing a later
+// or blind opener uses the BTN-versus-CO table. The bots never use these.
+const VsRaiseRanges& advisor_vs_open_ranges(Position hero, Position opener, int players = kMaxSeats);
 
 // Facing a 3-bet or a 4-bet. These are not positional: their ranges are so narrow
 // that position moves only the marginal hands. The bots use these; the advisor's

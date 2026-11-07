@@ -135,6 +135,24 @@ struct Charts {
     VsRaiseRanges sb_vs_three_bet;
     VsRaiseRanges heads_up_vs_three_bet;
 
+    // The advisor's answers to an open (advisor_vs_open_ranges).
+    VsRaiseRanges adv_hj_vs_utg;
+    VsRaiseRanges adv_co_vs_utg;
+    VsRaiseRanges adv_btn_vs_utg;
+    VsRaiseRanges adv_co_vs_hj;
+    VsRaiseRanges adv_btn_vs_hj;
+    VsRaiseRanges adv_btn_vs_co;
+    VsRaiseRanges adv_sb_vs_utg;
+    VsRaiseRanges adv_sb_vs_hj;
+    VsRaiseRanges adv_sb_vs_co;
+    VsRaiseRanges adv_sb_vs_btn;
+    VsRaiseRanges adv_bb_vs_utg;
+    VsRaiseRanges adv_bb_vs_hj;
+    VsRaiseRanges adv_bb_vs_co;
+    VsRaiseRanges adv_bb_vs_btn;
+    VsRaiseRanges adv_bb_vs_sb;
+    VsRaiseRanges adv_bb_heads_up;
+
     // The 3-bettor facing a 4-bet.
     VsRaiseRanges four_bet_ip_vs_early;
     VsRaiseRanges four_bet_ip;
@@ -144,6 +162,18 @@ struct Charts {
 
     static VsRaiseRanges ranges(std::string_view raise, std::string_view call) {
         return {HandRange::parse(raise), HandRange::parse(call)};
+    }
+
+    // From the 3-bet range and everything defended (3-bet or call): the call range
+    // is the difference. The 3-bets must be defended hands.
+    static VsRaiseRanges defend_ranges(std::string_view raise, std::string_view defended) {
+        VsRaiseRanges out{HandRange::parse(raise), {}};
+        const HandRange all = HandRange::parse(defended);
+        if (!all.contains_all(out.raise)) throw std::logic_error("preflop_charts: a 3-bet hand is not defended");
+        for (const HandClass hand : hand_classes_by_strength()) {
+            if (all.contains(hand) && !out.raise.contains(hand)) out.call.add(hand);
+        }
+        return out;
     }
 
     Charts() {
@@ -236,6 +266,77 @@ struct Charts {
                                        "99-22, ATs-A6s, KJs-K2s, QJs-Q6s, JTs-J8s, T9s-T7s, 98s-96s, 87s-85s, "
                                        "76s-75s, 65s-64s, 54s, AJo-A2o, KQo-K8o, QJo-Q9o, JTo, T9o");
 
+        // The advisor's answers to an open to about 2.5 BB at 100 BB (the SB opens to
+        // 2.5-3 BB), in the style of published 6-max solver outputs: wider than the
+        // bots' tables above, with 3-bets that mix value and a polarized share
+        // (suited wheel aces, suited connectors and broadways). Shares are of all
+        // 1326 combos. Each 3-bet range contains the one against an earlier opener,
+        // and so does each defended (3-bet or call) range.
+        //
+        // In position, cold: mostly 3-bet or fold early, more flats from the button.
+        // HJ vs UTG: 3-bet 5.1%, call 3.3%.
+        adv_hj_vs_utg = ranges("JJ+, AKs, AQs, AKo, AQo, KQs, A5s, A4s", "TT-77, AJs, ATs, KJs, QJs, JTs");
+        // CO vs UTG: 3-bet 5.4%, call 4.1%.
+        adv_co_vs_utg = ranges("JJ+, AKs, AQs, AKo, AQo, KQs, A5s-A3s", "TT-66, AJs, ATs, KJs, QJs, JTs, T9s");
+        // BTN vs UTG: 3-bet 5.4%, call 7.1%.
+        adv_btn_vs_utg = ranges("JJ+, AKs, AQs, AKo, AQo, KQs, A5s-A3s",
+                                "TT-22, AJs, ATs, KJs, KTs, QJs, QTs, JTs, T9s, 98s, 87s");
+        // CO vs HJ: 3-bet 6.3%, call 4.1%.
+        adv_co_vs_hj = ranges("JJ+, AKs, AQs, AKo, AQo, KQs, KJs, A5s-A3s, 76s, 65s",
+                              "TT-66, AJs, ATs, KTs, QJs, JTs, T9s, 98s");
+        // BTN vs HJ: 3-bet 7.8%, call 8.6%.
+        adv_btn_vs_hj = ranges("JJ+, AKs, AQs, AKo, AQo, KQs, KJs, A5s-A2s, 76s, 65s, 54s, KQo",
+                               "TT-22, AJs, ATs, A9s, KTs, QJs, QTs, JTs, J9s, T9s, T8s, 98s, 87s, AJo");
+        // BTN vs CO (also any later or blind opener): 3-bet 10.1%, call 8.7%.
+        adv_btn_vs_co = ranges("TT+, AKs, AQs, AKo, AQo, KQs, KJs, QJs, A5s-A2s, K9s, Q9s, 87s, 76s, 65s, 54s, KQo",
+                               "99-22, AJs-A6s, KTs, QTs, JTs, J9s, T9s, T8s, 98s, AJo, KJo");
+
+        // The SB, out of position against two players: 3-bet or fold.
+        // vs UTG 6.5%, HJ 8.1%, CO 10.7%, BTN 14.2%.
+        adv_sb_vs_utg = ranges("TT+, AKs, AQs, AJs, AKo, AQo, KQs, KJs, A5s, A4s, JTs", "");
+        adv_sb_vs_hj = ranges("99+, AKs, AQs, AJs, AKo, AQo, KQs, KJs, QJs, A5s-A2s, JTs, T9s", "");
+        adv_sb_vs_co = ranges("88+, AKs, AQs, AJs, ATs, AKo, AQo, AJo, KQs, KJs, KTs, QJs, A5s-A2s, JTs, T9s, 98s, 87s",
+                              "");
+        adv_sb_vs_btn = ranges("77+, A8s+, AKo, AQo, AJo, ATo, KQs, KJs, KTs, QJs, QTs, A5s-A2s, JTs, J9s, T9s, 98s, "
+                               "87s, KQo",
+                               "");
+
+        // The BB closes the action at a discount. Given as the 3-bets and every
+        // hand defended (3-bet or call); the call range is the difference.
+        // vs UTG: 3-bet 8.1%, call 24.0% (defend 32.1%).
+        adv_bb_vs_utg = defend_ranges(
+            "JJ+, AKs, AQs, AJs, AKo, AQo, KQs, KJs, A5s-A2s, T9s, 98s, 87s, 76s, 65s, 54s",
+            "22+, A2s+, K2s+, Q8s+, J8s+, T7s+, 96s+, 85s+, 74s+, 63s+, 53s+, 43s, A8o+, A5o, KTo+, QTo+, JTo");
+        // vs HJ: 3-bet 9.5%, call 28.7% (defend 38.2%).
+        adv_bb_vs_hj = defend_ranges(
+            "TT+, AKs, AQs, AJs, AKo, AQo, KQs, KJs, KTs, QJs, JTs, A5s-A2s, T9s, 98s, 87s, 76s, 65s, 54s",
+            "22+, A2s+, K2s+, Q4s+, J6s+, T6s+, 95s+, 85s+, 74s+, 63s+, 53s+, 43s, A8o+, A5o, K9o+, Q9o+, J9o+, "
+            "T9o");
+        // vs CO: 3-bet 11.5%, call 37.6% (defend 49.0%).
+        adv_bb_vs_co = defend_ranges(
+            "99+, AKs, AQs, AJs, AKo, AQo, AJo, KQs, KJs, KTs, QJs, Q9s, JTs, J9s, A5s-A2s, T9s, 98s, 87s, 76s, "
+            "65s, 54s",
+            "22+, A2s+, K2s+, Q2s+, J4s+, T5s+, 95s+, 84s+, 74s+, 63s+, 53s+, 43s, A7o+, A5o-A2o, K7o+, Q8o+, J8o+, "
+            "T8o+, 98o");
+        // vs BTN: 3-bet 13.4%, call 44.6% (defend 58.1%).
+        adv_bb_vs_btn = defend_ranges(
+            "88+, ATs+, AKo, AQo, AJo, KQo, KQs, KJs, KTs, QJs, Q9s, JTs, J9s, T8s, A5s-A2s, T9s, 98s, 87s, 76s, "
+            "65s, 54s",
+            "22+, A2s+, K2s+, Q2s+, J3s+, T5s+, 95s+, 84s+, 73s+, 63s+, 52s+, 43s, A2o+, K2o+, Q7o+, J8o+, T8o+, "
+            "98o, 87o, 76o");
+        // vs SB (open to 2.5-3 BB): 3-bet 16.3%, call 49.6% (defend 65.9%).
+        adv_bb_vs_sb = defend_ranges(
+            "77+, ATs+, ATo+, KJo+, KQs, KJs, KTs, K9s, K8s, QJs, Q9s, JTs, J9s, T8s, A5s-A2s, T9s, 98s, 87s, 76s, "
+            "65s, 54s",
+            "22+, A2s+, K2s+, Q2s+, J2s+, T4s+, 94s+, 84s+, 73s+, 63s+, 52s+, 42s+, 32s, A2o+, K2o+, Q5o+, J7o+, "
+            "T7o+, 97o+, 86o+, 76o, 65o");
+        // Heads-up vs the BTN: 3-bet 16.9%, call 55.7% (defend 72.5%).
+        adv_bb_heads_up = defend_ranges(
+            "77+, ATs+, ATo+, KJo+, KQs, KJs, KTs, K9s, K8s, QJs, Q9s, JTs, J9s, T8s, A5s-A2s, T9s, 98s, 97s, 87s, "
+            "86s, 76s, 65s, 54s",
+            "22+, A2s+, K2s+, Q2s+, J2s+, T2s+, 93s+, 84s+, 73s+, 62s+, 52s+, 42s+, 32s, A2o+, K2o+, Q4o+, J6o+, "
+            "T6o+, 96o+, 86o+, 75o+, 65o, 54o");
+
         // Answers to a 4-bet to about 22-25 BB, as a share of all 1326 combos.
         // In position against a UTG/HJ 4-bet: continue ~3.3% (44 combos), jam 1.2%.
         four_bet_ip_vs_early = ranges("KK+, AKs", "QQ, JJ, AKo, AQs");
@@ -260,8 +361,16 @@ bool is_early(Position position) { return position == Position::UTG || position 
 
 bool is_blind(Position position) { return position == Position::SB || position == Position::BB; }
 
-// Acting order after the flop: the blinds first, the button last.
-int postflop_order(Position position) {
+
+PreflopResponse respond(const VsRaiseRanges& ranges, HandClass hand) {
+    if (ranges.raise.contains(hand)) return PreflopResponse::Raise;
+    if (ranges.call.contains(hand)) return PreflopResponse::Call;
+    return PreflopResponse::Fold;
+}
+
+}  // namespace
+
+int postflop_acting_order(Position position) {
     switch (position) {
         case Position::SB: return 0;
         case Position::BB: return 1;
@@ -272,14 +381,6 @@ int postflop_order(Position position) {
     }
     return 0;
 }
-
-PreflopResponse respond(const VsRaiseRanges& ranges, HandClass hand) {
-    if (ranges.raise.contains(hand)) return PreflopResponse::Raise;
-    if (ranges.call.contains(hand)) return PreflopResponse::Call;
-    return PreflopResponse::Fold;
-}
-
-}  // namespace
 
 std::optional<HandClass> HandClass::parse(std::string_view text) {
     if (text.size() != 2 && text.size() != 3) return std::nullopt;
@@ -370,6 +471,36 @@ PreflopResponse vs_open_response(HandClass hand, Position hero, Position opener,
     return respond(vs_open_ranges(hero, opener, players), hand);
 }
 
+const VsRaiseRanges& advisor_vs_open_ranges(Position hero, Position opener, int players) {
+    const Charts& c = charts();
+    if (hero == Position::BB) {
+        if (players == 2) return c.adv_bb_heads_up;
+        switch (opener) {
+            case Position::UTG: return c.adv_bb_vs_utg;
+            case Position::HJ: return c.adv_bb_vs_hj;
+            case Position::CO: return c.adv_bb_vs_co;
+            case Position::BTN: return c.adv_bb_vs_btn;
+            case Position::SB:
+            case Position::BB: return c.adv_bb_vs_sb;
+        }
+        return c.adv_bb_vs_sb;
+    }
+    if (hero == Position::SB) {
+        switch (opener) {
+            case Position::UTG: return c.adv_sb_vs_utg;
+            case Position::HJ: return c.adv_sb_vs_hj;
+            case Position::CO: return c.adv_sb_vs_co;
+            default: return c.adv_sb_vs_btn;
+        }
+    }
+    if (opener == Position::UTG) {
+        if (hero == Position::HJ) return c.adv_hj_vs_utg;
+        return hero == Position::CO ? c.adv_co_vs_utg : c.adv_btn_vs_utg;
+    }
+    if (opener == Position::HJ) return hero == Position::CO ? c.adv_co_vs_hj : c.adv_btn_vs_hj;
+    return c.adv_btn_vs_co;
+}
+
 PreflopResponse vs_three_bet_response(HandClass hand) { return respond(charts().vs_three_bet, hand); }
 
 PreflopResponse vs_four_bet_response(HandClass hand) { return respond(charts().vs_four_bet, hand); }
@@ -377,7 +508,7 @@ PreflopResponse vs_four_bet_response(HandClass hand) { return respond(charts().v
 const VsRaiseRanges& vs_three_bet_ranges(Position opener, Position three_bettor, int players) {
     const Charts& c = charts();
     if (players == 2) return c.heads_up_vs_three_bet;
-    const bool in_position = postflop_order(opener) > postflop_order(three_bettor);
+    const bool in_position = postflop_acting_order(opener) > postflop_acting_order(three_bettor);
     switch (opener) {
         case Position::UTG: return in_position ? c.utg_vs_three_bet_ip : c.utg_vs_three_bet_oop;
         case Position::HJ: return in_position ? c.hj_vs_three_bet_ip : c.hj_vs_three_bet_oop;
@@ -393,7 +524,7 @@ const VsRaiseRanges& vs_four_bet_ranges(Position three_bettor, Position four_bet
     const Charts& c = charts();
     if (players == 2) return c.four_bet_heads_up;
     if (is_blind(three_bettor) && is_blind(four_bettor)) return c.four_bet_blinds;
-    if (postflop_order(three_bettor) < postflop_order(four_bettor)) return c.four_bet_oop;
+    if (postflop_acting_order(three_bettor) < postflop_acting_order(four_bettor)) return c.four_bet_oop;
     return is_early(four_bettor) ? c.four_bet_ip_vs_early : c.four_bet_ip;
 }
 

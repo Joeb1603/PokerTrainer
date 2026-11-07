@@ -1,6 +1,7 @@
 #include "advisor/advisor_charts.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <optional>
@@ -59,29 +60,65 @@ bool call_commits(const PlayerView& view) {
     return call * 3 >= std::min(me.stack, deepest - me.street_bet);
 }
 
-// The push/fold table's answer, where one applies.
-std::optional<PreflopResponse> push_fold_answer(const PlayerView& view, HandClass hand, int players,
-                                                const std::vector<PreflopRaise>& raises, int calls) {
-    if (calls > 0 || raises.size() > 1 || view.big_blind <= 0) return std::nullopt;
+// The depth of the lone preflop jam, in chips, as the range model reads it: the
+// smaller of the jammer's street total and the deepest starting stack among the
+// other players dealt in who had not folded when it was made (Hero included).
+int jam_depth(const PlayerView& view, int jammer) {
+    std::array<bool, kMaxSeats> folded{};
+    int total = 0;
+    for (const ActionRecord& a : view.actions) {
+        if (a.street != Street::Preflop || a.seat < 0 || a.seat >= kMaxSeats) continue;
+        if (a.seat == jammer && a.type == ActionType::Raise) {
+            total = a.street_total;
+            break;
+        }
+        if (a.type == ActionType::Fold) folded[at(a.seat)] = true;
+    }
+    int deepest = 0;
+    for (int i = 0; i < kMaxSeats; ++i) {
+        const PublicSeat& s = view.seats[at(i)];
+        if (i != jammer && s.position && !folded[at(i)]) deepest = std::max(deepest, starting_stack(s));
+    }
+    return std::min(total, deepest);
+}
+
+// What the push/fold tables say, where they apply; or that no chart applies.
+struct PushFoldAnswer {
+    std::optional<PreflopResponse> response;  // The table's answer
+    bool neutral = false;                     // A deep jam into a short Hero: no chart
+};
+
+// The push/fold table's answer, where one applies (advisor_charts.h).
+PushFoldAnswer push_fold_answer(const PlayerView& view, HandClass hand, int players,
+                                const std::vector<PreflopRaise>& raises, int calls) {
+    if (calls > 0 || raises.size() > 1 || view.big_blind <= 0) return {};
     const Position position = view.position.value_or(Position::BTN);
     const int mine = starting_stack(view.seats[at(view.seat)]);
     std::optional<Position> shover;
     int theirs = 0;
+    bool deep_jam = false;
     if (raises.empty()) {
         for (int i = 0; i < kMaxSeats; ++i) {
             const PublicSeat& s = view.seats[at(i)];
             if (i != view.seat && s.position && s.status == SeatStatus::Active) theirs = std::max(theirs, starting_stack(s));
         }
     } else {
-        if (!raises.front().all_in) return std::nullopt;
+        if (!raises.front().all_in) return {};
         shover = position_of(view, raises.front().player);
         theirs = starting_stack(view.seats[at(raises.front().player)]);
+        deep_jam = jam_depth(view, raises.front().player) > kPushFoldMaxStackBb * view.big_blind;
     }
     const double effective_bb = static_cast<double>(std::min(mine, theirs)) / view.big_blind;
-    if (!(effective_bb <= kPushFoldMaxStackBb)) return std::nullopt;
+    if (!(effective_bb <= kPushFoldMaxStackBb)) return {};
+    PushFoldAnswer out;
+    if (deep_jam) {
+        out.neutral = true;
+        return out;
+    }
     const int stack_bb =
         std::clamp(static_cast<int>(std::lround(effective_bb)), kPushFoldMinStackBb, kPushFoldMaxStackBb);
-    return push_fold_response(hand, position, stack_bb, shover, players);
+    out.response = push_fold_response(hand, position, stack_bb, shover, players);
+    return out;
 }
 
 PreflopResponse respond_to(const VsRaiseRanges& ranges, HandClass hand) {
@@ -104,9 +141,14 @@ AdvisorChart advisor_chart(const PlayerView& view) {
     const int count = static_cast<int>(raises.size());
 
     AdvisorChart out;
-    if (const auto table = push_fold_answer(view, hand, players, raises, calls)) {
-        out.response = *table;
+    const PushFoldAnswer table = push_fold_answer(view, hand, players, raises, calls);
+    if (table.response) {
+        out.response = *table.response;
         out.push_fold = true;
+    } else if (table.neutral) {
+        // For reference only: the commit chart, which the advisor does not apply here.
+        out.neutral = true;
+        out.response = vs_four_bet_response(hand) == PreflopResponse::Fold ? PreflopResponse::Fold : PreflopResponse::Call;
     } else if (count == 0) {
         // Limped to the big blind: raise for value, check the rest for free.
         const bool raises_first_in = position == Position::BB ? preflop_tier(hand) <= PreflopTier::Strong
@@ -117,7 +159,8 @@ AdvisorChart advisor_chart(const PlayerView& view) {
     } else if (count >= 3 || call_commits(view)) {
         out.response = vs_four_bet_response(hand);
     } else if (count == 1) {
-        out.response = vs_open_response(hand, position, position_of(view, raises[0].player), players);
+        const Position opener = position_of(view, raises[0].player);
+        out.response = respond_to(advisor_vs_open_ranges(position, opener, players), hand);
     } else if (raises[0].player == view.seat) {
         out.response = respond_to(vs_three_bet_ranges(position, position_of(view, raises[1].player), players), hand);
     } else {

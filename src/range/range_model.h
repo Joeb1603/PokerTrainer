@@ -70,8 +70,9 @@ namespace poker {
 //                                 window (fractions of the window's combos, by
 //                                 strength). The charts do not apply: their call
 //                                 ranges barely meet a limp range.
-//   Facing one raise              chart = vs_open_ranges(pos, opener), with
-//                                 raise width three_bet_width, call width flat_width
+//   Facing one raise              chart = advisor_vs_open_ranges(pos, opener) (not
+//                                 the bots' vs_open_ranges), with raise width
+//                                 three_bet_width, call width flat_width
 //   Facing a 3-bet, as the        chart = vs_three_bet_ranges(pos, 3-bettor),
 //   opener                        four_bet_width and call_3bet_width
 //   Facing a 4-bet, as the        chart = vs_four_bet_ranges(pos, 4-bettor),
@@ -87,7 +88,15 @@ namespace poker {
 //          become calls); else 0
 // so raise + call <= 1 for every class, and the same numbers serve as the
 // prediction in predict_preflop_response. The SB's charts have no call range, so
-// a SB call uses the in-position call range (vs_open_ranges(BTN, opener)).
+// a SB call uses the in-position call range (advisor_vs_open_ranges(BTN, opener)).
+//
+// A call (not all in and not committing) also responds to the raise's size, as
+// predict_preflop_response's calls do (below): with f = call_size_scale of the
+// latest raise's size_ratio (standard_preflop_raise_to), Cc is resized by
+// min(1, f), and below the standard size the range so far gains calls by
+// (f - 1) x its call mass. A limper's call scales its call width by f the same
+// way. So a flat of a min-raise reads wider than a flat of a standard open, and
+// inference and prediction agree; the raises do not depend on size.
 //
 // Stack-size overrides, checked before the table above. A raise "commits" when it
 // is all in or reaches 40% of the stack the player started the hand with; its
@@ -393,6 +402,18 @@ struct PreflopSpot {
     std::optional<double> all_in_bb;
 };
 
+// The standard street total for the next preflop raise after `raises` raise
+// records (every raise, short all-ins included) and `callers` calls, with `current`
+// the bet to match: 2.5 big blinds plus one per caller first in; against one raise
+// `current` x (3 + callers) in position and x (3.5 + callers) out of position (a
+// 3-bettor who acts before the opener after the flop, as the blinds do), the sizes
+// the positional vs-3-bet tables assume (preflop_charts.h); 2.3 x `current`
+// against two; and 0 after that (all in). The chart bots' preflop_size
+// (gto_heuristic_engine.cpp) is the same but 3x from every position. A raise's
+// size_ratio is its street total over this, computed before it was made, which
+// the inference and the advisor both use.
+double standard_preflop_raise_to(int big_blind, int raises, int callers, int current, bool out_of_position = false);
+
 // `villain_range_so_far` facing the spot's raise. The chart and widths are the
 // inference's for that spot (see above). The calls also respond to the raise's
 // size, by f = size_ratio^-0.5 for a raise at least the standard size and
@@ -406,9 +427,9 @@ struct PreflopSpot {
 // raise chart, so call shares were flat below the standard size.) So a min-raise
 // or a min-3-bet is called more often than a standard one; the raises are
 // unchanged. Measured for Baseline: the BB calls a BTN open of 1.5, 2 and 2.5 BB
-// 64.9, 48.4 and 38.7% of the time (plus the same 3-bets), and a CO open faces
+// 79.3, 59.1 and 47.3% of the time (plus the same 3-bets), and a CO open faces
 // a BB 3-bet of 0.53x, 1x and 1.4x the standard size with 68.2, 36.3 and 30.9%
-// calls. With villain_limped and a first raise, the limper's answer (above)
+// calls. The inference reads a call with the same rule. With villain_limped and a first raise, the limper's answer (above)
 // replaces the chart, its call width scaled by f.
 //
 // With all_in_bb at most 25 BB, the villain calls with the push/fold call range

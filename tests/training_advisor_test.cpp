@@ -10,6 +10,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -576,18 +577,26 @@ TEST(Advisor, FacingAShoveAgreesWithTheChartEverywhere) {
 }
 
 // The 169-class tests below take the advisor's own chart as their oracle
-// (advisor_chart_response); in these 100 BB single-raise spots it answers as the
-// bots' chart_response does.
-TEST(Advisor, AdvisorChartMatchesTheBotsChartOutsideItsOwnTables) {
+// (advisor_chart_response). Facing a single 100 BB raise it answers from its own
+// table, advisor_vs_open_ranges, which defends wider than the bots' chart.
+TEST(Advisor, AdvisorChartFacingAnOpenUsesItsOwnTable) {
+    int differs = 0;
     for (const HandClass hand : hand_classes_by_strength()) {
         GameEngine engine = six_max(2, cards_for(hand));
         while (engine.state().to_act != 5) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
         ASSERT_TRUE(engine.apply_action({ActionType::Raise, 50}));
         while (engine.state().to_act != 2) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
         const PlayerView view = engine.player_view(2);
-        EXPECT_EQ(advisor_chart_response(view), chart_response(view)) << hand.to_string();
+        const VsRaiseRanges& table = advisor_vs_open_ranges(Position::BB, Position::CO);
+        const PreflopResponse expected = table.raise.contains(hand)  ? PreflopResponse::Raise
+                                         : table.call.contains(hand) ? PreflopResponse::Call
+                                                                     : PreflopResponse::Fold;
+        EXPECT_EQ(advisor_chart_response(view), expected) << hand.to_string();
         EXPECT_FALSE(advisor_chart(view).push_fold);
+        differs += advisor_chart_response(view) != chart_response(view) ? 1 : 0;
     }
+    // The bots' chart is unchanged and narrower: TT, for one, only calls there.
+    EXPECT_GT(differs, 20);
 }
 
 TEST(Advisor, FacingANormalOpenFollowsTheChartOnWhetherToPlay) {
@@ -1450,14 +1459,13 @@ double three_bet_share(int hero, int opener, std::string& classes, const char* f
 TEST(Advisor, BbVsCoOpenThreeBetShareIsPlausible) {
     // Stage 5 found the BB 3-betting almost every hand, 72o included: the CO
     // folded 72% to any 3-bet under the non-positional chart. With the positional
-    // table the CO continues about 45%, and the advice is the chart's 3-bets
-    // (4.5% of hands) give or take what the EV outvotes. The plan's 8-15% band
-    // assumed a wider chart than the bots' BB-versus-CO 3-bet range, which this
-    // stage may not change (docs/advisor-upgrade-notes.md, Stage 6 batch C).
+    // table the CO continues about 45%, and the advice follows the advisor's own
+    // vs-open table (advisor_vs_open_ranges: 11.5% 3-bets, value plus suited wheel
+    // aces and suited connectors), inside the plan's 8-15% band.
     std::string classes;
     const double bb = three_bet_share(2, 5, classes, "72o");
     std::printf("[ Advisor ] BB vs CO 3-bets %.1f%%: %s\n", bb, classes.c_str());
-    EXPECT_GE(bb, vs_open_ranges(Position::BB, Position::CO).raise.percent() - 1e-9);
+    EXPECT_GE(bb, 8.0);
     EXPECT_LE(bb, 15.0);
     EXPECT_NE(classes.find("AA "), std::string::npos);
     // The BTN against the CO, and the SB against the BTN: plausible too.
@@ -1533,7 +1541,10 @@ TEST(Advisor, PlayersBehindAreNotCertainCallers) {
         const double everyone = equity_against_all(view, Archetype::Baseline, (1u << 5) | (1u << 1) | (1u << 2));
         std::printf("[ Advisor ] BTN AJs vs a CO open: %.1f%% (heads-up %.1f%%, three-way %.1f%%), %s\n",
                     hint.range_equity_pct, heads_up, everyone, hint.best_action.c_str());
-        EXPECT_GT(hint.range_equity_pct, heads_up - 7.0);
+        // The blinds defend from the advisor's own tables (the BB 49% of hands against
+        // a CO open, the SB 3-bets 10.7% and flats like the BTN), so the field is
+        // three-way almost half the time.
+        EXPECT_GT(hint.range_equity_pct, heads_up - 9.0);
         EXPECT_LT(hint.range_equity_pct, heads_up);
         EXPECT_GT(hint.range_equity_pct, everyone + 10.0);
         // The archetype lines use the same treatment.
@@ -1567,6 +1578,165 @@ TEST(Advisor, PlayersBehindAreNotCertainCallers) {
         EXPECT_GT(hint.range_equity_pct, everyone + 3.0);
         expect_consistent_outcomes(view, hint);
     }
+}
+
+// CO AcQd facing a 10 BB UTG jam with the BTN and both blinds still to act: each
+// scenario of who calls deals its own hands, the callers from their call ranges
+// and the folders from their fold parts (a folder holding call-range cards made
+// three-way equity about 2.3 pp too low). The reference rebuilds the call EV from
+// the range model's public functions: the nobody-calls scenario at the exact
+// per-combo equity, as the advisor scores one opponent, the others by a large
+// Monte Carlo.
+TEST(Advisor, PlayersBehindWhoFoldHoldTheirFoldParts) {
+    GameConfig config;
+    config.first_button = 0;
+    config.hero_seat = std::nullopt;
+    config.stacks = std::array<int, kMaxSeats>{2000, 2000, 2000, 200, 2000, 2000};
+    GameEngine engine(config);
+    ScriptedDeal deal;
+    deal.holes[5] = hole("Ac", "Qd");
+    deal.holes[0] = hole("2s", "3s");
+    deal.holes[1] = hole("2d", "3d");
+    deal.holes[2] = hole("2h", "3h");
+    deal.holes[3] = hole("4s", "5s");
+    deal.holes[4] = hole("4d", "5d");
+    deal.board = board_of("6c", "7c", "8h", "9s", "Td");
+    engine.start_hand(deal);
+    ASSERT_TRUE(engine.apply_action({ActionType::AllIn, 0}));
+    ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+    const PlayerView view = engine.player_view(5);
+    ASSERT_EQ(advisor_chart_response(view), PreflopResponse::Call);
+    AdvisorOptions options;
+    options.archetype_lines = false;
+    const HintRecommendation hint = TrainingAdvisor(25, options).analyze(view);
+    const double model = *hint.base_ev.check_call - (20.0 + 0.25 * 200.0);  // Less the chart prior
+
+    const ArchetypeParams& params = archetype_params(Archetype::Baseline);
+    std::array<std::optional<WeightedRange>, kMaxSeats> ranges = infer_ranges(view, params);
+    const CardMask dead = card_mask(std::span<const Card>(*view.own_hole));
+    for (std::optional<WeightedRange>& r : ranges) {
+        if (r) r->remove_cards(dead);
+    }
+    const ComboEquities heads_up = hero_vs_each_combo(*view.own_hole, {}, combos_in(*ranges[3]));
+    const std::array<int, 3> pending{0, 1, 2};  // BTN, SB, BB
+    std::array<double, 3> calls{};
+    std::array<WeightedRange, 3> call_ranges;
+    std::array<WeightedRange, 3> fold_parts;
+    for (std::size_t j = 0; j < pending.size(); ++j) {
+        const WeightedRange& range = *ranges[static_cast<std::size_t>(pending[j])];
+        PreflopSpot spot;
+        spot.villain = *view.seats[static_cast<std::size_t>(pending[j])].position;
+        spot.raiser = Position::UTG;
+        spot.raises = 1;
+        spot.size_ratio = 200.0 / 50.0;
+        spot.villain_raised_last = false;
+        spot.all_in_bb = 10.0;
+        const Response r = predict_preflop_response(range, spot, params);
+        ASSERT_EQ(r.raise, 0.0);
+        calls[j] = r.call;
+        call_ranges[j] = r.call_range;
+        for (int combo = 0; combo < kComboCount; ++combo) {
+            fold_parts[j].set(combo, std::max(0.0f, range.weight(combo) - r.call_range.weight(combo)));
+        }
+    }
+    const auto reference = [&](bool folders_from_fold_parts) {
+        double ev = 0.0;
+        for (std::uint32_t mask = 0; mask < 8; ++mask) {
+            double chance = 1.0;
+            double pot = 430.0;
+            std::array<std::optional<WeightedRange>, kMaxSeats> dealt{};
+            dealt[3] = ranges[3];
+            std::uint8_t field = 1u << 3;
+            for (std::size_t j = 0; j < pending.size(); ++j) {
+                const auto seat = static_cast<std::size_t>(pending[j]);
+                const bool in = ((mask >> j) & 1u) != 0;
+                chance *= in ? calls[j] : 1.0 - calls[j];
+                if (in) {
+                    dealt[seat] = call_ranges[j];
+                    field = static_cast<std::uint8_t>(field | (1u << seat));
+                    pot += view.seats[seat].stack + view.seats[seat].street_bet > 200 ? 200 - view.seats[seat].street_bet : 0;
+                } else {
+                    dealt[seat] = folders_from_fold_parts ? fold_parts[j] : call_ranges[j];
+                }
+            }
+            double equity = equity_vs_range(heads_up, *ranges[3]).value();
+            if (mask != 0) {
+                RangeEquityOptions mc;
+                mc.seed = 17 + mask;
+                mc.multiway_rollouts = 60000;
+                const std::array<LayerRequest, 1> layer{LayerRequest{field}};
+                equity = equity_vs_ranges(*view.own_hole, {}, dealt, layer, mc).equity[0];
+            }
+            ev += chance * (equity * pot - 200.0);
+        }
+        return ev;
+    };
+    const double fold_parts_ev = reference(true);
+    const double call_ranges_ev = reference(false);
+    std::printf("[ Advisor ] CO AQo call vs a 10 BB UTG jam: model %+.1f, reference %+.1f (folders from call "
+                "ranges %+.1f)\n",
+                model, fold_parts_ev, call_ranges_ev);
+    EXPECT_NEAR(model, fold_parts_ev, 2.0);
+    EXPECT_GT(fold_parts_ev, call_ranges_ev + 2.0);
+}
+
+// A deep jam into a short Hero: the BB has 10 BB, the BTN jams 100 BB with the SB
+// (100 BB) still to act behind it. The range model reads that jam at 100 BB (the
+// commit range), so the 10 BB push/fold call table, which assumes a 10 BB jam
+// and calls 22 and 55, no longer applies, and no other chart does: the range EV
+// alone decides. Against JJ+ and AK a 10 BB call needs about 44%.
+TEST(Advisor, DeepJamIntoAShortStackHasNoChartPrior) {
+    const auto spot = [](const char* a, const char* b, int sb_stack) {
+        GameConfig config;
+        config.first_button = 0;
+        config.hero_seat = std::nullopt;
+        config.stacks = std::array<int, kMaxSeats>{2000, sb_stack, 200, 2000, 2000, 2000};
+        GameEngine engine(config);
+        ScriptedDeal deal;
+        deal.holes[2] = hole(a, b);
+        deal.board = board_of("2c", "7d", "Jc", "4d", "9c");
+        std::array<bool, kDeckSize> used{};
+        for (const Card c : deal.board) used[c.id] = true;
+        used[card(a).id] = used[card(b).id] = true;
+        int next = 0;
+        for (int s = 0; s < kMaxSeats; ++s) {
+            if (deal.holes[s]) continue;
+            std::array<Card, 2> h{};
+            for (Card& c : h) {
+                while (used[static_cast<std::size_t>(next)]) ++next;
+                used[static_cast<std::size_t>(next)] = true;
+                c = Card(next);
+            }
+            deal.holes[s] = h;
+        }
+        engine.start_hand(deal);
+        while (engine.state().to_act != 0) EXPECT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+        EXPECT_TRUE(engine.apply_action({ActionType::AllIn, 0}));
+        EXPECT_TRUE(engine.apply_action({ActionType::Fold, 0}));  // SB
+        return engine.player_view(2);
+    };
+    const TrainingAdvisor advisor(65, kFastOptions);
+    for (const auto& [a, b, calls] : std::vector<std::tuple<const char*, const char*, bool>>{
+             {"2s", "2h", false}, {"5s", "5h", false}, {"Qs", "Qh", true}, {"Ks", "Kh", true}, {"As", "Ah", true}}) {
+        const PlayerView view = spot(a, b, 2000);
+        const AdvisorChart chart = advisor_chart(view);
+        EXPECT_TRUE(chart.neutral) << a << b;
+        EXPECT_FALSE(chart.push_fold) << a << b;
+        const HintRecommendation hint = advisor.analyze(view);
+        EXPECT_EQ(hint.action.type, calls ? ActionType::Call : ActionType::Fold) << a << b << ": " << hint.best_action;
+        // No prior: the call's EV is the range EV alone, equity times what Hero can
+        // win less the call.
+        const PotMath math = pot_math(view);
+        EXPECT_NEAR(*hint.base_ev.check_call,
+                    hint.range_equity_pct / 100.0 * (math.contestable + math.to_call) - math.to_call, 1e-6);
+    }
+    // With the SB short too, the jam is only a 10 BB jam for everyone still in
+    // behind it: the push/fold table applies again, and calls 22.
+    const PlayerView shallow = spot("2s", "2h", 200);
+    EXPECT_TRUE(advisor_chart(shallow).push_fold);
+    EXPECT_FALSE(advisor_chart(shallow).neutral);
+    EXPECT_EQ(advisor_chart_response(shallow),
+              push_fold_response(HandClass::parse("22").value(), Position::BB, 10, Position::BTN));
 }
 
 // Run by hand in Release: hint latency by street and opponent count, default
