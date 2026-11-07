@@ -1,0 +1,86 @@
+# Builds poker_trainer.exe with MSVC on Windows, runs the full test suite in
+# Release and Debug, and (optionally) publishes a GitHub release with the exe.
+# Run it by hand from the Actions tab: "Windows release" > "Run workflow".
+name: Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z). Notes are read from .github/release-notes/<tag>.md
+        required: true
+        default: v1.2.0
+      title:
+        description: Release title
+        required: true
+        default: "PokerTrainer v1.2.0: Range-Based Advice, Player Types and Solver Mode"
+      publish:
+        description: Publish the release (off = build and test only)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.config }} build and tests
+    runs-on: windows-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        config: [Release, Debug]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config ${{ matrix.config }} --parallel > build.log 2>&1
+          $code = $LASTEXITCODE
+          Get-Content build.log
+          exit $code
+
+      - name: Check for warnings in project code
+        shell: pwsh
+        run: ./.github/scripts/check-warnings.ps1 -Log build.log
+
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure -j 4
+
+      - name: Upload the exe
+        if: matrix.config == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: poker_trainer-exe
+          path: build/Release/poker_trainer.exe
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: poker_trainer-exe
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          notes=".github/release-notes/${TAG}.md"
+          test -f "$notes" || { echo "Missing $notes"; exit 1; }
+          gh release create "$TAG" dist/poker_trainer.exe \
+            --title "$TITLE" --notes-file "$notes" --target "$GITHUB_SHA"
