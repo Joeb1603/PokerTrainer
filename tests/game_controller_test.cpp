@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -599,6 +601,40 @@ TEST_F(Controller, EarlyFoldIsRefusedAtHerosTurnAndDoesNotCarryOver) {
 
 // --- Revealing bot hands -----------------------------------------------------
 
+TEST_F(Controller, RevealShowsHerosOwnFoldedCards) {
+    LocalGameController c(options());
+    int folded_hands = 0;
+    for (int hand = 0; hand < 20; ++hand) {
+        std::optional<std::array<Card, 2>> dealt;
+        play_hand_out(c, [&](const TableSnapshot& s) {
+            dealt = s.seats[kHeroSeat].visible_hole;
+            return Action{s.legal.allows(ActionType::Check) ? ActionType::Check : ActionType::Fold};
+        });
+        const TableSnapshot before = c.snapshot();
+        const SeatSnapshot& hero_before = before.seats[kHeroSeat];
+        if (hero_before.status == SeatStatus::Folded && dealt) {
+            ++folded_hands;
+            EXPECT_FALSE(hero_before.holds_cards);
+            EXPECT_FALSE(hero_before.revealed_after_fold);  // Not drawn until revealed
+
+            ASSERT_TRUE(c.reveal_bot_hands());
+            const SeatSnapshot& hero = c.snapshot().seats[kHeroSeat];
+            EXPECT_TRUE(hero.revealed_after_fold);
+            ASSERT_TRUE(hero.visible_hole);
+            EXPECT_EQ(*hero.visible_hole, *dealt);
+            EXPECT_EQ(hero.won, hero_before.won);
+            EXPECT_EQ(hero.shown_hand, hero_before.shown_hand);
+        }
+        if (c.snapshot().phase == ControllerPhase::SessionOver) {
+            c.new_session();
+        } else {
+            ASSERT_TRUE(c.next_hand());
+        }
+        EXPECT_FALSE(c.snapshot().seats[kHeroSeat].revealed_after_fold);
+    }
+    EXPECT_GT(folded_hands, 0);
+}
+
 TEST_F(Controller, RevealIsRefusedDuringAHandAndShowsEveryBotAfterIt) {
     fs::path log_path;
     std::vector<std::vector<std::string>> revealed_cards;
@@ -627,7 +663,7 @@ TEST_F(Controller, RevealIsRefusedDuringAHandAndShowsEveryBotAfterIt) {
                 EXPECT_EQ(s.shown_hand, before.seats[seat].shown_hand);
                 EXPECT_EQ(s.won, before.seats[seat].won);
                 ASSERT_EQ(s.position.has_value(), s.visible_hole.has_value()) << "seat " << seat;
-                EXPECT_EQ(s.revealed_after_fold, seat != kHeroSeat && s.position && s.status == SeatStatus::Folded);
+                EXPECT_EQ(s.revealed_after_fold, s.position && s.status == SeatStatus::Folded);
                 if (s.visible_hole) {
                     EXPECT_TRUE(ids.insert((*s.visible_hole)[0].id).second);
                     EXPECT_TRUE(ids.insert((*s.visible_hole)[1].id).second);
