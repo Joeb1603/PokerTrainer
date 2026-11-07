@@ -61,6 +61,7 @@ struct SolverAdvice {
     Action best;  // The most frequent option; ties go to the cheaper action
     std::string best_label;
     std::string street_label;  // "River", "Turn", "Flop (approximate: no river betting)" or "Flop"
+    double target_pct = 0.0;   // The tree's target_exploitability_pct; see solve_is_usable
 };
 
 struct SolverProgress {

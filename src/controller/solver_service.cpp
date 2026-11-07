@@ -254,6 +254,7 @@ SolverProgress SolverService::solve(const SolveRequest& request, std::stop_token
 
     SolverAdvice advice;
     advice.street_label = std::string(street_label(*tree));
+    advice.target_pct = target;
     for (std::size_t a = 0; a < root.actions.size(); ++a) {
         const std::optional<Action> action = table_action(view, root.actions[a]);
         if (!action) continue;  // Not legal at the table (a raise the table does not reopen)

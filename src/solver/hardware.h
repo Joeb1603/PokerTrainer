@@ -87,6 +87,19 @@ std::string_view street_label(SolverTree tree);
 // 0.3 (river), 0.8 (turn) or 2 (flop).
 double target_exploitability_pct(SolverTree tree);
 
+// A finished solve is close enough to follow (Play GTO, the accent heading) when its
+// exploitability is at most this many times its tree's target: 0.9% of the pot on the
+// river, 2.4% on the turn, 6% on the flop. A chosen margin, not a measured one: it
+// passes the default 8 s budget on the review's heads-up spot (turn 1.6%, flop 5.8%)
+// and rejects 2 s (turn 16.4%, flop 31.6%), where the most frequent action flipped
+// between budgets. Done without a final exploitability counts as not usable.
+inline constexpr double kUsableExploitabilityFactor = 3.0;
+
+constexpr bool solve_is_usable(double exploitability_pct, double target_pct) {
+    // The tolerance keeps the limit itself usable: 3 * 0.3 is just under 0.9 in doubles.
+    return target_pct > 0.0 && exploitability_pct <= kUsableExploitabilityFactor * target_pct + 1e-9;
+}
+
 // One line for a tooltip, e.g. "4 threads, 15.6 GB free: solves river and turn,
 // flop approximate".
 std::string hardware_summary(const HardwareInfo& info, SolverTier tier);

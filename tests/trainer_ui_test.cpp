@@ -195,6 +195,20 @@ protected:
         return false;
     }
 
+    // Every piece of text one frame draws, clipped or not (ImGui's logging).
+    std::string drawn_text() {
+        for (int i = 0; i < 3; ++i) frame();
+        ImGui::NewFrame();
+        ImGui::LogToBuffer();
+        ui_->draw();
+        ImGuiContext& g = *ImGui::GetCurrentContext();
+        std::string text = g.LogBuffer.c_str();
+        ImGui::LogFinish();
+        g.LogBuffer.clear();
+        ImGui::Render();
+        return text;
+    }
+
     // A Baseline hint plus the three archetype lines, each with a different action.
     void set_lines() {
         set_hint({ActionType::Raise, 500});
@@ -244,6 +258,7 @@ protected:
             advice.best = {ActionType::Call};
             advice.best_label = "CALL 100";
             advice.street_label = "Turn";
+            advice.target_pct = 0.8;  // 1.8% is within 3x: converged
             progress.advice = advice;
         }
     }
@@ -712,6 +727,56 @@ TEST_F(UiTest, PlayGtoUsesSolverWhenDone) {
     EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: CALL 100 (solver)"));
     click(kPlayGto);
     expect_single_action(fake_, ActionType::Call);
+}
+
+// Done is not enough: past 3x the street's target (turn 0.8%, so 2.4%) the solve is
+// shown muted with a note, and Play GTO keeps the heuristic line.
+TEST_F(UiTest, PlayGtoIgnoresAnUnconvergedSolve) {
+    set_hint({ActionType::Raise, 500});
+    set_solver(SolverState::Done);
+    fake_.table.solver.progress.exploitability_pct = 10.0;
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: RAISE to 500 (100% Pot)"));
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Raise, 500);
+    const std::string text = drawn_text();
+    EXPECT_NE(text.find("Solver (approximate): CALL 100 (most frequent)"), std::string::npos) << text;
+    EXPECT_NE(text.find("Not converged (10.0% of pot): Play GTO uses the heuristic advice."), std::string::npos) << text;
+    EXPECT_EQ(text.find("(solver)"), std::string::npos) << text;
+
+    // Without a final exploitability, or right at the limit.
+    fake_.table.solver.progress.exploitability_pct.reset();
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: RAISE to 500 (100% Pot)"));
+    fake_.table.solver.progress.exploitability_pct = 2.4;
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: CALL 100 (solver)"));
+}
+
+// The heading says the solver is approximate, the mistakes note is in its tooltip,
+// and a queued job reads "Starting...".
+TEST_F(UiTest, SolverHeadingSaysApproximate) {
+    set_lines();
+    set_solver(SolverState::Done);
+    std::string text = drawn_text();
+    EXPECT_NE(text.find("Solver (approximate): CALL 100 (most frequent)"), std::string::npos) << text;
+    EXPECT_NE(text.find("Approximate solver: simplified bet sizes, assumed ranges."), std::string::npos) << text;
+    EXPECT_EQ(text.find("Not converged"), std::string::npos) << text;
+
+    set_solver(SolverState::Running);
+    fake_.table.solver.progress.iterations = 0;
+    fake_.table.solver.progress.exploitability_pct.reset();
+    fake_.table.solver.progress.note = "Starting";
+    text = drawn_text();
+    EXPECT_NE(text.find("Starting\xE2\x80\xA6"), std::string::npos) << text;
+    EXPECT_EQ(text.find("0 iterations"), std::string::npos) << text;
+}
+
+TEST(SolverUsable, ThreeTimesTheTarget) {
+    EXPECT_TRUE(solve_is_usable(0.9, target_exploitability_pct(SolverTree::River)));
+    EXPECT_FALSE(solve_is_usable(0.91, target_exploitability_pct(SolverTree::River)));
+    EXPECT_TRUE(solve_is_usable(2.4, target_exploitability_pct(SolverTree::Turn)));
+    EXPECT_FALSE(solve_is_usable(10.0, target_exploitability_pct(SolverTree::Turn)));
+    EXPECT_TRUE(solve_is_usable(5.8, target_exploitability_pct(SolverTree::FlopCheckDown)));
+    EXPECT_FALSE(solve_is_usable(6.1, target_exploitability_pct(SolverTree::FlopFull)));
+    EXPECT_FALSE(solve_is_usable(0.0, 0.0));  // No target: never usable
 }
 
 TEST_F(UiTest, PlayGtoUsesHeuristicWhileRunning) {

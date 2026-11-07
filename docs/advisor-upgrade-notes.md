@@ -1230,7 +1230,7 @@ Regret above 1 BB covers 13% of tuned hands (15% pre-tuning); the solver's frequ
 
 **Tests:** 491 pass in Release (9.3 s wall) and Debug (37.5 s): 488 plus 3 new. GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `advisor_bench.cpp` and `bench_test.cpp`.
 
-### Stage 8 review, uncommitted, on top of `e07d799`
+### Stage 8 review, on top of `e07d799`
 
 No defect needed a code change. 491 tests pass in Release and Debug, zero warnings in Release, Debug and clang, `strict.sh` clean on `src/solver/*.cpp`, `solver_service.cpp`, `local_game_controller.cpp`, `trainer_ui.cpp` and `main.cpp`; clang `-Wshadow-all` (lambda parameters too, which MSVC's C4456 also flags) is clean on the same files and the two solver test files. Bench unchanged (0.694 BB, 57%).
 
@@ -1251,6 +1251,26 @@ No defect needed a code change. 491 tests pass in Release and Debug, zero warnin
 - Playing the solver's action can be recorded as a hero mistake, because mistakes stay on Baseline `base_ev` (decision 5); the UI does not say so.
 
 **Test changes:** none.
+
+**Fixes after the review** (UI, one additive snapshot field, one helper; no change to the solver math, the heuristic advisor, bots or the JSONL schema)
+- **Play GTO follows only a converged solve.** New `solve_is_usable(exploitability_pct, target_pct)` and `kUsableExploitabilityFactor = 3.0` in `solver/hardware.h`, the only place the rule lives: usable when the exploitability is at most 3 × the tree's `target_exploitability_pct` (river 0.3% → 0.9%, turn 0.8% → 2.4%, flop 2% → 6%; a 1e-9 tolerance keeps the limit itself usable, since 3 × 0.3 is just under 0.9 in doubles). `SolverAdvice` gains `double target_pct` (additive), which `SolverService::solve` sets from the tree. The UI's `solve_converged` needs Done, advice, a final exploitability and the rule; `solver_advice()` (Play GTO's "(solver)" line) uses it. An unconverged Done result is still shown, but muted: the heading and every table row in the muted colour, then "Not converged (X% of pot): Play GTO uses the heuristic advice. Raise the budget for a closer solve.", and Play GTO keeps the heuristic (or archetype) line.
+- **Why 3×:** a chosen margin, not a tuned one. The target is where a solve stops early, so a solve that ran its whole budget ends above it; 3× still accepts the default 8 s budget on the review's spot (turn 1.6%, flop 5.8%) and rejects the 2 s budget (16.4%, 31.6%), where the most frequent action flipped between budgets. Whether Hero's own top action is stable below 3× was not measured. Measured exploitability at small budgets, on the heads-up spot of `SolverService.DISABLED_ReportEndToEndTimes`, Turn tier:
+
+| Budget | Threads | Flop (approximate) | Turn | Usable at 3× (flop 6%, turn 2.4%) |
+|---|---|---|---|---|
+| 2 s | 1 | 221% | - | no |
+| 2 s | 3 | 31.6% | 16.4% | no / no |
+| 8 s (default) | 3 | 5.8% | 1.6% | yes / yes |
+
+- **The approximate label stays visible:** the heading is now "Solver (approximate): X (most frequent)", so at 1180x760, where the panel scrolls, the label is on screen. "Approximate solver: simplified bet sizes, assumed ranges." stays below the table.
+- **Mistakes against the solver:** the heading and the "Play GTO: X (solver)" button have the tooltip "Mistakes are judged against the heuristic Baseline, so following the solver can still be flagged." (a tooltip rather than a line, to save the panel's height).
+- **Cosmetic:** while the job is queued (note "Starting", no iterations) the status line reads "Starting…" instead of "Starting: 0 iterations". The setup phase after the tree is chosen still reads "<street>: 0 iterations".
+- **Screenshots** (Release under Xvfb, `--auto-shove --stop-on flop --solver --solver-tier turn --size 1180x760 --exit-after-frames 900`):
+  - `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_solver_min2.png`: seed 8, `--solver-budget 4000`. Facing 125 on JhAs3d: Done at 30 iterations, 1.9% of pot (under 6%); "Solver (approximate): CALL 125 (most frequent)" in the accent colour, wrapping to two lines, FOLD 29% / CALL 49% / RAISE 20% visible, "Play GTO: CALL 125 (solver)". The heading is fully visible above the scroll; the action log keeps three lines.
+  - `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_solver_unconverged.png`: seed 9, `--solver-budget 2000`. J8o on Ts5c7s: Done at 39 iterations, 10.4% of pot; the heading muted ("BET 38 (76% Pot)"), the "Not converged (10.4% of pot)" note under it, and "Play GTO: BET 25 (50% Pot)", the heuristic line.
+- **Tests:** 494 pass in Release (8.9 s wall) and Debug (34.9 s): 491 plus 3 new. GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `trainer_ui.cpp`, `solver_service.cpp` and `trainer_ui_test.cpp`.
+
+**Test changes (fixes)** (`tests/trainer_ui_test.cpp`): no assertion changed. `set_solver`'s Done advice now sets `target_pct = 0.8`, so its 1.8% stays converged and `PlayGtoUsesSolverWhenDone`, `PlayGtoUsesHeuristicForArchetypeLines`, `ExistingSidebarButtonsDidNotMove` and `EveryScreenDrawsWithFullData` pass unchanged. New helper `drawn_text()` (every text a frame draws, clipped or not, through ImGui's `LogToBuffer`). New tests: `UiTest.PlayGtoIgnoresAnUnconvergedSolve` (Done at 10% on the turn: the heuristic action and label, the muted note, no "(solver)"; no exploitability: heuristic; exactly 2.4%: solver), `UiTest.SolverHeadingSaysApproximate` (the heading and the long line; "Starting…" and no "0 iterations" while queued) and `SolverUsable.ThreeTimesTheTarget`.
 
 ## Unverified
 

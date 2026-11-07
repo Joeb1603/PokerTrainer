@@ -200,6 +200,16 @@ void wrapped_tooltip(const char* text) {
     }
 }
 
+// Hero mistakes stay on the heuristic model's base_ev (CLAUDE.md section 11).
+constexpr const char* kSolverMistakesNote =
+    "Mistakes are judged against the heuristic Baseline, so following the solver can still be flagged.";
+
+// A finished solve close enough to its target to follow (see solve_is_usable).
+bool solve_converged(const SolverProgress& progress) {
+    return progress.state == SolverState::Done && progress.advice && progress.exploitability_pct &&
+           solve_is_usable(*progress.exploitability_pct, progress.advice->target_pct);
+}
+
 // The "Advice:" choices: generic player types, assumed for every opponent at once.
 struct AdviceChoice {
     Archetype type;
@@ -560,6 +570,7 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
             // Solver mode, Baseline selected and the solve for this decision done.
             const std::string gto_label = "Play GTO: " + solved->best_label + " (solver)";
             if (ImGui::Button(gto_label.c_str(), {u(420.0f), u(30.0f)})) chosen = solved->best;
+            wrapped_tooltip(kSolverMistakesNote);
         } else if (s.hint) {
             // Follows the "Advice:" selector; Baseline when no line is selected or available.
             const AdviceLine* line = selected_line(*s.hint);
@@ -822,7 +833,7 @@ const SolverAdvice* TrainerUi::solver_advice() const {
     const TableSnapshot& s = controller_.snapshot();
     const SolverProgress& progress = s.solver.progress;
     if (!show_advisor_ || advice_focus_ != Archetype::Baseline || !controller_.solver_enabled()) return nullptr;
-    if (s.phase != ControllerPhase::HeroToAct || progress.state != SolverState::Done || !progress.advice) return nullptr;
+    if (s.phase != ControllerPhase::HeroToAct || !solve_converged(progress)) return nullptr;
     return &*progress.advice;
 }
 
@@ -864,10 +875,12 @@ void TrainerUi::draw_solver() {
     ImGui::ProgressBar(done ? 1.0f : static_cast<float>(std::clamp(progress.progress, 0.0, 1.0)), {-1.0f, 0.0f},
                        done ? "Done" : nullptr);
 
-    // "Turn: 340 iterations, exploitability 1.8% of pot"
+    // "Turn: 340 iterations, exploitability 1.8% of pot"; "Starting..." while queued.
     const std::string street = progress.advice ? progress.advice->street_label : progress.note;
     char status[160];
-    if (progress.exploitability_pct) {
+    if (!done && progress.iterations == 0 && street == "Starting") {
+        std::snprintf(status, sizeof status, "Starting\xE2\x80\xA6");  // U+2026, an ellipsis
+    } else if (progress.exploitability_pct) {
         std::snprintf(status, sizeof status, "%s: %d iterations, exploitability %.1f%% of pot", street.c_str(),
                       progress.iterations, *progress.exploitability_pct);
     } else {
@@ -882,11 +895,22 @@ void TrainerUi::draw_solver() {
 
     if (done && progress.advice) {
         const SolverAdvice& advice = *progress.advice;
+        // Only a converged solve is followed: in the accent colour, and by Play GTO.
+        const bool converged = solve_converged(progress);
+        const ImVec4 highlight = converged ? kAccentText : kMutedText;
         ImGui::PushFont(fonts_.bold);
-        ImGui::PushStyleColor(ImGuiCol_Text, kAccentText);
-        ImGui::TextWrapped("Solver: %s (most frequent)", advice.best_label.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, highlight);
+        ImGui::TextWrapped("Solver (approximate): %s (most frequent)", advice.best_label.c_str());
         ImGui::PopStyleColor();
         ImGui::PopFont();
+        wrapped_tooltip(kSolverMistakesNote);
+        if (!converged) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
+            ImGui::TextWrapped("Not converged (%.1f%% of pot): Play GTO uses the heuristic advice. Raise the budget for a "
+                               "closer solve.",
+                               progress.exploitability_pct.value_or(100.0));
+            ImGui::PopStyleColor();
+        }
 
         // Action | freq | EV, in the tree's order (the panel scrolls if it is too tall).
         if (ImGui::BeginTable("##solver", 3, ImGuiTableFlags_SizingFixedFit)) {
@@ -895,7 +919,7 @@ void TrainerUi::draw_solver() {
             ImGui::TableSetupColumn("ev", ImGuiTableColumnFlags_WidthFixed);
             for (const SolverOption& option : advice.options) {
                 const bool best = option.label == advice.best_label;
-                const ImVec4 color = best ? kAccentText : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                const ImVec4 color = !converged ? kMutedText : best ? kAccentText : ImGui::GetStyleColorVec4(ImGuiCol_Text);
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::TextColored(color, "%s", option.label.c_str());
