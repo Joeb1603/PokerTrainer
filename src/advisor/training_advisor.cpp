@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "advisor/advisor_charts.h"
 #include "bots/gto_heuristic_engine.h"
 #include "range/hand_vs_range.h"
 #include "strategy/preflop_charts.h"
@@ -38,6 +39,7 @@ constexpr double kImpliedShare = 0.5;
 constexpr double kImpliedPotCap = 0.5;
 constexpr double kShoveMaxPots = 1.5;
 constexpr int kPreflopShoveMaxBigBlinds = 15;
+constexpr double kCommitStackShare = 0.40;  // As the range model's committing raise
 constexpr double kVeryStrongBar = 0.5;
 constexpr double kSolidBar = 0.3;
 constexpr double kChartPriorBigBlinds = 1.0;
@@ -59,6 +61,8 @@ constexpr int kLineRolloutDivisor = 3;
 constexpr double kLineDealBudget = 150000.0;
 constexpr int kAcceptanceTrials = 512;
 constexpr std::uint64_t kRangeSeedSalt = 0xD1B54A32D192ED03ULL;
+constexpr std::uint64_t kContinueSeedSalt = 0x8CB92BA72F3D8DD7ULL;
+constexpr double kContinueDealBudget = 30000.0;
 
 std::size_t at(int index) { return static_cast<std::size_t>(index); }
 
@@ -92,7 +96,32 @@ struct PreflopLevels {
     int levels = 0;
     int callers = 0;
     int last_full = 0;
+    std::array<int, 8> level_seats{-1, -1, -1, -1, -1, -1, -1, -1};  // Who made each level (index level - 1)
+    // The latest raise record: its maker, street total, all-in flag and its size
+    // over the standard one (standard_raise_to at the time it was made).
+    int last_raiser = -1;
+    int last_total = 0;
+    bool last_all_in = false;
+    double last_size_ratio = 1.0;
+
+    // The maker of raise level `level` (1 = the open), or -1.
+    int level_seat(int level) const {
+        if (level < 1) return -1;
+        return level_seats[static_cast<std::size_t>(std::min(level, static_cast<int>(level_seats.size())) - 1)];
+    }
 };
+
+// The chart bots' raise-to for the next raise after `raises` raise records and
+// `callers` calls, with `current` the bet to match: preflop_size in
+// gto_heuristic_engine.cpp. 0 for a raise past the 4-bet, which goes all in.
+double chart_raise_to(int big_blind, int raises, int callers, int current) {
+    switch (raises) {
+        case 0: return big_blind * (kOpenBigBlinds + callers);
+        case 1: return static_cast<double>(current) * (kIsoMultiple + callers);
+        case 2: return current * kFourBetMultiple;
+        default: return 0.0;
+    }
+}
 
 PreflopLevels preflop_levels(const PlayerView& view) {
     PreflopLevels out;
@@ -102,11 +131,19 @@ PreflopLevels preflop_levels(const PlayerView& view) {
         if (a.street != Street::Preflop) continue;
         if (a.type == ActionType::Call) ++out.callers;
         if (a.type != ActionType::Bet && a.type != ActionType::Raise) continue;
+        const double standard = chart_raise_to(view.big_blind, out.raises, out.callers, current);
+        out.last_size_ratio = standard > 0.0 ? a.street_total / standard : 1.0;
+        out.last_raiser = a.seat;
+        out.last_total = a.street_total;
+        out.last_all_in = a.all_in;
         ++out.raises;
         const int increment = std::max(0, a.street_total - current);
         const bool full = increment >= out.last_full;
         if (full) out.last_full = increment;
-        if (full || out.levels == 0) ++out.levels;
+        if (full || out.levels == 0) {
+            ++out.levels;
+            out.level_seats[static_cast<std::size_t>(std::min(out.levels, 8) - 1)] = a.seat;
+        }
         current = std::max(current, a.street_total);
     }
     return out;
@@ -116,9 +153,9 @@ PreflopLevels preflop_levels(const PlayerView& view) {
 double standard_raise_to(const PlayerView& view, const PreflopLevels& pre) {
     const PublicSeat& me = view.seats[at(view.seat)];
     switch (pre.raises) {
-        case 0: return view.big_blind * (kOpenBigBlinds + pre.callers);
-        case 1: return static_cast<double>(view.current_bet) * (kIsoMultiple + pre.callers);
-        case 2: return view.current_bet * kFourBetMultiple;
+        case 0:
+        case 1:
+        case 2: return chart_raise_to(view.big_blind, pre.raises, pre.callers, view.current_bet);
         default: return me.street_bet + me.stack;
     }
 }
@@ -234,6 +271,22 @@ public:
     // found could not be dealt together at all.
     void treat_as_independent() { independent_ = true; }
 
+    // The same view, per-combo vector and options over other ranges, which the
+    // vector must cover (subsets of these ranges do).
+    // Multiway, it draws about kContinueDealBudget deals at most (at least
+    // kMinRangeRollouts rollouts, at most this one's), by a trial of how often the
+    // new ranges can be dealt together; none fitting means independent opponents.
+    RangeEquities with_ranges(std::array<std::optional<WeightedRange>, kMaxSeats> ranges) const {
+        const double acceptance = deal_acceptance(ranges, mix(options_.seed ^ kContinueSeedSalt));
+        RangeEquityOptions options = options_;
+        options.multiway_rollouts =
+            std::clamp(static_cast<int>(std::min<double>(options_.multiway_rollouts, kContinueDealBudget * acceptance)),
+                       std::min(kMinRangeRollouts, options_.multiway_rollouts), options_.multiway_rollouts);
+        RangeEquities out(view_, std::move(ranges), *combos_, options);
+        out.independent_ = independent_ || !(acceptance > 0.0);
+        return out;
+    }
+
 private:
     const PlayerView& view_;
     std::array<std::optional<WeightedRange>, kMaxSeats> ranges_;
@@ -287,6 +340,10 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
     int levels_after = in.pre.levels;
     if (in.pre.levels == 0 || effective_to - view.current_bet >= in.pre.last_full) ++levels_after;
     const double size_ratio = in.standard_to > 0.0 ? effective_to / in.standard_to : 1.0;
+    // Preflop, an all-in or a raise of at least 40% of the starting stack commits
+    // Hero, as the range model reads one (its push/fold override).
+    const int hero_start = me.stack + me.total_bet;
+    const bool commits = to >= hero_total || effective_to >= kCommitStackShare * hero_start;
 
     double fold_all = 1.0;
     double no_raise = 1.0;
@@ -310,9 +367,19 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
 
         Response answer;
         if (preflop) {
-            const Position hero_position = view.position.value_or(Position::BTN);
-            answer = predict_preflop_response(*range, *s.position, hero_position, levels_after, size_ratio,
-                                              in.players_dealt, *in.params, ((in.limpers >> i) & 1u) != 0);
+            PreflopSpot spot;
+            spot.villain = *s.position;
+            spot.raiser = view.position.value_or(Position::BTN);
+            spot.raises = levels_after;
+            spot.size_ratio = size_ratio;
+            spot.players = in.players_dealt;
+            spot.villain_limped = ((in.limpers >> i) & 1u) != 0;
+            // The opener facing Hero's 3-bet, or the 3-bettor facing Hero's 4-bet.
+            spot.villain_raised_last = levels_after >= 2 && in.pre.level_seat(levels_after - 1) == i;
+            if (commits && view.big_blind > 0) {
+                spot.all_in_bb = static_cast<double>(std::min(hero_start, s.stack + s.total_bet)) / view.big_blind;
+            }
+            answer = predict_preflop_response(*range, spot, *in.params);
         } else {
             const double odds = match / (pot + added + match);
             answer = predict_postflop_response(*range, *in.strength, view.street, size, odds, *in.params,
@@ -358,7 +425,7 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
     const double v_raised = raise_weight > 0.0 ? raised_value / raise_weight : 0.0;
 
     double implied = 0.0;
-    if (view.street != Street::River) {
+    if (!preflop && view.street != Street::River) {
         const int behind = std::min(hero_total, deepest_total) - effective_to;
         implied = std::min(std::max(0.0, e_call - 0.5) * std::max(0, behind) * kImpliedShare,
                            kImpliedPotCap * (pot + added + m));
@@ -370,6 +437,276 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
     out.outcome.raise_pct = 100.0 * p_raise;
     out.outcome.equity_called_pct = 100.0 * e_call;
     out.outcome.equity_raised_pct = raise_weight > 0.0 ? 100.0 * raise_equity / raise_weight : 0.0;
+    return out;
+}
+
+// --- Players still to act behind a call ------------------------------------------
+
+// A player who can still act after Hero calls: it has not matched the bet, or has
+// not acted on this street (the BB's option).
+struct PendingPlayer {
+    int index = 0;
+    int match = 0;        // Chips it adds to call, capped at its stack
+    int total_after = 0;  // Its total_bet after that call
+    bool limped = false;  // Called preflop before any raise
+};
+
+// Everything about Hero's call that does not depend on the opponents' type.
+struct CallSpot {
+    std::vector<PendingPlayer> pending;
+    std::vector<int> layer_tops;  // The upper level of each of Decision::layers
+    // Preflop: the spot the pending players answer (villain fields per player).
+    PreflopSpot spot;
+    int below_last_level = -1;  // Made the level below the latest: the positional tables
+    bool commits = false;       // The latest raise is all in or commits its maker
+    int committed = 0;          // ... for this many chips (its total when all in, else its starting stack)
+    // Postflop: the latest bet or raise this street, its maker and size in pots.
+    int aggressor = -1;
+    double size_pots = 0.0;
+    bool hero_all_in = false;   // Hero's call is all in: a squeeze cannot push Hero out
+};
+
+// The upper level of each layer pot_layers(view) returns, in its order.
+std::vector<int> layer_tops(const PlayerView& view) {
+    const PublicSeat& me = view.seats[at(view.seat)];
+    const int my_total = me.total_bet + std::min(std::max(0, view.current_bet - me.street_bet), me.stack);
+    std::vector<int> levels{my_total};
+    for (int i = 0; i < kMaxSeats; ++i) {
+        const PublicSeat& s = view.seats[at(i)];
+        if (i != view.seat && s.status == SeatStatus::AllIn && s.total_bet < my_total) levels.push_back(s.total_bet);
+    }
+    std::sort(levels.begin(), levels.end());
+    levels.erase(std::unique(levels.begin(), levels.end()), levels.end());
+    std::vector<int> tops;
+    int previous = 0;
+    for (const int level : levels) {
+        int amount = 0;
+        for (int i = 0; i < kMaxSeats; ++i) {
+            const PublicSeat& s = view.seats[at(i)];
+            const int total = i == view.seat ? my_total : s.total_bet;
+            amount += std::min(total, level) - std::min(total, previous);
+        }
+        if (amount > 0) tops.push_back(level);
+        previous = level;
+    }
+    return tops;
+}
+
+CallSpot call_spot(const PlayerView& view, const PreflopLevels& pre, int players_dealt) {
+    CallSpot out;
+    if (!view.legal.allows(ActionType::Call)) return out;
+    const PublicSeat& me = view.seats[at(view.seat)];
+    out.hero_all_in = view.legal.call_amount >= me.stack;
+    std::uint8_t acted = 0;
+    std::uint8_t limped = 0;
+    bool raised = false;
+    for (const ActionRecord& a : view.actions) {
+        if (a.street != view.street || a.seat < 0 || a.seat >= kMaxSeats) continue;
+        acted = static_cast<std::uint8_t>(acted | (1u << a.seat));
+        if (a.type == ActionType::Bet || a.type == ActionType::Raise) raised = true;
+        if (view.street == Street::Preflop && !raised && a.type == ActionType::Call) {
+            limped = static_cast<std::uint8_t>(limped | (1u << a.seat));
+        }
+    }
+    for (int i = 0; i < kMaxSeats; ++i) {
+        const PublicSeat& s = view.seats[at(i)];
+        if (i == view.seat || s.status != SeatStatus::Active || !s.position) continue;
+        const bool unmatched = s.street_bet < view.current_bet;
+        if (!unmatched && ((acted >> i) & 1u) != 0) continue;
+        PendingPlayer p;
+        p.index = i;
+        p.match = std::min(std::max(0, view.current_bet - s.street_bet), s.stack);
+        p.total_after = s.total_bet + p.match;
+        p.limped = ((limped >> i) & 1u) != 0;
+        out.pending.push_back(p);
+    }
+    if (out.pending.empty()) return out;
+    out.layer_tops = layer_tops(view);
+
+    if (view.street == Street::Preflop) {
+        out.spot.raises = pre.levels;
+        out.spot.size_ratio = pre.last_size_ratio;
+        out.spot.players = players_dealt;
+        if (pre.last_raiser >= 0) {
+            out.spot.raiser = view.seats[at(pre.last_raiser)].position.value_or(Position::BTN);
+            const PublicSeat& r = view.seats[at(pre.last_raiser)];
+            const int start = r.stack + r.total_bet;
+            out.commits = pre.last_all_in || pre.last_total >= kCommitStackShare * start;
+            out.committed = pre.last_all_in ? pre.last_total : start;
+        }
+        out.below_last_level = pre.level_seat(pre.levels - 1);
+        return out;
+    }
+    // The latest bet or raise on this street, sized as the range model sizes it:
+    // its increment over the pot after its maker's call.
+    int pot = view.street_start_pot[static_cast<std::size_t>(view.street)];
+    int current = 0;
+    std::array<int, kMaxSeats> bets{};
+    for (const ActionRecord& a : view.actions) {
+        if (a.street != view.street || a.seat < 0 || a.seat >= kMaxSeats) continue;
+        if (a.type == ActionType::Bet || a.type == ActionType::Raise) {
+            const int facing = std::max(0, current - bets[at(a.seat)]);
+            const double after_call = pot + facing;
+            out.aggressor = a.seat;
+            out.size_pots = after_call > 0.0 ? std::max(0, a.street_total - current) / after_call : 1.0;
+        }
+        pot += a.chips_added;
+        bets[at(a.seat)] += a.chips_added;
+        current = std::max(current, a.street_total);
+    }
+    return out;
+}
+
+struct CallValue {
+    double ev = 0.0;      // Without the chart prior
+    double equity = 0.0;  // Expected range equity against the field that continues
+};
+
+// Hero's call with players still to act (training_advisor.h, "Players still to
+// act"). Nullopt when nobody is: the plain layered formula applies.
+std::optional<CallValue> call_value(const PlayerView& view, const PotMath& math, std::span<const PotLayer> layers,
+                                    const CallSpot& spot, const RangeEquities& equities, const ArchetypeParams& params,
+                                    const StreetStrength* strength) {
+    if (spot.pending.empty() || layers.size() != spot.layer_tops.size()) return std::nullopt;
+    const PublicSeat& me = view.seats[at(view.seat)];
+    const double pot = view.total_pot;
+    const int hero_total = me.street_bet + me.stack;
+
+    struct Answer {
+        double call = 0.0;     // Continues by calling, given that nobody squeezes
+        double squeeze = 0.0;  // Raises after Hero's call
+        double squeezed_value = 0.0;
+    };
+    std::vector<Answer> answers;
+    std::array<std::optional<WeightedRange>, kMaxSeats> continuing;
+    for (int i = 0; i < kMaxSeats; ++i) continuing[at(i)] = equities.range(i);
+    std::uint8_t pending_bits = 0;
+    double no_squeeze = 1.0;
+    for (const PendingPlayer& p : spot.pending) {
+        pending_bits = static_cast<std::uint8_t>(pending_bits | (1u << p.index));
+        const PublicSeat& s = view.seats[at(p.index)];
+        const std::optional<WeightedRange>& range = equities.range(p.index);
+        Response response;
+        if (range) {
+            if (view.street == Street::Preflop) {
+                PreflopSpot preflop = spot.spot;
+                preflop.villain = *s.position;
+                preflop.villain_limped = p.limped;
+                preflop.villain_raised_last = spot.below_last_level == p.index;
+                if (spot.commits && view.big_blind > 0) {
+                    preflop.all_in_bb = static_cast<double>(std::min(spot.committed, s.stack + s.total_bet)) / view.big_blind;
+                }
+                response = predict_preflop_response(*range, preflop, params);
+            } else if (strength) {
+                const double odds = p.match / (pot + math.to_call + p.match);
+                const WeightedRange* bettor = nullptr;
+                if (spot.aggressor >= 0 && equities.range(spot.aggressor)) bettor = &*equities.range(spot.aggressor);
+                response =
+                    predict_postflop_response(*range, *strength, view.street, spot.size_pots, odds, params, bettor);
+            }
+        }
+        Answer answer;
+        double call = std::clamp(response.call, 0.0, 1.0);
+        double raise = std::clamp(response.raise, 0.0, 1.0 - call);
+        WeightedRange calls = std::move(response.call_range);
+        // A raise Hero cannot fold to (Hero all in), or one the player cannot make
+        // (it cannot cover the bet), is a call.
+        if (spot.hero_all_in || s.street_bet + s.stack <= view.current_bet) {
+            for (int combo = 0; combo < kComboCount; ++combo) {
+                calls.set(combo, calls.weight(combo) + response.raise_range.weight(combo));
+            }
+            call += raise;
+            raise = 0.0;
+        }
+        if (raise > 0.0) {
+            // Hero calls a pot-sized squeeze, capped by both stacks, or folds the call.
+            const double e = equity_vs_range(equities.combos(), response.raise_range).value_or(0.0);
+            const double target = std::max(static_cast<double>(view.current_bet),
+                                           std::min({view.current_bet + pot + math.to_call + p.match,
+                                                     static_cast<double>(hero_total),
+                                                     static_cast<double>(s.street_bet + s.stack)}));
+            const double hero_cost = target - me.street_bet;
+            const double squeezer_cost = target - s.street_bet;
+            answer.squeezed_value = std::max(-static_cast<double>(math.to_call),
+                                             e * (pot + hero_cost + squeezer_cost) - hero_cost);
+        }
+        answer.squeeze = raise;
+        answer.call = raise < 1.0 ? call / (1.0 - raise) : 0.0;
+        no_squeeze *= 1.0 - raise;
+        continuing[at(p.index)] = calls.total() > 0.0 ? std::optional<WeightedRange>(std::move(calls)) : std::nullopt;
+        if (!continuing[at(p.index)]) answer.call = 0.0;
+        answers.push_back(answer);
+    }
+
+    // Every way the pending players can continue, given that nobody squeezes.
+    std::uint8_t everyone = 0;
+    for (int i = 0; i < kMaxSeats; ++i) {
+        if (i != view.seat && contesting(view.seats[at(i)]) && equities.range(i)) {
+            everyone = static_cast<std::uint8_t>(everyone | (1u << i));
+        }
+    }
+    const std::size_t k = spot.pending.size();
+    struct Scenario {
+        double chance = 0.0;
+        std::uint8_t in = 0;  // The pending players who call
+    };
+    std::vector<Scenario> scenarios;
+    for (std::uint32_t mask = 0; mask < (1u << k); ++mask) {
+        Scenario sc;
+        sc.chance = 1.0;
+        for (std::size_t j = 0; j < k; ++j) {
+            const bool calls = ((mask >> j) & 1u) != 0;
+            sc.chance *= calls ? answers[j].call : 1.0 - answers[j].call;
+            if (calls) sc.in = static_cast<std::uint8_t>(sc.in | (1u << spot.pending[j].index));
+        }
+        if (sc.chance > 0.0) scenarios.push_back(sc);
+    }
+    // The players contesting a layer in a scenario: its certain players, and the
+    // callers whose chips reach past the layer below.
+    const auto layer_set = [&](std::size_t layer, std::uint8_t in) {
+        const int previous = layer == 0 ? 0 : spot.layer_tops[layer - 1];
+        auto set = static_cast<std::uint8_t>(layers[layer].opponent_seats & ~pending_bits);
+        for (const PendingPlayer& p : spot.pending) {
+            if (((in >> p.index) & 1u) != 0 && p.total_after > previous) set = static_cast<std::uint8_t>(set | (1u << p.index));
+        }
+        return set;
+    };
+    const auto field = [&](std::uint8_t in) { return static_cast<std::uint8_t>((everyone & ~pending_bits) | in); };
+    std::vector<std::uint8_t> sets;
+    for (const Scenario& sc : scenarios) {
+        sets.push_back(field(sc.in));
+        for (std::size_t l = 0; l < layers.size(); ++l) sets.push_back(layer_set(l, sc.in));
+    }
+    RangeEquities cont = equities.with_ranges(std::move(continuing));
+    cont.prepare(sets);
+
+    double no_squeeze_value = 0.0;
+    CallValue out;
+    for (const Scenario& sc : scenarios) {
+        double won = 0.0;
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            const int previous = l == 0 ? 0 : spot.layer_tops[l - 1];
+            const int top = spot.layer_tops[l];
+            double amount = layers[l].amount;
+            for (const PendingPlayer& p : spot.pending) {
+                if (((sc.in >> p.index) & 1u) == 0) continue;
+                const int now = view.seats[at(p.index)].total_bet;
+                amount += (std::min(p.total_after, top) - std::min(p.total_after, previous)) -
+                          (std::min(now, top) - std::min(now, previous));
+            }
+            won += amount * cont.equity(layer_set(l, sc.in));
+        }
+        no_squeeze_value += sc.chance * (won - math.to_call);
+        out.equity += sc.chance * cont.equity(field(sc.in));
+    }
+    double squeeze_weight = 0.0;
+    double squeezed = 0.0;
+    for (const Answer& a : answers) {
+        squeeze_weight += a.squeeze;
+        squeezed += a.squeeze * a.squeezed_value;
+    }
+    const double p_squeeze = 1.0 - no_squeeze;
+    out.ev = no_squeeze * no_squeeze_value + (squeeze_weight > 0.0 ? p_squeeze * squeezed / squeeze_weight : 0.0);
     return out;
 }
 
@@ -475,7 +812,10 @@ struct Decision {
     HandRead read;
     std::vector<PotLayer> layers;
     PreflopResponse chart_choice = PreflopResponse::Fold;
+    bool push_fold = false;  // The chart is the push/fold table: its raise is the all-in
     RaiseInputs inputs;  // Without equities, params and pot_kept_share, which each line sets
+    CallSpot call;       // Players still to act behind a call
+    const StreetStrength* strength = nullptr;  // Postflop, when a raise or a call needs it
 };
 
 // One line's advice: Baseline's, or one archetype's.
@@ -508,9 +848,16 @@ LineResult evaluate_line(const Decision& d, RangeEquities& equities, const Arche
             everyone = static_cast<std::uint8_t>(everyone | (1u << i));
         }
     }
-    std::vector<std::uint8_t> sets{everyone};
+    // With players still to act behind a call, the call and the range equity come
+    // from their answers, and the equity against everyone is not needed.
+    const std::optional<CallValue> called =
+        legal.allows(ActionType::Call)
+            ? call_value(view, math, d.layers, d.call, equities, params, d.strength)
+            : std::nullopt;
+    std::vector<std::uint8_t> sets;
+    if (!called) sets.push_back(everyone);
     for (const PotLayer& layer : d.layers) {
-        sets.push_back(layer.opponent_seats);
+        if (!called) sets.push_back(layer.opponent_seats);
         sets.push_back(all_in_set(view, layer.opponent_seats));
     }
     equities.prepare(sets);
@@ -519,14 +866,14 @@ LineResult evaluate_line(const Decision& d, RangeEquities& equities, const Arche
     double kept = 0.0;
     int layer_chips = 0;
     for (const PotLayer& layer : d.layers) {
-        layered += layer.amount * equities.equity(layer.opponent_seats);
+        if (!called) layered += layer.amount * equities.equity(layer.opponent_seats);
         kept += layer.amount * equities.equity(all_in_set(view, layer.opponent_seats));
         layer_chips += layer.amount;
     }
     const double layered_equity = layer_chips > 0 ? layered / layer_chips : 0.0;
 
     LineResult r;
-    r.range_equity = equities.equity(everyone);
+    r.range_equity = called ? called->equity : equities.equity(everyone);
 
     RaiseInputs inputs = d.inputs;
     if (may_raise) {
@@ -545,11 +892,14 @@ LineResult evaluate_line(const Decision& d, RangeEquities& equities, const Arche
     // equity of the model least, about the big ones. An approved call gains the
     // same, but an approved raise only the flat amount, or every chart raise would
     // become all in.
-    const auto prior = [&](PreflopResponse option, int risked) {
+    // With the push/fold table the chart's raise is the all-in, so every smaller
+    // raise counts as rejected.
+    const auto prior = [&](PreflopResponse option, int risked, bool all_in = false) {
         if (!preflop) return 0.0;
         const double flat = kChartPriorBigBlinds * view.big_blind * prior_scale;
         const double scaled = kChartPriorCallShare * risked * prior_scale;
-        if (d.chart_choice != option) return -(flat + scaled);
+        const bool rung_for_a_jam = d.push_fold && option == PreflopResponse::Raise && !all_in;
+        if (d.chart_choice != option || rung_for_a_jam) return -(flat + scaled);
         return option == PreflopResponse::Call ? flat + scaled : flat;
     };
     const auto raise_risk = [&](int to) { return clamp_raise_to(view, to) - view.seats[at(view.seat)].street_bet; };
@@ -574,8 +924,8 @@ LineResult evaluate_line(const Decision& d, RangeEquities& equities, const Arche
         r.ev.fold = 0.0;
         consider(0.0, {ActionType::Fold, 0}, "FOLD");
         if (legal.allows(ActionType::Call)) {
-            const double ev = layered_equity * (math.contestable + math.to_call) - math.to_call +
-                              prior(PreflopResponse::Call, math.to_call);
+            const double model = called ? called->ev : layered_equity * (math.contestable + math.to_call) - math.to_call;
+            const double ev = model + prior(PreflopResponse::Call, math.to_call);
             r.ev.check_call = ev;
             consider(ev, {ActionType::Call, 0}, "CALL " + std::to_string(math.to_call));
         }
@@ -611,7 +961,7 @@ LineResult evaluate_line(const Decision& d, RangeEquities& equities, const Arche
         // Without raising rights an all-in is just the call, already considered.
         if (may_raise) {
             const RaiseValue value = raise_value(view, inputs, legal.max_raise_to);
-            r.ev.all_in = value.ev + prior(PreflopResponse::Raise, raise_risk(legal.max_raise_to));
+            r.ev.all_in = value.ev + prior(PreflopResponse::Raise, raise_risk(legal.max_raise_to), true);
             r.outcomes[kOutcomeAllIn] = value.outcome;
         } else {
             r.ev.all_in = r.ev.check_call.value_or(0.0);
@@ -839,12 +1189,13 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
     const std::size_t line_count = options_.archetype_lines ? kLines.size() : 1;
     const bool parallel = options_.threads != 1 && line_count > 1;
 
+    d.inputs.pre = preflop_levels(view);
+    for (int i = 0; i < kMaxSeats; ++i) {
+        if (view.seats[at(i)].position) ++d.inputs.players_dealt;
+    }
+    d.call = call_spot(view, d.inputs.pre, d.inputs.players_dealt);
     if (d.may_raise) {
-        d.inputs.pre = preflop_levels(view);
         d.inputs.standard_to = standard_raise_to(view, d.inputs.pre);
-        for (int i = 0; i < kMaxSeats; ++i) {
-            if (view.seats[at(i)].position) ++d.inputs.players_dealt;
-        }
         if (preflop && d.inputs.pre.raises == 0) {
             for (const ActionRecord& a : view.actions) {
                 if (a.type == ActionType::Call) d.inputs.limpers = static_cast<std::uint8_t>(d.inputs.limpers | (1u << a.seat));
@@ -881,14 +1232,21 @@ HintRecommendation TrainingAdvisor::analyze(const PlayerView& view) const {
     const ComboEquities combos = hero_vs_each_combo(cards, view.board, needed, range_options);
 
     std::optional<StreetStrength> strength;
-    if (wants_hero_range) {
+    if (wants_hero_range || (!preflop && !d.call.pending.empty())) {
         strength = street_strength(view.board);
+        d.strength = &*strength;
+    }
+    if (wants_hero_range) {
         d.inputs.strength = &*strength;
         d.inputs.hero_range = &hero_range;
     }
 
     // Where the raise a chart wants is not legal, the call is that same choice.
-    d.chart_choice = preflop ? chart_response(view) : PreflopResponse::Fold;
+    if (preflop) {
+        const AdvisorChart chart = advisor_chart(view);
+        d.chart_choice = chart.response;
+        d.push_fold = chart.push_fold;
+    }
     if (d.chart_choice == PreflopResponse::Raise && !d.may_raise) d.chart_choice = PreflopResponse::Call;
 
     std::array<LineResult, kArchetypeCount> lines;

@@ -72,10 +72,13 @@ namespace poker {
 //                                 ranges barely meet a limp range.
 //   Facing one raise              chart = vs_open_ranges(pos, opener), with
 //                                 raise width three_bet_width, call width flat_width
-//   Facing a 3-bet                chart = the vs-3-bet ranges, four_bet_width and
-//                                 call_3bet_width (non-positional until Stage 6)
-//   Facing raise #3 or later      chart = the vs-4-bet ranges, four_bet_width and
-//                                 call_3bet_width
+//   Facing a 3-bet, as the        chart = vs_three_bet_ranges(pos, 3-bettor),
+//   opener                        four_bet_width and call_3bet_width
+//   Facing a 4-bet, as the        chart = vs_four_bet_ranges(pos, 4-bettor),
+//   3-bettor                      four_bet_width and call_3bet_width
+//   Any other player facing a     chart = the non-positional vs-3-bet ranges (a cold
+//   3-bet, or raise #3 or later   caller squeezed, a cold 4-bet) or vs-4-bet ranges,
+//                                 the same widths
 //
 // For a chart and its widths, R3 = resize(chart.raise, raise width) and
 // Cc = resize(chart.call, call width). Then per class:
@@ -86,26 +89,33 @@ namespace poker {
 // prediction in predict_preflop_response. The SB's charts have no call range, so
 // a SB call uses the in-position call range (vs_open_ranges(BTN, opener)).
 //
-// Stack-size overrides, checked before the table above:
-//   All-in raise of at most 15 BB (street total)
-//       TEMPORARY, until Stage 6's push/fold tables: the top
-//       clamp(400 / bb, 5, 100) % by strength, halved when facing a raise, times
-//       open_width, with growth capped as resize caps it. 10 BB first in is the
-//       top 40%, 15 BB 27%, 5 BB 80%.
-//   Call of an all-in of at most 15 BB
-//       TEMPORARY as above: the top clamp(250 / bb, 8, 100) % times flat_width,
-//       capped as above, with bb the all-in's street total in big blinds.
-//   Any other all-in raise (so over 15 BB; the plan's 20 BB rule is covered too),
-//   or a raise to at least 40% of the stack the player started the hand with
-//       the commit range, resize(vs-4-bet raise + call, four_bet_width) at 1
+// Stack-size overrides, checked before the table above. A raise "commits" when it
+// is all in or reaches 40% of the stack the player started the hand with; its
+// depth D is the effective stack in big blinds: the smaller of what the raiser
+// commits (its street total when all in, else its starting stack) and the deepest
+// starting stack among the other players still in. For D <= 25 BB the push/fold
+// tables (strategy/push_fold.h) apply at the table stack clamp(round(min(D, 15)),
+// 3, 15), and from 15 to 25 BB they blend into the deep commit ranges: with
+// t = clamp((D - 15) / 10, 0, 1), a likelihood is (1 - t) x the push/fold answer
+// + t x the commit answer, so there is no cliff at 15 or 16 BB.
+//   Committing raise, first in    push_fold_jam_range(pos) at open_width (the BB's
+//                                 raise over limps uses the SB's jam range)
+//   Committing re-raise (facing   the call range against a jam from the last
+//   a raise)                      raiser, at three_bet_width: a re-jam is taken to
+//                                 be what would call a jam of that size
+//   Call of an all-in             the call range against a jam from the all-in
+//                                 player, at flat_width
+//   Call ranges against a jam come from push_fold_call_range(caller, jammer); a
+//   caller who acted before the jammer (the opener facing a re-jam) has no table
+//   and uses the BB's call range against that jammer, or the BB's against the SB
+//   when the jammer is the BB. Every multiway nuance is left out: an overcall uses
+//   the same range as a lone call.
+//   Deeper than 25 BB:
+//   Any committing raise          the commit range, resize(vs-4-bet raise + call,
+//                                 four_bet_width) at 1
 //   A committing call: over 10 BB, and either at least 50 BB or at least a third
 //   of what is at stake (the same test as the bots' charts)
 //       resize(commit range, call_3bet_width) at 1
-//
-// KNOWN ISSUE for Stage 6: these overrides make a cliff. A 15 BB shove reads as the
-// top 27% of hands and a 16 BB shove as the commit range (about 3%); any raise to
-// 40% or more of the starting stack, all-in or not, reads as the commit range too.
-// Stage 6's push/fold tables replace them.
 //
 // --- Postflop -------------------------------------------------------------------
 //
@@ -360,15 +370,58 @@ Response predict_postflop_response(const WeightedRange& range, const StreetStren
                                    double size_pots, double pot_odds, const ArchetypeParams& params,
                                    const WeightedRange* bettor_range = nullptr);
 
-// `villain_range_so_far` facing a preflop raise from `raiser`, which makes
-// `raises_after_hero` raises in all (1 = an open, 2 = a 3-bet, 3+ = a 4-bet or
-// more). The chart and widths are the inference's for that spot (see above), with
-// the call width also multiplied by (1 / size_ratio)^0.5, size_ratio being the
-// raise's size over the standard one: bigger raises lose their weakest calls
-// first, smaller ones gain calls. The raises are unchanged, so the continue share
-// moves by somewhat less than that factor. The stack-size overrides are not
-// applied here. With villain_limped and a first raise, the limper's answer
-// (above) replaces the chart, its call width scaled the same way.
+// A preflop spot for predict_preflop_response: `villain` answering the latest
+// raise, or, with raises 0, a limp.
+struct PreflopSpot {
+    Position villain = Position::BB;
+    Position raiser = Position::BTN;  // Who made the latest raise (for an open, the opener)
+    // Raise levels including the latest: 1 an open, 2 a 3-bet, 3 or more a 4-bet or
+    // more; 0 a limped pot with no raise, answered as the inference reads it (the BB
+    // raises with its raise range and checks the rest; anyone else iso-raises with
+    // 0.75 x open_width of its open range, limps behind with the limp window, or folds).
+    int raises = 1;
+    // The latest raise's street total over a standard one's.
+    double size_ratio = 1.0;
+    int players = kMaxSeats;
+    bool villain_limped = false;  // Called before any raise: the limper's answer to a first raise
+    // The villain made the level below the latest (the opener facing a 3-bet, the
+    // 3-bettor facing a 4-bet): the positional tables. False for cold callers and
+    // players yet to act, who answer from the non-positional ones.
+    bool villain_raised_last = true;
+    // The latest raise commits the raiser (all in, or at least 40% of its starting
+    // stack), with this effective stack in big blinds: the push/fold override below.
+    std::optional<double> all_in_bb;
+};
+
+// `villain_range_so_far` facing the spot's raise. The chart and widths are the
+// inference's for that spot (see above). The calls also respond to the raise's
+// size, by f = size_ratio^-0.5 for a raise at least the standard size and
+// f = size_ratio^-1 below it. Above the standard size Cc is resize(call chart,
+// call width x f), so bigger raises lose their weakest calls first. Below it the
+// range gains calls worth (f - 1) x its call mass, from the strongest classes of
+// villain_range_so_far that the chart folds (outside R3, Cc and chart.raise), each
+// added while the mass before it plus half its own is within that target, and
+// while the classes that continue stay within max(max_range_pct, their %) of all
+// combos. (Growing Cc itself, as before Stage 6, mostly added hands already in the
+// raise chart, so call shares were flat below the standard size.) So a min-raise
+// or a min-3-bet is called more often than a standard one; the raises are
+// unchanged. Measured for Baseline: the BB calls a BTN open of 1.5, 2 and 2.5 BB
+// 64.9, 48.4 and 38.7% of the time (plus the same 3-bets), and a CO open faces
+// a BB 3-bet of 0.53x, 1x and 1.4x the standard size with 68.2, 36.3 and 30.9%
+// calls. With villain_limped and a first raise, the limper's answer (above)
+// replaces the chart, its call width scaled by f.
+//
+// With all_in_bb at most 25 BB, the villain calls with the push/fold call range
+// against a jam from the raiser at the table stack (resized by flat_width, as in
+// the inference) and never raises; from 15 to 25 BB that answer blends, by the t
+// above, into the chart answer for the spot (whose raises then count as calls of
+// the all-in for the advisor). Deeper all-ins use the chart answer alone, as do
+// the inference's other stack-size overrides, which are not applied here.
+Response predict_preflop_response(const WeightedRange& villain_range_so_far, const PreflopSpot& spot,
+                                  const ArchetypeParams& params);
+
+// The same, for a raise that is not all in, with villain_raised_last true:
+// raises_after_hero below 1 counts as 1.
 Response predict_preflop_response(const WeightedRange& villain_range_so_far, Position villain, Position raiser,
                                   int raises_after_hero, double size_ratio, int players,
                                   const ArchetypeParams& params, bool villain_limped = false);

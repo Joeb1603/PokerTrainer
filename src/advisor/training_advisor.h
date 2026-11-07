@@ -114,7 +114,8 @@ struct AdvisorOptions {
 //
 //   Fold   0
 //   Check  e_L * contestable
-//   Call   e_L * (contestable + to_call) - to_call
+//   Call   e_L * (contestable + to_call) - to_call, when nobody can act after
+//          Hero's call; otherwise see "Players still to act" below
 //   Bet/raise adding a chips (to the street total clamped to what an opponent can
 //   match), each opponent i matching it with m_i chips:
 //          F * P * k + P_call * V_called + P_raise * V_raised
@@ -147,9 +148,14 @@ struct AdvisorOptions {
 //
 // implied rewards a raise that keeps chips behind for later streets, which a
 // single-street formula otherwise misses and which would make all-in look best with
-// every strong hand: (e_call - 0.5, if positive) * effective stack left * 0.5,
-// before the river only, and at most 0.5 * (P + a + m). Without that cap the stack
+// every strong hand: (e_call - 0.5, if positive) * effective stack left * 0.5, on
+// the flop and turn only, and at most 0.5 * (P + a + m). Without that cap the stack
 // behind outweighs everything else, and the nuts would choose the smallest bet.
+// Preflop it is 0: there e_call is all-in equity against the calling range, and at
+// 100 BB each point of it was worth about 10 chips of implied, so the size whose
+// callers were weakest won (a min-3-bet with AJs from the BB: implied 85, 78, 42
+// and 32 chips at 80, 105, 133 and 160), and strong hands took the largest open
+// through the cap. The chart prior stands in for later streets preflop.
 //
 // Postflop answers: size s = (to - current bet) / (P + Hero's call), the pot
 // fraction raise_to_for_pot_fraction uses; pot odds m_i / (P + a + m_i); and Hero's
@@ -159,12 +165,50 @@ struct AdvisorOptions {
 // Preflop answers: predict_preflop_response for every opponent still able to act,
 // with its range so far, its position, Hero's position as the raiser, the raise
 // levels including Hero's (a short all-in is not a new level, as the engine rules),
-// the players dealt in, and villain_limped for a player who called before any
-// raise. size_ratio is the raise's street total over a standard one: 2.5 big
-// blinds plus one per caller first in, 3x the bet plus one bet per caller against
-// one raise, 2.3x against two, and all in after that, as the chart bots size. The
-// call ranges are scored on the preflop matrix, all in, so postflop play and
-// position are left out; the chart prior below stands in for them.
+// the players dealt in, villain_limped for a player who called before any raise,
+// and villain_raised_last for the player who made the level below Hero's (the
+// opener facing Hero's 3-bet, the 3-bettor facing Hero's 4-bet: the positional
+// tables). A raise that is all in or at least 40% of Hero's starting stack sets
+// all_in_bb to the smaller starting stack of Hero and that opponent, so the
+// push/fold call ranges answer a short jam. size_ratio is the raise's street total
+// over a standard one: 2.5 big blinds plus one per caller first in, 3x the bet
+// plus one bet per caller against one raise, 2.3x against two, and all in after
+// that, as the chart bots size. The call ranges are scored on the preflop matrix,
+// all in, so postflop play and position are left out; the chart prior below
+// stands in for them.
+//
+// --- Players still to act ---------------------------------------------------------
+//
+// A player who has not matched the bet, or has not acted on this street (the BB's
+// option), can still act after Hero calls, so it is not a certain caller with its
+// whole range. Each such player j answers the bet Hero calls: preflop
+// predict_preflop_response for the latest raise (its maker as the raiser, the
+// levels so far, the raise's own size ratio, all_in_bb when it commits its maker,
+// villain_raised_last when j made the level below; with no raise, the limped-pot
+// answer), postflop predict_postflop_response for the latest bet's size (as the
+// range model sizes it), pot odds m_j / (P + to_call + m_j) and the bettor's range.
+// That gives call share c_j, call range C_j and raise share q_j: a squeeze.
+//   P_sq    = 1 - product of (1 - q_j): somebody squeezes after Hero's call
+//   V_sq_j  = max(-to_call, e(raise range_j) * (P + T + T_j) - T): Hero calls a
+//             pot-sized squeeze (to the bet + P + to_call + m_j, capped by both
+//             stacks), costing T in all, j putting in T_j, or folds the call
+//   Given no squeeze, j continues with c_j / (1 - q_j), independently of the
+//   others. Every subset S of continuing players is enumerated (at most 2^5):
+//   V_S = sum over layers of (amount + the chips S adds to it) * e(layer's
+//   certain players and the players of S whose chips reach it) - to_call, with
+//   each j in S holding C_j. One Monte Carlo run serves every set, with the
+//   line's seed and rollouts, but at most about 30,000 deals in all (at least
+//   100 rollouts), by a 512-deal trial of how often the continuing ranges can be
+//   dealt together: call ranges are narrow and collide, and the redraws were what
+//   made this slow. When no trial deal fits, the independent-opponents product.
+//   Call = (1 - P_sq) * sum_S P(S) V_S + P_sq * (sum_j q_j V_sq_j / sum_j q_j)
+// range_equity_pct is then sum_S P(S) e(the field of S) rather than the equity
+// against every player still in. A squeeze a player cannot make (it cannot cover
+// the bet), or one Hero cannot fold to (Hero's call is all in), counts as a call.
+// Approximations: the continues are independent, a player who folds still holds
+// cards from its call range in the Monte Carlo, an overcall of a short jam uses
+// the lone-call push/fold range, and the original bettor never re-raises. A check
+// is unchanged: at no price every player continues. Heads-up nothing changes.
 //
 // --- Bet size -----------------------------------------------------------------
 //
@@ -184,11 +228,14 @@ struct AdvisorOptions {
 //
 // --- Preflop chart prior --------------------------------------------------------
 //
-// Preflop, the 6-max charts act as a prior (chart_response, which also turns a
-// fold into a call at a tiny price). Options the chart rejects lose a big blind
-// plus a quarter of the chips they risk: the bigger the play, the more the
-// range it faces matters. A call the chart picks gains the same, and a raise it
-// picks gains just the big blind. Strong EV differences can still outvote it.
+// Preflop, the 6-max charts act as a prior (advisor_chart in advisor_charts.h:
+// the bots' chart_response with the positional answers to 3-bets and 4-bets, and
+// the push/fold tables at 15 big blinds or less; it also turns a fold into a call
+// at a tiny price). Options the chart rejects lose a big blind plus a quarter of
+// the chips they risk: the bigger the play, the more the range it faces matters.
+// A call the chart picks gains the same, and a raise it picks gains just the big
+// blind. Where the push/fold table says jam, only the all-in counts as that raise;
+// every smaller raise is rejected. Strong EV differences can still outvote it.
 // Preflop chooses among the ladder sizes by EV; there is no size rule. All-in is
 // advised preflop only with an effective stack of at most 15 big blinds, within
 // 1.5 pots, or as the only raise left: the single-street model overrates deep

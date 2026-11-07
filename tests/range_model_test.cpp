@@ -19,6 +19,7 @@
 #include "range/range_model.h"
 #include "range/weighted_range.h"
 #include "strategy/preflop_charts.h"
+#include "strategy/push_fold.h"
 
 using namespace poker;
 
@@ -307,18 +308,32 @@ TEST(RangeModel, ThreeBetAndFourBetUseTheCharts) {
     const WeightedRange co = infer_range_for(view, kCo, Archetype::Baseline, false);
     const WeightedRange btn = infer_range_for(engine.player_view(kSb), kBtn, Archetype::Baseline, false);
     const VsRaiseRanges& vs_co = vs_open_ranges(Position::BTN, Position::CO);
+    // The CO opened and faces the BTN's 3-bet out of position: the positional table.
+    const VsRaiseRanges& co_vs_btn = vs_three_bet_ranges(Position::CO, Position::BTN);
     for (const HandClass h : hand_classes_by_strength()) {
         const double b = btn.class_mass(h) / h.combos();
         EXPECT_NEAR(b, vs_co.raise.contains(h) ? 1.0 - p.slowplay : 0.0, 1e-6) << h.to_string();
         const double c = co.class_mass(h) / h.combos();
-        const bool four_bets = vs_three_bet_response(h) == PreflopResponse::Raise && rfi_range(Position::CO).contains(h);
+        const bool four_bets = co_vs_btn.raise.contains(h) && rfi_range(Position::CO).contains(h);
         EXPECT_NEAR(c, four_bets ? 1.0 - p.slowplay : 0.0, 1e-6) << h.to_string();
     }
 
-    // Calling the 4-bet: the vs-4-bet call range plus slowplayed 5-bet hands.
+    // Calling the 4-bet as the 3-bettor: the positional vs-4-bet call range plus
+    // slowplayed 5-bet hands, on the BTN's 3-bet range.
     play(engine, {C});
     ASSERT_EQ(engine.state().street, Street::Flop);
     const WeightedRange caller = infer_range_for(engine.player_view(kCo), kBtn, Archetype::Baseline, false);
+    const VsRaiseRanges& btn_vs_co = vs_four_bet_ranges(Position::BTN, Position::CO);
+    WeightedRange expected;
+    for (const HandClass h : hand_classes_by_strength()) {
+        const double three_bet = vs_co.raise.contains(h) ? 1.0 - p.slowplay : 0.0;
+        const double flat = btn_vs_co.raise.contains(h) ? p.slowplay : btn_vs_co.call.contains(h) ? 1.0 : 0.0;
+        expected.set_class(h, static_cast<float>(three_bet * flat));
+    }
+    expected.remove_cards(card_mask(std::span<const Card>(engine.player_view(kCo).board)));
+    for (int combo = 0; combo < kComboCount; ++combo) {
+        EXPECT_NEAR(caller.weight(combo), expected.weight(combo), 1e-6) << combo;
+    }
     EXPECT_NEAR(class_weight(caller, "QQ"), 1.0 - p.slowplay, 1e-6);  // 3-bet at 0.8, then flats a 4-bet at 1
     EXPECT_NEAR(class_weight(caller, "AA"), (1.0 - p.slowplay) * p.slowplay, 1e-6);
     EXPECT_EQ(class_weight(caller, "TT"), 0.0);
@@ -335,7 +350,8 @@ TEST(RangeModel, ShortAllInWidensAsStacksShrink) {
     const double at5 = shove_mass(100);
     EXPECT_LT(at15, at10);
     EXPECT_LT(at10, at5);
-    EXPECT_NEAR(at10 / kComboCount, 0.40, 0.02);  // Temporary formula: 400 / bb percent
+    const CardMask board = card_mask(std::span<const Card>(kDryBoard));  // The view's board
+    EXPECT_NEAR(at10, chart_weights(*push_fold_jam_range(Position::BTN, 10), 0).total(), 1e-6);  // The 10 BB table
 
     // A deep shove is the commit range, QQ+ and AK.
     GameEngine deep = table({}, kDryBoard);
@@ -348,14 +364,63 @@ TEST(RangeModel, ShortAllInWidensAsStacksShrink) {
     // Calling a deep shove commits too; calling a short one is wider than the deep commit.
     play(deep, {F, C});
     const WeightedRange caller = infer_range_for(deep.player_view(kBtn), kBb, Archetype::Baseline, false);
-    const CardMask board = card_mask(std::span<const Card>(kDryBoard));  // Run out by now
     EXPECT_NEAR(caller.total(), chart_weights(HandRange::parse("JJ+, AKs, AKo"), board).total(), 1e-6);
     GameEngine shallow = table({}, kDryBoard, {200, 2000, 2000, 2000, 2000, 2000});
     play(shallow, {F, F, F, R(200), F, C});
     const WeightedRange short_call = infer_range_for(shallow.player_view(kBtn), kBb, Archetype::Baseline, false);
-    // Temporary formula: the top 250 / bb percent, here 25%.
-    EXPECT_EQ(short_call.weights(), chart_weights(HandRange::top_percent(25.0), board).weights());
+    // The BB's push/fold call range against a 10 BB BTN jam.
+    EXPECT_EQ(short_call.weights(), chart_weights(*push_fold_call_range(Position::BB, Position::BTN, 10), board).weights());
     EXPECT_GT(short_call.total(), caller.total());
+}
+
+TEST(RangeModel, ShortAllInUsesPushFoldTables) {
+    const ArchetypeParams& p = archetype_params(Archetype::Baseline);
+    const auto shove = [](int stack, std::initializer_list<Action> before) {
+        GameEngine engine = table({}, kDryBoard, {stack, 2000, 2000, 2000, 2000, 2000});
+        play(engine, before);
+        play(engine, {R(stack)});  // The BTN goes all in
+        return infer_range_for(engine.player_view(kSb), kBtn, Archetype::Baseline, false);
+    };
+    // First in: the jam table at each stack, and no cliff past 15 BB: from 15 to 25
+    // BB the range blends into the commit range by (D - 15) / 10.
+    const HandRange commit = HandRange::parse("JJ+, AKs, AKo");
+    const HandRange jam15 = *push_fold_jam_range(Position::BTN, 15);
+    for (const int stack : {60, 100, 200, 300}) {
+        const WeightedRange r = shove(stack, {F, F, F});
+        EXPECT_EQ(r.weights(), chart_weights(*push_fold_jam_range(Position::BTN, stack / 20), 0).weights()) << stack;
+    }
+    double previous = shove(300, {F, F, F}).total();
+    for (const int stack : {320, 340, 400, 500}) {
+        const WeightedRange r = shove(stack, {F, F, F});
+        const double t = (stack / 20.0 - 15.0) / 10.0;
+        for (const HandClass h : hand_classes_by_strength()) {
+            const double expected = (jam15.contains(h) ? 1.0 - t : 0.0) + (commit.contains(h) ? t : 0.0);
+            ASSERT_NEAR(r.class_mass(h) / h.combos(), expected, 1e-6) << stack << " " << h.to_string();
+        }
+        EXPECT_LT(r.total(), previous) << stack;
+        previous = r.total();
+    }
+    const double at15 = shove(300, {F, F, F}).total();
+    const double at16 = shove(320, {F, F, F}).total();
+    EXPECT_GT(at16, 0.85 * at15);  // Was the top 27% at 15 BB and the commit range (3%) at 16
+    EXPECT_NEAR(shove(500, {F, F, F}).total(), commit.combos(), 1e-6);
+    EXPECT_NEAR(shove(2000, {F, F, F}).total(), commit.combos(), 1e-6);
+
+    // A re-jam over the CO's open: what calls a 10 BB jam from the CO.
+    const WeightedRange rejam = shove(200, {F, F, R(50)});
+    const WeightedRange expected = chart_weights(resize_range(*push_fold_call_range(Position::BTN, Position::CO, 10),
+                                                              p.three_bet_width), 0);
+    EXPECT_EQ(rejam.weights(), expected.weights());
+
+    // The SB's call of the BTN's 10 BB jam, and the BB's overcall: the call table.
+    GameEngine engine = table({}, kDryBoard, {200, 2000, 2000, 2000, 2000, 2000});
+    play(engine, {F, F, F, R(200), C, C});
+    const PlayerView view = engine.player_view(kBtn);
+    const CardMask board = card_mask(std::span<const Card>(view.board));
+    EXPECT_EQ(infer_range_for(view, kSb, Archetype::Baseline, false).weights(),
+              chart_weights(*push_fold_call_range(Position::SB, Position::BTN, 10), board).weights());
+    EXPECT_EQ(infer_range_for(view, kBb, Archetype::Baseline, false).weights(),
+              chart_weights(*push_fold_call_range(Position::BB, Position::BTN, 10), board).weights());
 }
 
 TEST(RangeModel, BbCheckKeepsEverythingButItsRaises) {
@@ -396,6 +461,51 @@ TEST(RangeModel, PredictPreflopResponseShrinksWithSize) {
     const Response maniac = predict_preflop_response(everything, Position::CO, Position::BTN, 2, 1.0, 6,
                                                      archetype_params(Archetype::Maniac));
     EXPECT_GT(nit.fold, maniac.fold);
+}
+
+TEST(RangeModel, SmallRaisesGetCalledMore) {
+    const ArchetypeParams& p = archetype_params(Archetype::Baseline);
+    // The BB against a BTN open of 1.5, 2 and 2.5 BB (standard 2.5): more calls as the
+    // open shrinks, the same 3-bets. The extra calls come from hands outside the chart.
+    const WeightedRange everything = WeightedRange::uniform();
+    const VsRaiseRanges& bb_chart = vs_open_ranges(Position::BB, Position::BTN);
+    const Response r06 = predict_preflop_response(everything, Position::BB, Position::BTN, 1, 0.6, 6, p);
+    const Response r08 = predict_preflop_response(everything, Position::BB, Position::BTN, 1, 0.8, 6, p);
+    const Response r10 = predict_preflop_response(everything, Position::BB, Position::BTN, 1, 1.0, 6, p);
+    EXPECT_GT(r06.call, r08.call + 0.03);
+    EXPECT_GT(r08.call, r10.call + 0.03);
+    EXPECT_NEAR(r06.raise, r10.raise, 1e-9);
+    bool outside = false;
+    for (const HandClass h : hand_classes_by_strength()) {
+        if (bb_chart.call.contains(h) || bb_chart.raise.contains(h)) continue;
+        outside = outside || r08.call_range.class_mass(h) > 0.0;
+        EXPECT_EQ(r10.call_range.class_mass(h), 0.0) << h.to_string();
+    }
+    EXPECT_TRUE(outside);
+
+    // The CO's open facing the BB's 3-bet: a min-3-bet (to 80 over 50, 0.53 of the
+    // standard 150) is called far more than a standard one. Before Stage 6 the call
+    // share was flat from 0.55 to 1.0, because the call chart grew only through hands
+    // already in the raise chart.
+    const WeightedRange open = WeightedRange::from_hand_range(rfi_range(Position::CO));
+    PreflopSpot spot;
+    spot.villain = Position::CO;
+    spot.raiser = Position::BB;
+    spot.raises = 2;
+    spot.size_ratio = 80.0 / 150.0;
+    const Response min3 = predict_preflop_response(open, spot, p);
+    spot.size_ratio = 1.0;
+    const Response standard = predict_preflop_response(open, spot, p);
+    spot.size_ratio = 1.4;
+    const Response big = predict_preflop_response(open, spot, p);
+    EXPECT_GT(min3.call, standard.call + 0.15);
+    EXPECT_GT(standard.call, big.call);
+    EXPECT_NEAR(min3.raise, standard.raise, 1e-9);
+    // The standard answer is the positional table: about 45% of the CO's open continues.
+    EXPECT_NEAR(1.0 - standard.fold, 168.0 / 370.0, 0.01);
+    std::printf("[ RangeModel ] BB calls a BTN open of 1.5/2/2.5 BB %.1f/%.1f/%.1f%%; the CO calls a BB 3-bet "
+                "of 0.53/1/1.4x %.1f/%.1f/%.1f%%\n",
+                100 * r06.call, 100 * r08.call, 100 * r10.call, 100 * min3.call, 100 * standard.call, 100 * big.call);
 }
 
 // --- Postflop inference ---------------------------------------------------------
@@ -666,15 +776,16 @@ double bet_frequency(const std::array<Card, 5>& board, std::initializer_list<Act
 }
 
 TEST(RangeModel, CbetFrequenciesArePlausible) {
-    // The BB's 3-bet range (QQ+, AK, A5s) against the UTG's flat on K83r: it beats
-    // almost all of that range, so it bets a third of the pot nearly always.
+    // The BB's 3-bet range (QQ+, AK, A5s) against the UTG's flat on K83r. The UTG's
+    // positional flat (QQ-88, AKo, AQs-ATs, KQs-KTs and suited connectors) holds
+    // AKo and Kx, so the BB bets a third of the pot most of the time, not always.
     const double three_bet_pot =
         bet_frequency(board_of("Kd", "8s", "3c", "2h", "Th"), {R(50), F, F, F, F, R(200), C}, B(136), kBb, kBtn);
     // The BTN against the BB's defend on K72r, a third of the pot.
     const double single_raised = bet_frequency(kDryBoard, {F, F, F, R(50), F, C, X}, B(36), kBtn, kUtg);
     std::printf("[ RangeModel ] c-bet a third: 3-bet pot K83r %.0f%%, BTN vs BB K72r %.0f%%\n", 100.0 * three_bet_pot,
                 100.0 * single_raised);
-    EXPECT_GE(three_bet_pot, 0.85);
+    EXPECT_GE(three_bet_pot, 0.70);
     EXPECT_GE(single_raised, 0.60);
     EXPECT_LE(single_raised, 0.80);
 }

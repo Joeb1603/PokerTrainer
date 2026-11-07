@@ -9,6 +9,7 @@
 #include "bots/gto_heuristic_engine.h"
 #include "core/hand_evaluator.h"
 #include "strategy/preflop_charts.h"
+#include "strategy/push_fold.h"
 
 namespace poker {
 namespace {
@@ -54,12 +55,14 @@ constexpr double kEmptyMass = 1e-6;
 constexpr double kIsoWidth = 0.75;
 constexpr double kLimpCallShare = 0.6;   // A limp-call keeps the strongest 0.6 x flat_width of the window
 constexpr double kLimpRaiseShare = 0.1;  // A limp-raise: traps plus the strongest 0.1 x three_bet_width
-constexpr int kShortAllInBigBlinds = 15;
-constexpr double kPushPercentTimesBigBlinds = 400.0;  // Temporary push/fold stand-ins
-constexpr double kPushMinPercent = 5.0;
-constexpr double kReshoveShare = 0.5;
-constexpr double kCallPushPercentTimesBigBlinds = 250.0;
-constexpr double kCallPushMinPercent = 8.0;
+// Committing raises and calls of all-ins: push/fold tables up to 15 BB, blending
+// into the commit ranges by 25 BB.
+constexpr double kPushFoldBlendFrom = kPushFoldMaxStackBb;
+constexpr double kPushFoldBlendTo = 25.0;
+// The call width's response to a raise's size: size_ratio to the minus this,
+// for raises at least standard and below it.
+constexpr double kCallSizeExponentAbove = 0.5;
+constexpr double kCallSizeExponentBelow = 1.0;
 constexpr double kCommitStackShare = 0.40;
 constexpr int kCommitPriceBigBlinds = 10;
 constexpr int kCommitAlwaysBigBlinds = 50;
@@ -406,10 +409,13 @@ struct ChartAnswer {
     WeightedRange raise;
 };
 
+// call_scale shrinks the call width for a raise bigger than standard
+// (predict_preflop_response); 1 otherwise. Growth for smaller raises is
+// predict_preflop_response's, over the villain's own range.
 ChartAnswer chart_answer(const VsRaiseRanges& chart, const HandRange& call_chart, double raise_width,
-                         double call_width, const ArchetypeParams& p) {
+                         double call_width, double call_scale, const ArchetypeParams& p) {
     const HandRange r3 = resized(chart.raise, raise_width, p);
-    const HandRange cc = resized(call_chart, call_width, p);
+    const HandRange cc = resized(call_chart, call_width * std::min(1.0, call_scale), p);
     const auto sp = static_cast<float>(clamp01(p.slowplay));
     ChartAnswer out;
     for (const HandClass hand : hand_classes_by_strength()) {
@@ -423,18 +429,110 @@ ChartAnswer chart_answer(const VsRaiseRanges& chart, const HandRange& call_chart
     return out;
 }
 
-// The chart, call chart and widths for a player facing its `raises`-th raise.
-ChartAnswer facing_raise_answer(Position pos, Position opener, int raises, int players, double call_scale,
-                                const ArchetypeParams& p) {
+// A raise below the standard size gains calls: (f - 1) x the range's call mass,
+// from the strongest classes of the range that fold to the chart, while the
+// classes that continue stay within max(max_range_pct, their current %) of all
+// combos. A class is added while the mass before it plus half its own is within
+// the target, as resize_range rounds.
+void add_calls_for_size(ChartAnswer& answer, const WeightedRange& range, double f, const ArchetypeParams& p) {
+    if (!(f > 1.0)) return;
+    double call_mass = 0.0;
+    int continuing_combos = 0;
+    for (const HandClass hand : hand_classes_by_strength()) {
+        bool continues = false;
+        for (const std::uint16_t combo : class_combos(hand).view()) {
+            call_mass += range.weight(combo) * answer.call.weight(combo);
+            continues = continues || answer.call.weight(combo) > 0.0f || answer.raise.weight(combo) > 0.0f;
+        }
+        if (continues) continuing_combos += hand.combos();
+    }
+    const double target = (f - 1.0) * call_mass;
+    const double cap = growth_cap(100.0 * continuing_combos / kTotalCombos, f, p) * kTotalCombos / 100.0;
+    double added = 0.0;
+    for (const HandClass hand : hand_classes_by_strength()) {
+        bool folds = true;
+        double mass = 0.0;
+        for (const std::uint16_t combo : class_combos(hand).view()) {
+            folds = folds && answer.call.weight(combo) <= 0.0f && answer.raise.weight(combo) <= 0.0f;
+            mass += range.weight(combo);
+        }
+        if (!folds || !(mass > 0.0)) continue;
+        if (added + 0.5 * mass > target || continuing_combos + hand.combos() > cap) break;
+        answer.call.set_class(hand, 1.0f);
+        added += mass;
+        continuing_combos += hand.combos();
+    }
+}
+
+// The chart, call chart and widths for a player at `pos` facing its `raises`-th
+// raise, made by `raiser`. `reraised`: this player made the level below (the
+// opener facing a 3-bet, the 3-bettor facing a 4-bet), so the positional tables.
+ChartAnswer facing_raise_answer(Position pos, Position raiser, int raises, int players, bool reraised,
+                                double call_scale, const ArchetypeParams& p) {
     if (raises <= 1) {
-        const VsRaiseRanges& chart = vs_open_ranges(pos, opener, players);
+        const VsRaiseRanges& chart = vs_open_ranges(pos, raiser, players);
         // The SB charts are 3-bet or fold; a SB that flats plays like a caller in position.
-        const HandRange& calls = chart.call.empty() ? vs_open_ranges(Position::BTN, opener, players).call : chart.call;
-        return chart_answer(chart, calls, p.three_bet_width, p.flat_width * call_scale, p);
+        const HandRange& calls = chart.call.empty() ? vs_open_ranges(Position::BTN, raiser, players).call : chart.call;
+        return chart_answer(chart, calls, p.three_bet_width, p.flat_width, call_scale, p);
     }
     const ExtraCharts& extra = extra_charts();
-    const VsRaiseRanges& chart = raises == 2 ? extra.vs_three_bet : extra.vs_four_bet;
-    return chart_answer(chart, chart.call, p.four_bet_width, p.call_3bet_width * call_scale, p);
+    const VsRaiseRanges* chart = raises == 2 ? &extra.vs_three_bet : &extra.vs_four_bet;
+    if (reraised && raises == 2) chart = &vs_three_bet_ranges(pos, raiser, players);
+    if (reraised && raises == 3) chart = &vs_four_bet_ranges(pos, raiser, players);
+    return chart_answer(*chart, chart->call, p.four_bet_width, p.call_3bet_width, call_scale, p);
+}
+
+// The call width's size response f for a raise size_ratio times the standard one.
+double call_size_scale(double size_ratio) {
+    if (!(std::isfinite(size_ratio) && size_ratio > 0.0)) return 1.0;
+    const double exponent = size_ratio >= 1.0 ? kCallSizeExponentAbove : kCallSizeExponentBelow;
+    return std::pow(size_ratio, -exponent);
+}
+
+// --- Short stacks: push/fold tables, blended into the commit ranges -------------
+
+// Depth D in big blinds: the table stack for the push/fold tables, and t, the
+// share of the commit answer. Nullopt deeper than kPushFoldBlendTo.
+struct ShortStack {
+    int table_bb = kPushFoldMaxStackBb;
+    double commit_share = 0.0;
+};
+
+std::optional<ShortStack> short_stack(double depth_bb) {
+    if (!(depth_bb <= kPushFoldBlendTo)) return std::nullopt;
+    ShortStack out;
+    const double shallow = std::min(depth_bb, kPushFoldBlendFrom);
+    out.table_bb = std::clamp(static_cast<int>(std::lround(shallow)), kPushFoldMinStackBb, kPushFoldMaxStackBb);
+    out.commit_share = std::clamp((depth_bb - kPushFoldBlendFrom) / (kPushFoldBlendTo - kPushFoldBlendFrom), 0.0, 1.0);
+    return out;
+}
+
+// What calls a jam from `jammer`: the caller's own table, or for a caller who
+// acted before the jammer, the BB's against it (the BB's against the SB when the
+// jammer is the BB).
+HandRange call_chart_vs_jam(Position caller, Position jammer, int stack_bb, int players) {
+    if (auto own = push_fold_call_range(caller, jammer, stack_bb, players)) return *own;
+    if (auto bb = push_fold_call_range(Position::BB, jammer, stack_bb, players)) return *bb;
+    return push_fold_call_range(Position::BB, Position::SB, stack_bb, players).value_or(HandRange{});
+}
+
+// A committing raise from `pos`: first in (no raiser), the jam table (the SB's for
+// a BB raising over limps); over a raise, what would call a jam from the raiser.
+HandRange jam_chart(Position pos, std::optional<Position> raiser, int stack_bb, int players) {
+    if (raiser) return call_chart_vs_jam(pos, *raiser, stack_bb, players);
+    if (auto own = push_fold_jam_range(pos, stack_bb, players)) return *own;
+    return push_fold_jam_range(Position::SB, stack_bb, players).value_or(HandRange{});
+}
+
+// (1 - t) x the push/fold range + t x the commit range, as a likelihood.
+WeightedRange blend_ranges(const HandRange& short_range, const HandRange& commit, double t) {
+    WeightedRange out;
+    const auto deep = static_cast<float>(clamp01(t));
+    for (const HandClass hand : hand_classes_by_strength()) {
+        const float w = (short_range.contains(hand) ? 1.0f - deep : 0.0f) + (commit.contains(hand) ? deep : 0.0f);
+        if (w > 0.0f) out.set_class(hand, w);
+    }
+    return out;
 }
 
 HandRange open_range(Position pos, int players, const ArchetypeParams& p) {
@@ -493,12 +591,6 @@ ChartAnswer limper_answer(Position pos, int players, double call_scale, const Ar
         }
     }
     return out;
-}
-
-// The top `percent` % by strength times `width`, capped as resized() caps growth.
-WeightedRange top_percent_range(double percent, double width, const ArchetypeParams& p) {
-    const double target = percent * std::max(0.0, width);
-    return WeightedRange::from_hand_range(HandRange::top_percent(std::min(target, growth_cap(percent, width, p))));
 }
 
 // --- The walk over a view's actions --------------------------------------------
@@ -655,9 +747,9 @@ private:
             const bool full = increment >= last_full_raise_;
             if (full) last_full_raise_ = increment;
             current_bet_ = std::max(current_bet_, a.street_total);
-            if (street_ == Street::Preflop) {
-                if (raises_ == 0) opener_ = position_of(a.seat);
-                if (full || raises_ == 0) ++raises_;
+            if (street_ == Street::Preflop && (full || raises_ == 0)) {
+                ++raises_;
+                level_seat_[static_cast<std::size_t>(std::min(raises_, kTrackedLevels) - 1)] = a.seat;
             }
         } else if (a.type == ActionType::Call && street_ == Street::Preflop && raises_ == 0) {
             ++limpers_;
@@ -692,6 +784,26 @@ private:
         return call * 3 >= std::min(my_stack, deepest - t.street_bet);
     }
 
+    // The seat that made raise level `level` (1 = the open), or -1.
+    int level_seat(int level) const {
+        return level >= 1 ? level_seat_[static_cast<std::size_t>(std::min(level, kTrackedLevels) - 1)] : -1;
+    }
+
+    // The latest raise's maker, and whether `seat` made the level below it.
+    Position raiser() const { return position_of(std::max(0, level_seat(raises_))); }
+    bool reraised(int seat) const { return raises_ >= 2 && level_seat(raises_ - 1) == seat; }
+
+    // The effective depth in big blinds of `chips` committed by `seat`: capped by the
+    // deepest starting stack among the other players still in.
+    double depth_bb(int seat, int chips) const {
+        int deepest = 0;
+        for (int i = 0; i < kMaxSeats; ++i) {
+            const Tracked& o = tracked_[static_cast<std::size_t>(i)];
+            if (i != seat && o.dealt && !o.folded) deepest = std::max(deepest, o.start_stack);
+        }
+        return big_blinds(std::min(chips, deepest));
+    }
+
     std::optional<WeightedRange> preflop_likelihood(const ActionRecord& a, const Tracked& t, int facing) const {
         const Position pos = position_of(a.seat);
         const ExtraCharts& extra = extra_charts();
@@ -699,14 +811,16 @@ private:
         const bool limper_facing_raise = t.limped && raises_ == 1;
 
         if (aggressive) {
-            if (a.all_in && big_blinds(a.street_total) <= kShortAllInBigBlinds) {
-                const double bb = std::max(1.0, big_blinds(a.street_total));
-                double percent = std::clamp(kPushPercentTimesBigBlinds / bb, kPushMinPercent, 100.0);
-                if (raises_ > 0) percent *= kReshoveShare;
-                return top_percent_range(percent, p_.open_width, p_);
-            }
             if (a.all_in || a.street_total >= kCommitStackShare * t.start_stack) {
-                return WeightedRange::from_hand_range(resized(extra.commit, p_.four_bet_width, p_));
+                const HandRange commit = resized(extra.commit, p_.four_bet_width, p_);
+                const int committed = a.all_in ? a.street_total : t.start_stack;
+                if (const auto depth = short_stack(depth_bb(a.seat, committed))) {
+                    const std::optional<Position> over = raises_ > 0 ? std::optional<Position>(raiser()) : std::nullopt;
+                    const HandRange jam = jam_chart(pos, over, depth->table_bb, players_);
+                    const double width = raises_ > 0 ? p_.three_bet_width : p_.open_width;
+                    return blend_ranges(resized(jam, width, p_), commit, depth->commit_share);
+                }
+                return WeightedRange::from_hand_range(commit);
             }
             if (raises_ == 0) {
                 if (limpers_ == 0) return WeightedRange::from_hand_range(open_range(pos, players_, p_));
@@ -714,7 +828,7 @@ private:
                 return WeightedRange::from_hand_range(resized(rfi_range(pos, players_), kIsoWidth * p_.open_width, p_));
             }
             if (limper_facing_raise) return limper_answer(pos, players_, 1.0, p_).raise;
-            return facing_raise_answer(pos, opener_, raises_, players_, 1.0, p_).raise;
+            return facing_raise_answer(pos, raiser(), raises_, players_, reraised(a.seat), 1.0, p_).raise;
         }
 
         if (a.type == ActionType::Check) {
@@ -730,16 +844,19 @@ private:
 
         // A call.
         if (raises_ == 0) return limp_likelihood(pos, players_, p_);
-        if (last_aggression_all_in_ && big_blinds(last_aggression_total_) <= kShortAllInBigBlinds) {
-            const double bb = std::max(1.0, big_blinds(last_aggression_total_));
-            const double percent = std::clamp(kCallPushPercentTimesBigBlinds / bb, kCallPushMinPercent, 100.0);
-            return top_percent_range(percent, p_.flat_width, p_);
+        if (last_aggression_all_in_ && street_aggressor_ >= 0) {
+            const int committed = std::min(last_aggression_total_, t.start_stack);
+            if (const auto depth = short_stack(depth_bb(street_aggressor_, committed))) {
+                const HandRange calls = call_chart_vs_jam(pos, position_of(street_aggressor_), depth->table_bb, players_);
+                return blend_ranges(resized(calls, p_.flat_width, p_), resized(extra.commit, p_.call_3bet_width, p_),
+                                    depth->commit_share);
+            }
         }
         if (call_is_committing(a, t)) {
             return WeightedRange::from_hand_range(resized(extra.commit, p_.call_3bet_width, p_));
         }
         if (limper_facing_raise) return limper_answer(pos, players_, 1.0, p_).call;
-        return facing_raise_answer(pos, opener_, raises_, players_, 1.0, p_).call;
+        return facing_raise_answer(pos, raiser(), raises_, players_, reraised(a.seat), 1.0, p_).call;
     }
 
     // The standing of every combo against the players `i` plays against: the
@@ -799,7 +916,8 @@ private:
     int added_ = 0;
     int raises_ = 0;
     int limpers_ = 0;
-    Position opener_ = Position::BTN;
+    static constexpr int kTrackedLevels = 8;
+    std::array<int, kTrackedLevels> level_seat_{-1, -1, -1, -1, -1, -1, -1, -1};  // Who made each raise level
     double last_aggression_size_ = 0.0;
     bool last_aggression_all_in_ = false;
     int last_aggression_total_ = 0;
@@ -998,14 +1116,46 @@ Response predict_postflop_response(const WeightedRange& range, const StreetStren
     return postflop_response_at(range, strength, f.footing(), street, safe_size(size_pots), pot_odds, params);
 }
 
-Response predict_preflop_response(const WeightedRange& villain_range_so_far, Position villain, Position raiser,
-                                  int raises_after_hero, double size_ratio, int players,
-                                  const ArchetypeParams& params, bool villain_limped) {
-    const double scale = std::isfinite(size_ratio) && size_ratio > 0.0 ? 1.0 / std::sqrt(size_ratio) : 1.0;
-    const int level = std::max(1, raises_after_hero);
-    const ChartAnswer answer = villain_limped && level == 1
-                                   ? limper_answer(villain, players, scale, params)
-                                   : facing_raise_answer(villain, raiser, level, players, scale, params);
+Response predict_preflop_response(const WeightedRange& villain_range_so_far, const PreflopSpot& spot,
+                                  const ArchetypeParams& params) {
+    const double scale = call_size_scale(spot.size_ratio);
+    ChartAnswer answer;
+    if (spot.raises <= 0) {
+        // A limped pot: the inference's reading of each answer.
+        const ExtraCharts& extra = extra_charts();
+        if (spot.villain == Position::BB) {
+            answer.raise = WeightedRange::from_hand_range(resized(extra.bb_raise, params.open_width, params));
+            answer.call = WeightedRange::uniform();
+            for (int combo = 0; combo < kComboCount; ++combo) {
+                if (answer.raise.weight(combo) > 0.0f) answer.call.set(combo, 0.0f);
+            }
+        } else {
+            answer.raise = WeightedRange::from_hand_range(
+                resized(rfi_range(spot.villain, spot.players), kIsoWidth * params.open_width, params));
+            answer.call = limp_likelihood(spot.villain, spot.players, params);
+            for (int combo = 0; combo < kComboCount; ++combo) {
+                if (answer.raise.weight(combo) > 0.0f) answer.call.set(combo, 0.0f);
+            }
+        }
+    } else if (spot.villain_limped && spot.raises == 1) {
+        answer = limper_answer(spot.villain, spot.players, scale, params);
+    } else {
+        answer = facing_raise_answer(spot.villain, spot.raiser, spot.raises, spot.players, spot.villain_raised_last,
+                                     scale, params);
+        add_calls_for_size(answer, villain_range_so_far, scale, params);
+    }
+    if (spot.all_in_bb) {
+        if (const auto depth = short_stack(*spot.all_in_bb)) {
+            // Calls of a short jam; from 15 BB on, blended into the chart answer.
+            const HandRange calls = call_chart_vs_jam(spot.villain, spot.raiser, depth->table_bb, spot.players);
+            const WeightedRange short_calls = WeightedRange::from_hand_range(resized(calls, params.flat_width, params));
+            const auto t = static_cast<float>(depth->commit_share);
+            for (int combo = 0; combo < kComboCount; ++combo) {
+                answer.call.set(combo, (1.0f - t) * short_calls.weight(combo) + t * answer.call.weight(combo));
+                answer.raise.set(combo, t * answer.raise.weight(combo));
+            }
+        }
+    }
     Response out;
     double mass = 0.0;
     double calls = 0.0;
@@ -1026,6 +1176,19 @@ Response predict_preflop_response(const WeightedRange& villain_range_so_far, Pos
         out.fold = std::max(0.0, 1.0 - out.call - out.raise);
     }
     return out;
+}
+
+Response predict_preflop_response(const WeightedRange& villain_range_so_far, Position villain, Position raiser,
+                                  int raises_after_hero, double size_ratio, int players,
+                                  const ArchetypeParams& params, bool villain_limped) {
+    PreflopSpot spot;
+    spot.villain = villain;
+    spot.raiser = raiser;
+    spot.raises = std::max(1, raises_after_hero);
+    spot.size_ratio = size_ratio;
+    spot.players = players;
+    spot.villain_limped = villain_limped;
+    return predict_preflop_response(villain_range_so_far, spot, params);
 }
 
 // --- Ranges from a view ---------------------------------------------------------

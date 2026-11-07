@@ -60,6 +60,7 @@ FetchContent_MakeAvailable(nlohmann_json)
 
 # --- Core library (no GUI dependencies) --------------------------------------
 add_library(poker_core STATIC
+    src/advisor/advisor_charts.cpp
     src/advisor/training_advisor.cpp
     src/bots/bots.cpp
     src/bots/gto_heuristic_engine.cpp

@@ -13,6 +13,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "advisor/advisor_charts.h"
 #include "advisor/training_advisor.h"
 #include "bots/gto_heuristic_engine.h"
 #include "controller/game_controller.h"
@@ -20,6 +21,7 @@
 #include "range/hand_vs_range.h"
 #include "range/range_model.h"
 #include "strategy/preflop_charts.h"
+#include "strategy/push_fold.h"
 
 using namespace poker;
 
@@ -55,11 +57,12 @@ GameEngine heads_up_to_flop(const std::array<Card, 2>& seat0, const std::array<C
     return engine;
 }
 
-GameEngine six_max(int seat, const std::array<Card, 2>& cards, std::uint64_t seed = 5) {
+GameEngine six_max(int seat, const std::array<Card, 2>& cards, std::uint64_t seed = 5, int stack = 2000) {
     GameConfig config;
     config.first_button = 0;
     config.hero_seat = std::nullopt;
     config.seed = seed;
+    config.stacks = std::array<int, kMaxSeats>{stack, stack, stack, stack, stack, stack};
     GameEngine engine(config);
     ScriptedDeal deal;
     deal.holes[seat] = cards;
@@ -101,7 +104,7 @@ PreflopResponse chart_response_for_shove(const char* text) {
             while (engine.state().to_act != 3) EXPECT_TRUE(engine.apply_action({ActionType::Fold, 0}));
             EXPECT_TRUE(engine.apply_action({ActionType::AllIn, 0}));
             while (engine.state().to_act != 2) EXPECT_TRUE(engine.apply_action({ActionType::Fold, 0}));
-            return chart_response(engine.player_view(2));
+            return advisor_chart_response(engine.player_view(2));
         }
     }
     throw std::logic_error("no cards for hand");
@@ -560,7 +563,7 @@ TEST(Advisor, FacingAShoveAgreesWithTheChartEverywhere) {
         while (engine.state().to_act != 2) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
         const PlayerView view = engine.player_view(2);
         const HintRecommendation hint = advisor.analyze(view);
-        const bool chart_folds = chart_response(view) == PreflopResponse::Fold;
+        const bool chart_folds = advisor_chart_response(view) == PreflopResponse::Fold;
         EXPECT_EQ(hint.action.type, chart_folds ? ActionType::Fold : ActionType::Call)
             << hand.to_string() << ": " << hint.best_action << " " << hint.rationale;
     }
@@ -569,6 +572,21 @@ TEST(Advisor, FacingAShoveAgreesWithTheChartEverywhere) {
     }
     for (const char* hand : {"AA", "KK", "QQ", "AKo"}) {
         EXPECT_NE(chart_response_for_shove(hand), PreflopResponse::Fold) << hand;
+    }
+}
+
+// The 169-class tests below take the advisor's own chart as their oracle
+// (advisor_chart_response); in these 100 BB single-raise spots it answers as the
+// bots' chart_response does.
+TEST(Advisor, AdvisorChartMatchesTheBotsChartOutsideItsOwnTables) {
+    for (const HandClass hand : hand_classes_by_strength()) {
+        GameEngine engine = six_max(2, cards_for(hand));
+        while (engine.state().to_act != 5) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Raise, 50}));
+        while (engine.state().to_act != 2) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+        const PlayerView view = engine.player_view(2);
+        EXPECT_EQ(advisor_chart_response(view), chart_response(view)) << hand.to_string();
+        EXPECT_FALSE(advisor_chart(view).push_fold);
     }
 }
 
@@ -581,7 +599,7 @@ TEST(Advisor, FacingANormalOpenFollowsTheChartOnWhetherToPlay) {
         while (engine.state().to_act != 2) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
         const PlayerView view = engine.player_view(2);
         const HintRecommendation hint = advisor.analyze(view);
-        const bool chart_folds = chart_response(view) == PreflopResponse::Fold;
+        const bool chart_folds = advisor_chart_response(view) == PreflopResponse::Fold;
         EXPECT_EQ(hint.action.type == ActionType::Fold, chart_folds) << hand.to_string() << ": " << hint.best_action;
     }
 }
@@ -1360,6 +1378,200 @@ TEST(Advisor, VsNitFoldsMoreToBigBets) {
 // Run by hand in Release: hint latency by street and opponent count, default
 // options with and without the archetype lines, automatic threading and one
 // thread. Random play with mostly calls and checks, so many flops are multiway.
+// --- Stage 6: push/fold, positional 3-bets and players still to act ------------
+
+TEST(Advisor, ShortStackFirstInIsPushOrFold) {
+    // 10 BB effective, folded to Hero: every class jams or folds, as the table says.
+    const TrainingAdvisor advisor(61, kFastOptions);
+    for (const int seat : {3, 5, 0, 1}) {
+        int jams = 0;
+        for (const HandClass hand : hand_classes_by_strength()) {
+            GameEngine engine = six_max(seat, cards_for(hand), 5, 200);
+            while (engine.state().to_act != seat) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+            const PlayerView view = engine.player_view(seat);
+            ASSERT_TRUE(advisor_chart(view).push_fold);
+            const HintRecommendation hint = advisor.analyze(view);
+            const bool table_jams = push_fold_response(hand, *view.position, 10, std::nullopt) == PreflopResponse::Raise;
+            EXPECT_EQ(hint.action.type, table_jams ? ActionType::AllIn : ActionType::Fold)
+                << seat << " " << hand.to_string() << ": " << hint.best_action;
+            jams += hint.action.type == ActionType::AllIn ? hand.combos() : 0;
+        }
+        EXPECT_NEAR(100.0 * jams / kTotalCombos, push_fold_jam_range(*six_max(seat, hole("Ac", "Ad")).player_view(seat).position, 10)->percent(), 1e-9);
+    }
+    // At 16 BB the table no longer applies, and a normal raise is advised again.
+    GameEngine deeper = six_max(0, hole("Ac", "Kd"), 5, 320);
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(deeper.apply_action({ActionType::Fold, 0}));
+    EXPECT_FALSE(advisor_chart(deeper.player_view(0)).push_fold);
+}
+
+TEST(Advisor, ShortStackCallsAJamPerTable) {
+    // The BB facing a lone 10 BB jam from the SB and from the BTN.
+    const TrainingAdvisor advisor(62, kFastOptions);
+    for (const int jammer : {1, 0}) {
+        for (const HandClass hand : hand_classes_by_strength()) {
+            GameEngine engine = six_max(2, cards_for(hand), 5, 200);
+            while (engine.state().to_act != jammer) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+            ASSERT_TRUE(engine.apply_action({ActionType::AllIn, 0}));
+            while (engine.state().to_act != 2) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+            const PlayerView view = engine.player_view(2);
+            ASSERT_TRUE(advisor_chart(view).push_fold);
+            const HintRecommendation hint = advisor.analyze(view);
+            const bool table_calls =
+                push_fold_response(hand, Position::BB, 10, view.seats[jammer].position) == PreflopResponse::Call;
+            EXPECT_EQ(hint.action.type, table_calls ? ActionType::Call : ActionType::Fold)
+                << jammer << " " << hand.to_string() << ": " << hint.best_action;
+        }
+    }
+}
+
+// The share of all combos the Baseline advice 3-bets, for `hero` facing an open
+// to 50 from `opener` (100 BB), and the classes. No 3-bet is a min-3-bet: each
+// is at least twice the open.
+double three_bet_share(int hero, int opener, std::string& classes, const char* fold_check = nullptr) {
+    AdvisorOptions options;
+    options.archetype_lines = false;
+    const TrainingAdvisor advisor(63, options);
+    int combos = 0;
+    for (const HandClass hand : hand_classes_by_strength()) {
+        GameEngine engine = six_max(hero, cards_for(hand));
+        while (engine.state().to_act != opener) EXPECT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+        EXPECT_TRUE(engine.apply_action({ActionType::Raise, 50}));
+        while (engine.state().to_act != hero) EXPECT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+        const HintRecommendation hint = advisor.analyze(engine.player_view(hero));
+        if (is_aggressive(hint.action.type)) {
+            combos += hand.combos();
+            classes += hand.to_string() + " ";
+            EXPECT_TRUE(hint.action.type == ActionType::AllIn || hint.action.amount >= 100) << hint.best_action;
+        }
+        if (fold_check && hand.to_string() == fold_check) {
+            EXPECT_EQ(hint.action.type, ActionType::Fold) << hint.best_action;
+        }
+    }
+    return 100.0 * combos / kTotalCombos;
+}
+
+TEST(Advisor, BbVsCoOpenThreeBetShareIsPlausible) {
+    // Stage 5 found the BB 3-betting almost every hand, 72o included: the CO
+    // folded 72% to any 3-bet under the non-positional chart. With the positional
+    // table the CO continues about 45%, and the advice is the chart's 3-bets
+    // (4.5% of hands) give or take what the EV outvotes. The plan's 8-15% band
+    // assumed a wider chart than the bots' BB-versus-CO 3-bet range, which this
+    // stage may not change (docs/advisor-upgrade-notes.md, Stage 6 batch C).
+    std::string classes;
+    const double bb = three_bet_share(2, 5, classes, "72o");
+    std::printf("[ Advisor ] BB vs CO 3-bets %.1f%%: %s\n", bb, classes.c_str());
+    EXPECT_GE(bb, vs_open_ranges(Position::BB, Position::CO).raise.percent() - 1e-9);
+    EXPECT_LE(bb, 15.0);
+    EXPECT_NE(classes.find("AA "), std::string::npos);
+    // The BTN against the CO, and the SB against the BTN: plausible too.
+    classes.clear();
+    const double btn = three_bet_share(0, 5, classes, "72o");
+    std::printf("[ Advisor ] BTN vs CO 3-bets %.1f%%: %s\n", btn, classes.c_str());
+    EXPECT_GE(btn, 4.0);
+    EXPECT_LE(btn, 15.0);
+    classes.clear();
+    const double sb = three_bet_share(1, 0, classes, "72o");
+    std::printf("[ Advisor ] SB vs BTN 3-bets %.1f%%: %s\n", sb, classes.c_str());
+    EXPECT_GE(sb, 8.0);
+    EXPECT_LE(sb, 20.0);
+}
+
+// Hero's range equity against `seats` as infer_ranges(type) reads them, all
+// assumed to continue: what the advisor measured before Stage 6 batch C.
+double equity_against_all(const PlayerView& view, Archetype type, std::uint8_t seats) {
+    std::array<std::optional<WeightedRange>, kMaxSeats> ranges = infer_ranges(view, type);
+    RangeEquityOptions options;
+    options.seed = 9;
+    options.multiway_rollouts = 20000;
+    const std::array<LayerRequest, 1> layer{LayerRequest{seats}};
+    return 100.0 * equity_vs_ranges(*view.own_hole, view.board, ranges, layer, options).equity[0];
+}
+
+TEST(Advisor, PlayersBehindAreNotCertainCallers) {
+    const TrainingAdvisor advisor(64, kRollouts);
+
+    // CO AQo facing a 10 BB UTG jam, with the BTN and both blinds still to act: each
+    // calls with its push/fold range, so the call is mostly heads-up. It used to be
+    // 27.8% "against the range" (four-way) and FOLD.
+    {
+        GameConfig config;
+        config.first_button = 0;
+        config.hero_seat = std::nullopt;
+        config.stacks = std::array<int, kMaxSeats>{2000, 2000, 2000, 200, 2000, 2000};
+        GameEngine engine(config);
+        ScriptedDeal deal;
+        deal.holes[5] = hole("Ac", "Qd");
+        deal.holes[0] = hole("2s", "3s");
+        deal.holes[1] = hole("2d", "3d");
+        deal.holes[2] = hole("2h", "3h");
+        deal.holes[3] = hole("4s", "5s");
+        deal.holes[4] = hole("4d", "5d");
+        deal.board = board_of("6c", "7c", "8h", "9s", "Td");
+        engine.start_hand(deal);
+        ASSERT_TRUE(engine.apply_action({ActionType::AllIn, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+        const PlayerView view = engine.player_view(5);
+        const HintRecommendation hint = advisor.analyze(view);
+        EXPECT_EQ(hint.action.type, ActionType::Call) << hint.best_action << " " << hint.rationale;
+        const double heads_up = equity_against_all(view, Archetype::Baseline, 1u << 3);
+        const double everyone = equity_against_all(view, Archetype::Baseline, (1u << 3) | 1u | (1u << 1) | (1u << 2));
+        std::printf("[ Advisor ] CO AQo vs a 10 BB UTG jam: %.1f%% (heads-up %.1f%%, all four %.1f%%), %s\n",
+                    hint.range_equity_pct, heads_up, everyone, hint.best_action.c_str());
+        EXPECT_GT(hint.range_equity_pct, everyone + 10.0);
+        EXPECT_LT(hint.range_equity_pct, heads_up + 1.0);
+        EXPECT_GT(hint.range_equity_pct, heads_up - 7.0);
+    }
+
+    // BTN AJs facing a CO open, blinds still to act: close to the heads-up equity
+    // against the CO's range (each blind defends a share of the time), not the
+    // three-way equity against every blind range; and the advice plays the hand.
+    {
+        GameEngine engine = six_max(0, hole("Ac", "Jc"));
+        while (engine.state().to_act != 5) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+        ASSERT_TRUE(engine.apply_action({ActionType::Raise, 50}));
+        const PlayerView view = engine.player_view(0);
+        const HintRecommendation hint = advisor.analyze(view);
+        EXPECT_NE(hint.action.type, ActionType::Fold) << hint.best_action;
+        const double heads_up = equity_against_all(view, Archetype::Baseline, 1u << 5);
+        const double everyone = equity_against_all(view, Archetype::Baseline, (1u << 5) | (1u << 1) | (1u << 2));
+        std::printf("[ Advisor ] BTN AJs vs a CO open: %.1f%% (heads-up %.1f%%, three-way %.1f%%), %s\n",
+                    hint.range_equity_pct, heads_up, everyone, hint.best_action.c_str());
+        EXPECT_GT(hint.range_equity_pct, heads_up - 7.0);
+        EXPECT_LT(hint.range_equity_pct, heads_up);
+        EXPECT_GT(hint.range_equity_pct, everyone + 10.0);
+        // The archetype lines use the same treatment.
+        constexpr std::array<Archetype, 3> kTypes{Archetype::Nit, Archetype::Station, Archetype::Maniac};
+        for (std::size_t i = 0; i < kTypes.size(); ++i) {
+            ASSERT_TRUE(hint.versus[i]);
+            const double line_all = equity_against_all(view, kTypes[i], (1u << 5) | (1u << 1) | (1u << 2));
+            EXPECT_GT(hint.versus[i]->range_equity_pct, line_all + 5.0) << to_string(kTypes[i]);
+        }
+    }
+
+    // Postflop: four-way on the flop, the BB bets and Hero (UTG) calls with the CO
+    // and the BTN behind. The range equity counts only the players expected to
+    // continue, so it sits above the equity against all three.
+    {
+        GameEngine engine = six_max(3, hole("Ac", "Qc"));
+        ASSERT_TRUE(engine.apply_action({ActionType::Raise, 50}));  // UTG
+        ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));     // HJ
+        ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));     // CO
+        ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));     // BTN
+        ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));     // SB
+        ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));     // BB
+        ASSERT_EQ(engine.state().street, Street::Flop);
+        ASSERT_TRUE(engine.apply_action({ActionType::Bet, 100}));    // BB bets half the pot
+        const PlayerView view = engine.player_view(3);
+        ASSERT_TRUE(view.legal.allows(ActionType::Call));
+        const HintRecommendation hint = advisor.analyze(view);
+        const double everyone = equity_against_all(view, Archetype::Baseline, (1u << 2) | (1u << 5) | 1u);
+        std::printf("[ Advisor ] UTG AQs facing a flop bet with two behind: %.1f%% (all three %.1f%%), %s\n",
+                    hint.range_equity_pct, everyone, hint.best_action.c_str());
+        EXPECT_GT(hint.range_equity_pct, everyone + 3.0);
+        expect_consistent_outcomes(view, hint);
+    }
+}
+
 TEST(Advisor, DISABLED_LatencyByStreet) {
     for (const bool lines : {false, true})
     for (const int threads : {0, 1}) {

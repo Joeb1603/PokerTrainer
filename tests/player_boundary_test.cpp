@@ -3,6 +3,7 @@
 // cards, so if any of those headers ever pulls them in, the build breaks here.
 #include <gtest/gtest.h>
 
+#include "advisor/advisor_charts.h"
 #include "advisor/training_advisor.h"
 #include "bots/bot_strategy.h"
 #include "bots/bots.h"
