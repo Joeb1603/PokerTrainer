@@ -110,6 +110,11 @@ add_executable(advisor_bench tools/advisor_bench.cpp)
 target_link_libraries(advisor_bench PRIVATE poker_core nlohmann_json::nlohmann_json)
 target_compile_options(advisor_bench PRIVATE ${POKER_WARNINGS})
 
+# Plays the advisor's Baseline and player-type lines against tables of one bot type.
+add_executable(advisor_matchup tools/advisor_matchup.cpp)
+target_link_libraries(advisor_matchup PRIVATE poker_core)
+target_compile_options(advisor_matchup PRIVATE ${POKER_WARNINGS})
+
 # Regenerates src/range/generated/preflop_equity_data.cpp; run from the repo root.
 add_executable(gen_preflop_tables tools/gen_preflop_tables.cpp)
 target_link_libraries(gen_preflop_tables PRIVATE poker_core)
@@ -237,6 +242,10 @@ if(POKER_BUILD_TESTS)
              COMMAND advisor_bench --spots ${CMAKE_SOURCE_DIR}/tools/bench/turn_spots.json
                      --only co_btn-wet-bc --iterations 20 --min-iterations 20 --combos 4
                      --advisor-rollouts 500 --threads 2)
+    # Every matchup for a few hands at low rollouts: legal actions and conserved chips.
+    add_test(NAME advisor_matchup_smoke
+             COMMAND advisor_matchup --hands 6 --matchup all --advisor-rollouts 200
+                     --range-rollouts 200 --bot-rollouts 100)
     # Bots and the advisor must see the table only through PlayerView.
     add_test(NAME no_engine_access_in_players
              COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/check_no_engine_access.cmake)
