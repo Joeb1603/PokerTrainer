@@ -116,6 +116,7 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 
 - Finished work must have zero warnings and all tests passing in both Release and Debug. Tests use `gtest_discover_tests` with `PRE_TEST`, so each config runs its own binary.
 - Linking fails with `LNK1104` while `poker_trainer.exe` is open. Don't close a running copy that may be the user's: verify in a temporary short-path folder such as `build/v` and delete it afterward. Long paths, such as the scratchpad, can make configuring fail.
+- Sanitizers (Linux, GCC): configure a separate build with `-DPOKER_BUILD_APP=OFF`, `-DCMAKE_BUILD_TYPE=RelWithDebInfo` and `CMAKE_CXX_FLAGS`/`CMAKE_C_FLAGS`/`CMAKE_EXE_LINKER_FLAGS` set to `-fsanitize=thread`, or to `-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined`, then run its `ctest`. Timing tests such as `SolverService.NewDecisionCancelsQuickly` can miss their bounds under TSan when the machine is busy; rerun them alone.
 - Windowless UI tests are in `tests/trainer_ui_test.cpp`. They inject ImGui input at fixed coordinates, so layout changes mean updating those constants.
 - `main.cpp` has developer flags for reaching rare screens: `--seed`, `--log-dir`, `--exit-after-frames`, `--auto-shove`, `--stop-on live-side-pot|side-pot|showdown|flop|bust`, `--reveal`, `--bot-delay MS`, `--solver`, `--solver-budget MS`, `--solver-tier off|river|turn|flop`.
 - More developer flags for reviewing the UI: `--advice baseline|nit|station|maniac` (initial "Advice:" choice), `--hover X,Y` (holds the ImGui mouse there, for tooltips), `--size WxH` (window size, at least 1180x760), and `--screenshot PATH` (saves the last frame as a PNG, with `--exit-after-frames` or on close; works under `xvfb-run` on Linux).
@@ -152,7 +153,7 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - Advisor equity is against random hands, and fold equity can recommend small bets with weak hands, such as 24% equity on a paired board.
 - The sizing distribution is measured only for heads-up spots with no bet to face.
 - New Session has no confirmation, and quitting mid-hand can make the summary's `hands` count one higher than the logged hands.
-- ThreadSanitizer has not been run on the equity code.
+- Sanitizers have run only on Linux with GCC: ThreadSanitizer, and AddressSanitizer with UBSan, over the whole core test suite and a threaded turn-bench solve, with nothing reported. MSVC builds have not been sanitized.
 
 ## 13. Working Preferences
 

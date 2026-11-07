@@ -340,7 +340,10 @@ TEST(SolverService, NewDecisionCancelsQuickly) {
     const double latency = ms_since(start);
     ASSERT_TRUE(answer);
     EXPECT_EQ(answer->state, SolverState::NotApplicable);
-    EXPECT_LT(latency, 200.0);
+    // Measured at 6-8 ms in Release here. The bound leaves room for loaded
+    // or sanitized test machines (216 ms under TSan with a bench running
+    // alongside), and is still far below a full flop iteration (about 4 s).
+    EXPECT_LT(latency, 1'000.0);
     std::printf("[ cancel latency: %.1f ms ]\n", latency);
     EXPECT_FALSE(service.poll(turn.key));
 }

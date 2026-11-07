@@ -1,7 +1,8 @@
 #pragma once
 
 // Benchmark spots for tools/advisor_bench and tests/bench_test.cpp: loading
-// tools/bench/river_spots.json and replaying a spot's script through GameEngine.
+// tools/bench/river_spots.json or turn_spots.json and replaying a spot's script
+// through GameEngine.
 // Header-only and tools-only; the syntax is documented in tools/bench/README.md.
 
 #include <algorithm>
@@ -47,8 +48,10 @@ struct BenchSpot {
     std::string pot_type;
     std::string family;
     std::string line;
-    std::vector<Card> board;  // Five cards
-    std::array<std::vector<ScriptAction>, 4> script;  // Preflop, flop, turn, river (up to the hero's decision)
+    Street street = Street::River;  // The street of the hero's decision (the file's)
+    std::vector<Card> board;  // Five cards on the river, four on the turn
+    // Preflop, flop, turn, river, up to the hero's decision; empty after its street.
+    std::array<std::vector<ScriptAction>, 4> script;
     std::array<std::string, 4> script_text;
     bool hero_ip = false;
     std::array<std::string, 2> range_text;  // OOP, IP
@@ -58,16 +61,17 @@ struct BenchSpot {
     std::array<int, 2> stacks{};            // OOP, IP stacks behind at the hero's decision
 
     int hero() const { return hero_ip ? 1 : 0; }
-    // "OOP first", or "IP vs 33%" from the river bet the hero faces.
+    // "OOP first", or "IP vs 33%" from the bet the hero faces on the decision street.
     std::string role() const {
         if (!hero_ip) return "OOP first";
-        const std::vector<ScriptAction>& river = script[3];
-        if (river.empty() || !river.back().pot_fraction) return "IP";
-        return "IP vs " + std::to_string(static_cast<int>(std::lround(*river.back().pot_fraction * 100.0))) + "%";
+        const std::vector<ScriptAction>& last = script[static_cast<std::size_t>(street)];
+        if (last.empty() || !last.back().pot_fraction) return "IP";
+        return "IP vs " + std::to_string(static_cast<int>(std::lround(*last.back().pot_fraction * 100.0))) + "%";
     }
 };
 
 struct BenchFile {
+    Street street = Street::River;  // "street": "turn" or "river" (the default)
     int stack = 2000;
     int small_blind = 10;
     int big_blind = 20;
@@ -163,8 +167,11 @@ inline const nlohmann::json& field(const nlohmann::json& object, const char* key
     return object.at(key);
 }
 
-inline BenchSpot parse_spot(const nlohmann::json& entry) {
+// `street` is the file's decision street: the board has street + 2 cards, and the
+// script keys after it may be missing or empty.
+inline BenchSpot parse_spot(const nlohmann::json& entry, Street street) {
     BenchSpot spot;
+    spot.street = street;
     spot.id = field(entry, "id").get<std::string>();
     try {
         spot.description = field(entry, "description").get<std::string>();
@@ -172,10 +179,18 @@ inline BenchSpot parse_spot(const nlohmann::json& entry) {
         spot.family = field(entry, "family").get<std::string>();
         spot.line = field(entry, "line").get<std::string>();
         spot.board = tools::parse_board(field(entry, "board").get<std::string>());
-        if (spot.board.size() != 5) throw std::invalid_argument("the board needs five cards");
+        const auto decision = static_cast<std::size_t>(street);
+        if (spot.board.size() != decision + 2) {
+            throw std::invalid_argument("the board needs " + std::to_string(decision + 2) + " cards");
+        }
         for (std::size_t s = 0; s < 4; ++s) {
-            spot.script_text[s] = field(entry, std::string(kStreetKeys[s]).c_str()).get<std::string>();
+            const std::string key(kStreetKeys[s]);
+            if (s > decision && !entry.contains(key)) continue;
+            spot.script_text[s] = field(entry, key.c_str()).get<std::string>();
             spot.script[s] = parse_street_script(spot.script_text[s]);
+            if (s > decision && !spot.script[s].empty()) {
+                throw std::invalid_argument("no actions allowed after the decision street (" + key + ")");
+            }
         }
         const std::string hero = field(entry, "hero").get<std::string>();
         if (hero != "oop" && hero != "ip") throw std::invalid_argument("hero must be oop or ip");
@@ -198,10 +213,18 @@ inline BenchSpot parse_spot(const nlohmann::json& entry) {
 inline BenchFile parse_bench_file(const std::string& text) {
     const nlohmann::json root = nlohmann::json::parse(text);
     BenchFile file;
+    if (root.contains("street")) {
+        const std::string street = root.at("street").get<std::string>();
+        if (street == "turn") {
+            file.street = Street::Turn;
+        } else if (street != "river") {
+            throw std::invalid_argument("street must be turn or river");
+        }
+    }
     file.stack = field(root, "stack").get<int>();
     file.small_blind = field(root, "small_blind").get<int>();
     file.big_blind = field(root, "big_blind").get<int>();
-    for (const nlohmann::json& entry : field(root, "spots")) file.spots.push_back(parse_spot(entry));
+    for (const nlohmann::json& entry : field(root, "spots")) file.spots.push_back(parse_spot(entry, file.street));
     std::vector<std::string> ids;
     for (const BenchSpot& spot : file.spots) ids.push_back(spot.id);
     std::sort(ids.begin(), ids.end());
@@ -245,10 +268,11 @@ inline std::optional<int> first_combo(const WeightedRange& range, CardMask dead)
     return std::nullopt;
 }
 
-// Deals the spot with the given hole cards (the other four players get the
-// lowest unused cards), then plays the script. Returns the engine at the hero's
-// river decision. Throws std::runtime_error when an action is illegal, comes out
-// of turn, or a street ends somewhere other than where the script does.
+// Deals the spot with the given hole cards (the other four players, and a turn
+// spot's river card, get the lowest unused cards), then plays the script. Returns
+// the engine at the hero's decision on the spot's street. Throws std::runtime_error
+// when an action is illegal, comes out of turn, or a street ends somewhere other
+// than where the script does.
 inline GameEngine replay_spot(const BenchFile& file, const BenchSpot& spot, const std::array<Card, 2>& hero_cards,
                               const std::array<Card, 2>& villain_cards) {
     GameConfig config;
@@ -260,25 +284,27 @@ inline GameEngine replay_spot(const BenchFile& file, const BenchSpot& spot, cons
     GameEngine engine(config);
 
     ScriptedDeal deal;
-    for (std::size_t c = 0; c < 5; ++c) deal.board[c] = spot.board[c];
     deal.holes[static_cast<std::size_t>(hero_seat(spot))] = hero_cards;
     deal.holes[static_cast<std::size_t>(villain_seat(spot))] = villain_cards;
     CardMask used = card_mask(std::span<const Card>(spot.board)) | card_mask(std::span<const Card>(hero_cards)) |
                     card_mask(std::span<const Card>(villain_cards));
-    if (std::popcount(used) != 9) throw std::runtime_error(spot.id + ": hole cards clash with each other or the board");
+    if (std::popcount(used) != static_cast<int>(spot.board.size()) + 4) {
+        throw std::runtime_error(spot.id + ": hole cards clash with each other or the board");
+    }
     int next = 0;
     const auto spare = [&] {
         while ((used & (CardMask{1} << next)) != 0) ++next;
         used |= CardMask{1} << next;
         return Card(next);
     };
+    for (std::size_t c = 0; c < 5; ++c) deal.board[c] = c < spot.board.size() ? spot.board[c] : spare();
     for (auto& hole : deal.holes) {
         if (!hole) hole = std::array<Card, 2>{spare(), spare()};
     }
     engine.start_hand(deal);
 
     const auto fail = [&](const std::string& message) { throw std::runtime_error(spot.id + ": " + message); };
-    for (std::size_t s = 0; s < 4; ++s) {
+    for (std::size_t s = 0; s <= static_cast<std::size_t>(spot.street); ++s) {
         const auto street = static_cast<Street>(s);
         if (engine.state().street != street) fail("expected " + std::string(to_string(street)) + " to start");
         for (const ScriptAction& scripted : spot.script[s]) {
@@ -300,8 +326,9 @@ inline GameEngine replay_spot(const BenchFile& file, const BenchSpot& spot, cons
             }
         }
     }
-    if (engine.state().street != Street::River) fail("the hand left the river before the hero's decision");
-    if (engine.state().to_act != hero_seat(spot)) fail("the hero is not the one to act on the river");
+    const std::string decision(to_string(spot.street));
+    if (engine.state().street != spot.street) fail("the hand left the " + decision + " before the hero's decision");
+    if (engine.state().to_act != hero_seat(spot)) fail("the hero is not the one to act on the " + decision);
     return engine;
 }
 

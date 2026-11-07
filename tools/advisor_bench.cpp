@@ -1,16 +1,19 @@
-// Scores the Training Advisor against the river solver on the benchmark spots in
-// tools/bench/river_spots.json. Run from the repository root.
+// Scores the Training Advisor against the solver on the benchmark spots in
+// tools/bench/river_spots.json (the default) or turn_spots.json. Run from the
+// repository root.
 //
 //   advisor_bench [--spots PATH] [--iterations N] [--min-iterations N] [--target PCT]
-//                 [--combos N] [--advisor-rollouts N] [--seed S] [--timing] [--only ID]
-//                 [--csv PATH] [--stability] [--baseline-params C,V,B]
+//                 [--threads N] [--combos N] [--advisor-rollouts N] [--seed S] [--timing]
+//                 [--only ID] [--csv PATH] [--stability] [--baseline-params C,V,B]
 //
-// For each spot: replay the script through GameEngine, solve the river from the
-// spot's assumed ranges, then ask the advisor about a sample of hero combos and
-// compare its action with the solver's. The tree is river_default_abstraction (root
-// sizes are the advisor's 25/50/75/100% ladder plus all-in) with sizes merged into
+// For each spot: replay the script through GameEngine, solve the spot's street from
+// its assumed ranges, then ask the advisor about a sample of hero combos and
+// compare its action with the solver's. The tree is river_default_abstraction for
+// river files and turn_tier_abstraction for turn files (root sizes are the
+// advisor's 25/50/75/100% ladder plus all-in in both), with sizes merged into
 // all-in only when they take the whole stack, as the advisor lists them, so every
-// advisor bet or raise has a root action with the same street total. Per combo:
+// advisor bet or raise has a root action with the same street total. A turn solve
+// runs on --threads threads (the result does not depend on the count). Per combo:
 //   regret  = (max_a ev_best[a][h] - ev_best[advisor][h]) / big blind
 //   agree   = the advisor's action is the solver's most frequent one
 //   freq    = the solver's frequency for the advisor's action
@@ -46,6 +49,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "advisor/training_advisor.h"
@@ -64,14 +68,17 @@ constexpr int kCheckEvery = 25;  // Iterations between exploitability checks
 
 constexpr std::string_view kUsage =
     "Usage: advisor_bench [--spots PATH] [--iterations N] [--min-iterations N] [--target PCT]\n"
-    "                     [--combos N] [--advisor-rollouts N] [--seed S] [--timing] [--only ID]\n"
-    "                     [--csv PATH] [--stability] [--baseline-params C,V,B]\n"
-    "  --spots             spot file (default tools/bench/river_spots.json)\n"
-    "  --iterations        solver iteration cap per spot (default 3000)\n"
-    "  --min-iterations    iterations before the target may stop a solve (default 2000, at\n"
-    "                      most --iterations), so off-path ev_best values have converged\n"
-    "                      even where exploitability falls fast\n"
-    "  --target            stop once exploitability is at most PCT % of pot (default 0.3)\n"
+    "                     [--threads N] [--combos N] [--advisor-rollouts N] [--seed S] [--timing]\n"
+    "                     [--only ID] [--csv PATH] [--stability] [--baseline-params C,V,B]\n"
+    "  --spots             spot file (default tools/bench/river_spots.json; a file with\n"
+    "                      \"street\": \"turn\" is solved with the turn tier)\n"
+    "  --iterations        solver iteration cap per spot (default 3000 river, 1500 turn)\n"
+    "  --min-iterations    iterations before the target may stop a solve (default 2000 river,\n"
+    "                      500 turn; at most --iterations), so off-path ev_best values have\n"
+    "                      converged even where exploitability falls fast\n"
+    "  --target            stop once exploitability is at most PCT % of pot (default 0.3\n"
+    "                      river, 0.5 turn)\n"
+    "  --threads           solver threads for turn spots (default: hardware threads)\n"
     "  --combos            hero combos sampled per spot (default 80)\n"
     "  --advisor-rollouts  advisor Monte Carlo rollouts (default 5000)\n"
     "  --seed              advisor seed (default 0)\n"
@@ -85,9 +92,11 @@ constexpr std::string_view kUsage =
 
 struct Options {
     std::string spots = "tools/bench/river_spots.json";
-    int iterations = 3000;
-    int min_iterations = 2000;
-    double target = 0.3;
+    // Unset: the street's default (river 3000 / 2000 / 0.3, turn 1500 / 500 / 0.5)
+    std::optional<int> iterations;
+    std::optional<int> min_iterations;
+    std::optional<double> target;
+    int threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
     int combos = 80;
     int rollouts = kDefaultRollouts;
     std::uint64_t seed = 0;
@@ -156,6 +165,8 @@ Options parse_options(int argc, char** argv) {
             options.iterations = int_flag(arg, value, 1);
         } else if (arg == "--min-iterations") {
             options.min_iterations = int_flag(arg, value, 0);
+        } else if (arg == "--threads") {
+            options.threads = int_flag(arg, value, 1);
         } else if (arg == "--target") {
             const std::optional<double> target = tools::parse_double(value);
             if (!target || *target < 0.0) usage_error("--target needs a non-negative percentage");
@@ -176,8 +187,16 @@ Options parse_options(int argc, char** argv) {
             usage_error("unknown flag: " + std::string(arg));
         }
     }
-    options.min_iterations = std::min(options.min_iterations, options.iterations);
     return options;
+}
+
+// Fills the unset solver limits with the street's defaults.
+void apply_street_defaults(Options& options, Street street) {
+    const bool turn = street == Street::Turn;
+    if (!options.iterations) options.iterations = turn ? 1500 : 3000;
+    if (!options.min_iterations) options.min_iterations = turn ? 500 : 2000;
+    if (!options.target) options.target = turn ? 0.5 : 0.3;
+    options.min_iterations = std::min(*options.min_iterations, *options.iterations);
 }
 
 std::string action_label(const TreeAction& action) {
@@ -289,17 +308,23 @@ struct SpotResult {
     double stability_mean_change = 0.0;
 };
 
-// Up to `count` hands spread evenly over the root player's hands sorted by river
-// strength (strongest first, ties by combo index): a systematic sample that keeps
-// value hands, bluff-catchers and air in proportion.
+// Up to `count` hands spread evenly over the root player's hands sorted by made-hand
+// strength on the current board (strongest first, ties by combo index): a
+// systematic sample that keeps value hands, bluff-catchers and air in proportion.
 std::vector<std::size_t> sample_hands(const RootSolution& root, const std::vector<Card>& board, int count) {
     std::vector<std::size_t> live;
     for (std::size_t h = 0; h < root.hands.size(); ++h) {
         if (root.share[h] > 0.0) live.push_back(h);
     }
-    const std::array<Card, 5> five{board[0], board[1], board[2], board[3], board[4]};
     std::vector<HandRank> rank(root.hands.size());
-    for (const std::size_t h : live) rank[h] = evaluate7(combo_cards(root.hands[h]), five);
+    std::vector<Card> cards(board);
+    cards.resize(board.size() + 2);
+    for (const std::size_t h : live) {
+        const std::array<Card, 2> hole = combo_cards(root.hands[h]);
+        cards[board.size()] = hole[0];
+        cards[board.size() + 1] = hole[1];
+        rank[h] = evaluate(cards);
+    }
     std::sort(live.begin(), live.end(), [&](std::size_t a, std::size_t b) {
         if (rank[a] != rank[b]) return rank[a] < rank[b];
         return root.hands[a] < root.hands[b];
@@ -333,14 +358,18 @@ SpotResult run_spot(const bench::BenchFile& file, const bench::BenchSpot& spot, 
 
     const auto start = std::chrono::steady_clock::now();
     const SolveSpot solve_spot = spot_from_view(first_view, spot.ranges[hero], spot.ranges[1 - hero]);
-    BetAbstraction abstraction = river_default_abstraction();
+    BetAbstraction abstraction =
+        spot.street == Street::Turn ? turn_tier_abstraction() : river_default_abstraction();
     abstraction.all_in_merge = 1.0;
-    PostflopSolver solver(solve_spot, abstraction);
+    SolverLimits limits;
+    limits.threads = options.threads;
+    PostflopSolver solver(solve_spot, abstraction, limits);
+    const int iterations = *options.iterations;
     double exploitability = 0.0;
-    while (solver.iterations() < options.iterations) {
-        solver.run(std::min(kCheckEvery, options.iterations - solver.iterations()));
+    while (solver.iterations() < iterations) {
+        solver.run(std::min(kCheckEvery, iterations - solver.iterations()));
         exploitability = solver.exploitability_pct_pot();
-        if (exploitability <= options.target && solver.iterations() >= options.min_iterations) break;
+        if (exploitability <= *options.target && solver.iterations() >= *options.min_iterations) break;
     }
     const RootSolution root = solver.root();
     result.solve_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -491,7 +520,7 @@ std::string baseline_text(const Options& options) {
 }
 
 int main(int argc, char** argv) {
-    const Options options = parse_options(argc, argv);
+    Options options = parse_options(argc, argv);
     const auto started = std::chrono::steady_clock::now();
     bench::BenchFile file;
     try {
@@ -500,6 +529,8 @@ int main(int argc, char** argv) {
         std::cerr << "advisor_bench: " << error.what() << '\n';
         return 2;
     }
+    apply_street_defaults(options, file.street);
+    const bool turn = file.street == Street::Turn;
 
     std::vector<SpotResult> results;
     try {
@@ -517,16 +548,17 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    std::cout << "## Advisor vs river solver\n\n"
-              << "Solver: target " << options.target << "% of pot, " << options.min_iterations << " to "
-              << options.iterations << " iterations. Advisor: seed " << options.seed << ", " << options.rollouts
+    std::cout << "## Advisor vs " << (turn ? "turn" : "river") << " solver\n\n"
+              << "Solver: " << (turn ? "turn tier" : "river tier") << ", target " << *options.target << "% of pot, "
+              << *options.min_iterations << " to " << *options.iterations << " iterations"
+              << (turn ? ", " + std::to_string(options.threads) + " threads" : std::string()) << ". Advisor: seed " << options.seed << ", " << options.rollouts
               << " rollouts" << baseline_text(options) << ". Up to " << options.combos << " hero combos per spot, weighted by root share.\n"
               << "Regret uses best-continuation EVs (ev_best). Ranges are assumed, not solved.\n\n"
               << "| spot | hero | hands | sampled | iters | expl % pot | regret bb | > 0.5 bb | > 1 bb | agree | freq"
               << " | < 10% | inexact maps |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
-    bool all_converged = true;
+    int missed = 0;
     for (const SpotResult& r : results) {
-        all_converged = all_converged && r.exploitability <= options.target;
+        missed += r.exploitability <= *options.target ? 0 : 1;
         const SpotMetrics& m = r.metrics;
         std::cout << "| " << r.spot->id << " | " << r.spot->role() << " | " << r.hands << " | " << r.combos.size()
                   << " | " << r.iterations << " | " << fixed(r.exploitability, 3) << " | " << fixed(m.regret, 3)
@@ -553,7 +585,8 @@ int main(int argc, char** argv) {
         for (const ComboResult& c : r.combos) millis.push_back(c.millis);
     }
     std::cout << "\nSolver time " << fixed(solve_ms / 1000.0, 1) << " s over " << results.size() << " spots; "
-              << (all_converged ? "every spot reached the target.\n" : "SOME SPOTS MISSED THE TARGET.\n");
+              << (missed == 0 ? "every spot reached the target.\n"
+                              : std::to_string(missed) + " SPOT(S) MISSED THE TARGET (see expl % pot).\n");
     if (options.stability) {
         std::cout << "\n### Stability (re-solved at twice the iterations)\n\n"
                   << "| spot | iters | mean abs combo regret change bb | spot regret change bb |\n|---|---|---|---|\n";

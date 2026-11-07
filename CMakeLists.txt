@@ -105,7 +105,7 @@ add_executable(solver_cli tools/solver_cli.cpp)
 target_link_libraries(solver_cli PRIVATE poker_core)
 target_compile_options(solver_cli PRIVATE ${POKER_WARNINGS})
 
-# Scores the Training Advisor against the river solver on tools/bench/river_spots.json.
+# Scores the Training Advisor against the river or turn solver on tools/bench/*_spots.json.
 add_executable(advisor_bench tools/advisor_bench.cpp)
 target_link_libraries(advisor_bench PRIVATE poker_core nlohmann_json::nlohmann_json)
 target_compile_options(advisor_bench PRIVATE ${POKER_WARNINGS})
@@ -208,7 +208,7 @@ if(POKER_BUILD_TESTS)
     )
     target_link_libraries(core_tests PRIVATE poker_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_compile_options(core_tests PRIVATE ${POKER_WARNINGS})
-    # Bench.SpotFileParsesAndEverySpotIsLegal reads tools/bench/river_spots.json.
+    # The Bench tests read tools/bench/river_spots.json and turn_spots.json.
     target_compile_definitions(core_tests PRIVATE POKER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     if(POKER_BUILD_APP)
         target_sources(core_tests PRIVATE tests/trainer_ui_test.cpp tests/screenshot_test.cpp)
@@ -232,6 +232,11 @@ if(POKER_BUILD_TESTS)
     add_test(NAME advisor_bench_smoke
              COMMAND advisor_bench --spots ${CMAKE_SOURCE_DIR}/tools/bench/river_spots.json
                      --only co_btn-paired-bx --combos 8 --advisor-rollouts 500)
+    # The same on a turn spot: the turn tier, threaded, 20 iterations.
+    add_test(NAME advisor_bench_turn_smoke
+             COMMAND advisor_bench --spots ${CMAKE_SOURCE_DIR}/tools/bench/turn_spots.json
+                     --only co_btn-wet-bc --iterations 20 --min-iterations 20 --combos 4
+                     --advisor-rollouts 500 --threads 2)
     # Bots and the advisor must see the table only through PlayerView.
     add_test(NAME no_engine_access_in_players
              COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/check_no_engine_access.cmake)

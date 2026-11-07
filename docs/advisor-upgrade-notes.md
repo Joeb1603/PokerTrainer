@@ -1159,6 +1159,77 @@ Every street also has all-in, and the flop tiers raise all-in only.
 
 **Tests:** 488 pass in Release (9.2 s wall) and Debug (36.2 s): 482 plus 6 new. GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `trainer_ui.cpp` and `trainer_ui_test.cpp`.
 
+### Stage 8 batch E (turn bench holdout, sanitizers), uncommitted, on top of `4846048`
+
+**Turn bench design** (`tools/bench/turn_spots.json`, from the new `gen_turn_spots.py`, a sibling of `gen_river_spots.py` with the same syntax and the same independent pot and stack check)
+- 12 heads-up turn decisions at 100 BB: the river bench's three pot types (BTN vs BB, CO vs BTN, SB 3-bets BTN) × dry / wet / paired / monotone, on the river bench's flops. The dry and paired turns add a second suit (Kd7c2h **4d**, As8d3c **5d**, Kc8h3d **2c**, 7c7d4s **Jd**, QsQd6c **3d**, 8s8c3d **Kc**), so every spot has flush or straight draws.
+- Two lines: `xx` (flop checked through) and `bc` (the preflop aggressor bets 33% and is called). Three hero roles: OOP first to act, or IP facing OOP's 50% or 75% turn bet (in BTN vs BB that is a lead or a probe). Every pot type and every role has two spots of each line, and every family one spot of each role.
+- Ranges at the turn decision are hand-written, as for the river (charts, then narrowed by hand on the flop; a facing-bet spot's OOP range is its turn betting range). Draws are in both ranges.
+- **The first draft was revised before the final numbers.** Its betting ranges held 63-75% equity against the caller's range with 6-30% of their weight under 35% equity, and the solver folded 52-87% to them (80% to a half-pot bet). A scratch program (exact turn equity of every combo against the other range, weighted by unblocked combos) guided adding bluffs, draws and merged hands until the eight betting ranges hold 55-65% equity with 24-37% of their weight under 35%. The revision was driven by that check, not by the tuned-vs-pre-tuning comparison; on the first draft the comparison pointed the same way (tuned 0.723 BB and 26% agreement, pre-tuning 0.762 BB and 29%).
+- `bench_spots.h`: an optional top-level `"street": "turn"` (default river) sets each spot's `street`; the board has street + 2 cards, scripts after the decision street may be missing or must be empty, `role()` reads the decision street's bet, and `replay_spot` stops at the hero's decision on that street. A turn spot's river card is the lowest spare card, which the player view never shows. River spots replay exactly as before.
+
+**`advisor_bench` on turn spots** (`--spots tools/bench/turn_spots.json`; `--spots` still defaults to the river file)
+- Tree: `turn_tier_abstraction()` with `all_in_merge = 1.0`, so every advisor size maps exactly: 0 inexact maps on all 12 spots (the exit-3 check still applies).
+- `--threads N` (default `hardware_concurrency`) sets `SolverLimits::threads`; results do not depend on it.
+- Street defaults when the flags are not given: turn 500 to 1500 iterations, target 0.5% of pot; river unchanged (2000 to 3000, 0.3%). The header names the tier and threads, and the summary counts spots that missed the target.
+- Combos are sampled by made-hand strength on the current board (`evaluate` on 6 cards for the turn; identical to the old `evaluate7` order on the river).
+- The river bench is unchanged: overall 0.694 BB and 57%.
+
+**Convergence and runtime** (Release, 4 threads, this 4-core container)
+- Every spot stopped at the 500-iteration minimum, with exploitability 0.003-0.167% of pot (target 0.5%): btn_bb-dry-xx 0.167 (the widest spot, 441 hero hands), the OOP-first spots 0.05, the facing-bet spots 0.003-0.030.
+- `--stability` (re-solved at 1000 iterations): mean absolute change in a combo's regret 0.0085 BB, overall regret −0.006 BB, largest spot change 0.029 BB (sb_btn_3bet-dry-xx). So 500 iterations are enough here, unlike the river's 200.
+- A full run takes 69.9 s, 67.7 s of it solving (about 5.6 s per spot); `--stability` 135 s. The advisor takes p50 2.15 ms and p95 3.11 ms per turn decision.
+
+**Results: tuned Baseline (0.85, 0.28, 1.2) against pre-tuning (`--baseline-params 0.95,0.33,1.0`)**, 80 combos per spot, regret in BB:
+
+| Group | Tuned regret | Pre-tuning regret | Tuned agree | Pre-tuning agree |
+|---|---|---|---|---|
+| **Overall (12)** | **0.543** (2.10% of pot) | **0.614** (2.17%) | **33%** | **39%** |
+| BTN vs BB | 0.198 | 0.179 | 30% | 38% |
+| CO vs BTN | 0.262 | 0.241 | 36% | 43% |
+| SB vs BTN 3-bet | 1.170 | 1.421 | 35% | 36% |
+| Dry / wet / paired / monotone | 0.636 / 0.408 / 0.286 / 0.843 | 0.704 / 0.382 / 0.376 / 0.993 | 39 / 18 / 30 / 47% | 46 / 27 / 39 / 44% |
+| Flop checked through / bet-call | 0.392 / 0.695 | 0.420 / 0.808 | 41 / 26% | 47 / 31% |
+| OOP first to act | 0.069 | 0.045 | 27% | 37% |
+| IP facing 50% | 0.309 | 0.404 | 43% | 48% |
+| IP facing 75% | 1.253 | 1.392 | 30% | 32% |
+
+Regret above 1 BB covers 13% of tuned hands (15% pre-tuning); the solver's frequency for the advised action is 34% (39%).
+
+| Spot | Hero | Hands | Tuned regret / agree | Pre-tuning regret / agree | Solver mix | Tuned advisor mix |
+|---|---|---|---|---|---|---|
+| btn_bb-dry-xx | OOP first | 441 | 0.040 / 9% | 0.026 / 18% | X 57% B25 32% B50 9% | X 19% B50 46% B75 35% |
+| btn_bb-wet-bc | IP vs 50% | 274 | 0.468 / 18% | 0.434 / 31% | F 14% C 82% R100 4% | F 2% C 29% R75 54% R100 15% |
+| btn_bb-paired-xx | IP vs 75% | 531 | 0.205 / 41% | 0.172 / 47% | F 63% C 36% | F 27% C 52% R50 18% |
+| btn_bb-monotone-bc | OOP first | 285 | 0.081 / 52% | 0.084 / 55% | X 99% | X 52% B75 47% |
+| co_btn-dry-xx | IP vs 50% | 118 | 0.027 / 68% | 0.061 / 72% | F 34% C 62% R100 4% | F 22% C 56% R75 19% |
+| co_btn-wet-bc | IP vs 75% | 114 | 0.711 / 5% | 0.673 / 9% | F 26% C 73% | C 29% R75 54% R100 13% |
+| co_btn-paired-bc | OOP first | 317 | 0.111 / 15% | 0.032 / 36% | X 94% | X 15% B25 55% B50 30% |
+| co_btn-monotone-xx | IP vs 50% | 115 | 0.197 / 55% | 0.197 / 55% | F 39% C 61% | F 25% C 50% R75 24% |
+| sb_btn_3bet-dry-xx | IP vs 75% | 137 | 1.842 / 40% | 2.025 / 49% | F 38% C 62% | F 58% C 7% R75 34% |
+| sb_btn_3bet-wet-xx | OOP first | 167 | 0.044 / 32% | 0.038 / 41% | X 73% B50 25% | X 33% B50 11% B75 46% B100 10% |
+| sb_btn_3bet-paired-bc | IP vs 50% | 133 | 0.544 / 33% | 0.925 / 33% | F 58% C 42% | F 10% C 73% R25 8% R50 10% |
+| sb_btn_3bet-monotone-bc | IP vs 75% | 99 | 2.252 / 33% | 2.697 / 22% | F 44% C 56% | C 78% R75 22% |
+
+- **Holdout verdict: mixed.** By the Stage 5 adoption rule the tuned parameters also pass on the turn (0.071 BB better overall, at least 0.03; no pot type or hero role worse by more than 0.1 BB: the worst is OOP first, +0.024). But the gain comes from the expensive spots (the 3-bet pot −0.251 BB, IP facing 75% −0.139), while both single-raised pot types and OOP-first get slightly worse (+0.02 BB each), and agreement with the solver's top action falls by 6 pp, lower in 12 of 13 groups (all but monotone). On the river, tuning raised agreement (54% to 56%). So the tuning holds up on regret but not on agreement; with 12 hand-written spots the regret gain is real for these spots but not strong evidence beyond them.
+- **Patterns:** facing turn bets the advisor raises far more than the solver (R75 54% on both wet `bc` spots, where the solver raises 0-4%) and folds less (the solver folds 26-63% in seven of the eight facing-bet spots; the advisor 0-27% except sb_btn_3bet-dry-xx). First to act it bets 48-85% where the solver checks 57-99%, but that is cheap (OOP-first regret 0.07 BB). The worst spots are the 3-bet pot facing 75% (2.25 and 1.84 BB).
+- Nothing in the advisor or bots changed.
+
+**ThreadSanitizer** (GCC 13.3, `/tmp/claude-0/b/tsan`, RelWithDebInfo, `-fsanitize=thread`, `POKER_BUILD_APP=OFF`, rebuilt at `4846048`)
+- The full suite, `ctest -j 4` (449 tests run, 10 disabled) in 183 s: no ThreadSanitizer report anywhere in the log.
+- One failure, not a race: `SolverService.NewDecisionCancelsQuickly` measured 216 ms against its 200 ms bound, while a 4-thread `advisor_bench` ran on the same 4 cores. Run alone under TSan it passes (no report). Left as is.
+- After the batch's changes: `Bench.*`, and a threaded turn-tier solve through `advisor_bench --threads 4 --stability` (30 + 30 iterations, `halt_on_error=1`): clean.
+
+**AddressSanitizer + UBSan** (new `/tmp/claude-0/b/asan`: GCC, RelWithDebInfo, `POKER_BUILD_APP=OFF`, `-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined`, dependency sources from the Release build's `_deps`)
+- The full suite, `ctest -j 4`: 451 tests passed (10 disabled) in 56 s, with no ASan, LeakSanitizer or UBSan report. The turn bench (`--threads 3 --stability`, 20 iterations) is clean too.
+- Not run: a Debug ASan build (RelWithDebInfo defines `NDEBUG`, so `assert`s were off), clang's sanitizers, and MSVC's `/fsanitize=address`.
+
+**Fixes:** none were needed.
+
+**Docs:** CLAUDE.md §12's ThreadSanitizer line now says what was run; §9 says how to configure the sanitizer builds. `tools/bench/README.md` covers the turn file, the street field and the turn defaults.
+
+**Tests:** 491 pass in Release (9.3 s wall) and Debug (37.5 s): 488 plus 3 new. GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `advisor_bench.cpp` and `bench_test.cpp`.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -1362,3 +1433,12 @@ Every street also has all-in, and the flop tiers raise all-in only.
   - `UiTest.PlayGtoUsesHeuristicForArchetypeLines` (1 / 4 ms): with Done, Station plays its own line; back on Baseline, the solver's label; with the advisor hidden, "Play GTO" plays the heuristic raise.
   - `UiTest.ExistingSidebarButtonsDidNotMove` (1 / 6 ms) also checks the toggle, New Session, the advisor toggle and the radios with the solve Running and Done.
   - `UiTest.EveryScreenDrawsWithFullData` (38 / 163 ms) also draws every phase and focus for each solver state (Off, NotApplicable, Running, Done, Failed) on the River, Turn and Flop tiers with the long approximate-flop label, without an exploitability, and unavailable with the mode on.
+- **Stage 8 batch E** (`tests/bench_test.cpp`, `CMakeLists.txt`):
+  - `Bench.SpotFileParsesAndEverySpotIsLegal`: its body moved into a helper, `check_spot_file`, shared with the turn test. The river assertions are unchanged, plus the file's and each spot's street, the board size, and `view.board` equal to the spot's board.
+    - **Old:** the tree was built with `river_default_abstraction()`.
+    - **New:** with `all_in_merge = 1.0`, as `advisor_bench` solves.
+    - **Reason:** the test should build the tree the bench actually solves.
+  - New `Bench.TurnSpotFileParsesAndEverySpotIsLegal` (10 / 40 ms Release / Debug): the same checks on `turn_spots.json` (12 spots, the turn tier).
+  - New `Bench.StreetFieldSetsBoardAndScriptLimits` (0 / 0 ms): `"street"` parsing, the board size per street, a turn file's optional empty `river`, rejecting a river action in a turn file, an unknown street, and a river file without a `river` script.
+  - New ctest `advisor_bench_turn_smoke` (0.19 / 1.1 s): one turn spot end to end, 20 iterations on 2 threads.
+- **`SolverService.NewDecisionCancelsQuickly`** (Stage 8 batch E follow-up): the cancel-latency bound went from < 200 ms to < 1000 ms. Measured latency is 6-8 ms in Release, but it hit 216 ms under ThreadSanitizer with a bench running alongside. The looser bound avoids failures on loaded or slow machines, and a full flop iteration (about 4 s) still fails it.

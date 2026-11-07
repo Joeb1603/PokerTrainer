@@ -249,14 +249,21 @@ TEST(Bench, RangeTextSuitFiltersAndCombos) {
     EXPECT_THROW(bench::parse_street_script("BB:X5"), std::invalid_argument);
 }
 
-// Every spot in the bench file parses, its script is legal and reaches the hero's
-// river decision with the pot and stacks the file states, and both ranges hold
-// combos once the board is out.
-TEST(Bench, SpotFileParsesAndEverySpotIsLegal) {
-    const bench::BenchFile file = bench::load_bench_file(std::string(POKER_SOURCE_DIR) + "/tools/bench/river_spots.json");
-    ASSERT_EQ(file.spots.size(), 36u);
+namespace {
+
+// Every spot in a bench file parses, its script is legal and reaches the hero's
+// decision on the file's street with the pot and stacks the file states, both
+// ranges hold combos once the board is out, and the solver's tree builds.
+void check_spot_file(const std::string& name, std::size_t count, Street street) {
+    const bench::BenchFile file = bench::load_bench_file(std::string(POKER_SOURCE_DIR) + "/tools/bench/" + name);
+    ASSERT_EQ(file.street, street);
+    ASSERT_EQ(file.spots.size(), count);
+    BetAbstraction abstraction = street == Street::Turn ? turn_tier_abstraction() : river_default_abstraction();
+    abstraction.all_in_merge = 1.0;  // As advisor_bench solves
     for (const bench::BenchSpot& spot : file.spots) {
         SCOPED_TRACE(spot.id);
+        EXPECT_EQ(spot.street, street);
+        EXPECT_EQ(spot.board.size(), static_cast<std::size_t>(street) + 2);
         const CardMask board = card_mask(std::span<const Card>(spot.board));
         const std::size_t hero = static_cast<std::size_t>(spot.hero());
         std::array<WeightedRange, 2> ranges = spot.ranges;
@@ -273,7 +280,8 @@ TEST(Bench, SpotFileParsesAndEverySpotIsLegal) {
             bench::replay_spot(file, spot, combo_cards(*hero_combo), combo_cards(*villain_combo));
         const int seat = bench::hero_seat(spot);
         const PlayerView view = engine.player_view(seat);
-        EXPECT_EQ(view.street, Street::River);
+        EXPECT_EQ(view.street, street);
+        EXPECT_EQ(view.board, spot.board);
         EXPECT_EQ(view.total_pot, spot.pot);
         EXPECT_EQ(view.opponents_in_hand(), 1);
         const std::array<int, 2> seats{bench::seat_of(spot.players[0]), bench::seat_of(spot.players[1])};
@@ -293,6 +301,36 @@ TEST(Bench, SpotFileParsesAndEverySpotIsLegal) {
         EXPECT_EQ(villain_bet > 0, spot.hero_ip);
         EXPECT_EQ(solve.effective_stack, std::min(spot.stacks[0] + solve.street_bet[0], spot.stacks[1] + solve.street_bet[1]) -
                                              villain_bet);
-        EXPECT_NO_THROW(build_betting_tree(solve, river_default_abstraction()));
+        EXPECT_NO_THROW(build_betting_tree(solve, abstraction));
     }
+}
+
+}  // namespace
+
+TEST(Bench, SpotFileParsesAndEverySpotIsLegal) { check_spot_file("river_spots.json", 36, Street::River); }
+
+// The turn holdout (Stage 8): the same checks on turn_spots.json, solved with the
+// turn tier.
+TEST(Bench, TurnSpotFileParsesAndEverySpotIsLegal) { check_spot_file("turn_spots.json", 12, Street::Turn); }
+
+// The file's street sets the board size, and no script may run past it.
+TEST(Bench, StreetFieldSetsBoardAndScriptLimits) {
+    const auto file_with = [](const std::string& street, const std::string& board, const std::string& river) {
+        std::string text = R"({"stack": 2000, "small_blind": 10, "big_blind": 20,)";
+        if (!street.empty()) text += R"("street": ")" + street + R"(",)";
+        text += R"("spots": [{"id": "t", "description": "", "pot_type": "btn_bb", "family": "dry", "line": "xx",)"
+                R"("board": ")" + board + R"(", "pre": "UTG:F HJ:F CO:F BTN:R50 SB:F BB:C", "flop": "BB:X BTN:X",)"
+                R"("turn": "",)" + river + R"("hero": "oop", "oop_range": "AA", "ip_range": "KK", "pot": 110,)"
+                R"("stacks": [1950, 1950]}]})";
+        return text;
+    };
+    const bench::BenchFile turn = bench::parse_bench_file(file_with("turn", "Kd 7c 2h 4d", ""));
+    EXPECT_EQ(turn.street, Street::Turn);
+    EXPECT_EQ(turn.spots[0].role(), "OOP first");
+    EXPECT_NO_THROW(bench::parse_bench_file(file_with("turn", "Kd 7c 2h 4d", R"("river": "",)")));
+    EXPECT_THROW(bench::parse_bench_file(file_with("turn", "Kd 7c 2h 4d", R"("river": "BB:X",)")), std::invalid_argument);
+    EXPECT_THROW(bench::parse_bench_file(file_with("turn", "Kd 7c 2h 4d 9s", "")), std::invalid_argument);
+    EXPECT_THROW(bench::parse_bench_file(file_with("flop", "Kd 7c 2h", "")), std::invalid_argument);
+    EXPECT_EQ(bench::parse_bench_file(file_with("", "Kd 7c 2h 4d 9s", R"("river": "",)")).street, Street::River);
+    EXPECT_THROW(bench::parse_bench_file(file_with("", "Kd 7c 2h 4d 9s", "")), std::invalid_argument);  // River script required
 }
