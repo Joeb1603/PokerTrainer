@@ -116,6 +116,7 @@ public:
     double* chance_values = nullptr;  // Per card, one list
     double* worker_scratch = nullptr;  // Workers 1..: worker_stride doubles each
     std::size_t worker_stride = 0;
+    const std::stop_token* interrupt = nullptr;  // SolverLimits::interrupt
 
     void walk(int index, const double* own, const double* opp, double* out, double* scratch) const {
         const TreeNode& node = tree->nodes[static_cast<std::size_t>(index)];
@@ -260,6 +261,7 @@ private:
         const int p = traverser;
         const std::span<const int> children = tree->children_of(index);
         const auto task = [&](int k, int worker) {
+            if (interrupt->stop_requested()) return;  // Abandoned: the values are discarded
             double* child_own = worker == 0 ? scratch : worker_scratch + static_cast<std::size_t>(worker - 1) * worker_stride;
             double* child_opp = child_own + np;
             double* rest = child_opp + no;
@@ -393,6 +395,7 @@ void PostflopSolver::build_tables(std::size_t full_boards, std::size_t checkdown
     checkdowns_.resize(turn_boards.size());
     const auto showdown_count = static_cast<int>(showdown_boards.size());
     const auto task = [&](int k, int) {
+        if (limits_.interrupt.stop_requested()) return;  // Abandoned with the solver
         if (k < showdown_count) {
             const auto board = static_cast<std::size_t>(showdown_boards[static_cast<std::size_t>(k)]);
             showdowns_[static_cast<std::size_t>(k)] = ShowdownTable(hands_, tree_.boards[board].view());
@@ -424,13 +427,14 @@ void PostflopSolver::attach(W& walker) const {
     walker.chance_values = scratch_.data() + chance_offset_;
     walker.worker_scratch = scratch_.data() + workers_offset_;
     walker.worker_stride = worker_stride_;
+    walker.interrupt = &limits_.interrupt;
 }
 
 void PostflopSolver::run(int iterations, std::stop_token stop) {
     if (iterations < 0) throw std::invalid_argument("solver: iterations must not be negative");
     const std::size_t widest = static_cast<std::size_t>(std::max(hands_.size(0), hands_.size(1)));
     for (int i = 0; i < iterations; ++i) {
-        if (stop.stop_requested()) return;
+        if (stop.stop_requested() || limits_.interrupt.stop_requested()) return;
         ++iterations_;
         Walker walker;
         attach(walker);

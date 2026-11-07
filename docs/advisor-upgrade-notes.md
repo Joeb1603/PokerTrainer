@@ -1014,6 +1014,112 @@ Every street also has all-in, and the flop tiers raise all-in only.
 - The tree lost nothing; `TreeShape` and `count_betting_tree` are new public API.
 - The turn tier misses the plan's per-iteration estimate (see above).
 
+### Stage 8 batches B and C (hardware tiers, `SolverService`, controller), uncommitted, on top of `37f079f`
+
+**Hardware** (`src/solver/hardware.{h,cpp}`)
+- `detect_hardware()` returns threads (`hardware_concurrency`, 0 read as 1), total and available RAM, and `ram_known`.
+  - Windows: `GlobalMemoryStatusEx` (`ullTotalPhys`, `ullAvailPhys`), with `WIN32_LEAN_AND_MEAN` and `NOMINMAX`, only in the .cpp.
+  - Linux: `MemTotal` and `MemAvailable` from `/proc/meminfo`. `MemAvailable` counts reclaimable page cache, so it is the better figure; `sysconf(_SC_AVPHYS_PAGES)` counts only free pages and reads low on a machine with a warm cache. `sysconf` is the fallback when `/proc/meminfo` lacks a line.
+  - Anything else: `ram_known = false`, which gives the river tier (with 2+ threads) and a 256 MB budget.
+  - Container memory limits (cgroups) are not read. This container reports about 14.9 GB available.
+- `choose_tier` (pure): Unavailable below 2 threads or 1 GB available; Flop at 8 threads and 8 GB; Turn at 4 threads and 4 GB; River otherwise. Memory budget = min(50% of available, 16 GB). Solver threads = max(1, threads − 1). This box: "4 threads, 14.9 GB free: solves river and turn, flop approximate", 3 solver threads, a 7.4 GB budget.
+- **Street to tree** (`tree_for`), refining the plan: the Turn tier also gets the approximate flop tree, which is about the size of a turn tree.
+
+  | Street | Unavailable | River | Turn | Flop |
+  |---|---|---|---|---|
+  | River | heuristic | river tier | river tier | river tier |
+  | Turn | heuristic | heuristic ("Turn needs a faster machine") | turn tier | turn tier |
+  | Flop | heuristic | heuristic | flop check-down, labelled "approximate: no river betting" | flop full if its estimate fits the budget **and the time budget is at least 120 s**, else check-down |
+  | Preflop | heuristic | heuristic | heuristic | heuristic |
+
+- **New: the full flop tree needs a 120 s budget** (`kFlopFullMinBudgetMs`, the UI's longest), not only the memory. Measured on 3 threads with the heads-up spot below (798 × 790 combos, 5.2 GB): 4 iterations in 20 s left it at 237% of the pot, and 14 in 60 s at 46%. The approximate tree reached 1.9% in 12 s on the same spot. At the default 8 s budget, full would give advice from about 5 iterations. Even at 120 s an 8-thread machine would run perhaps 30-60 iterations of this spot (extrapolated), so whether full beats check-down there is unverified.
+- `hardware_summary`: e.g. "4 threads, 15.6 GB free: solves river and turn, flop approximate". The controller adds "(tier set to X)" under an override.
+
+**Service** (`src/controller/solver_service.{h,cpp}`)
+- One worker `std::jthread` waits on a `condition_variable_any` with its stop token. One mutex guards the queued request, the current key, a job serial, the current job's `stop_source` and its progress.
+- `submit()` stops the current job's `stop_source`, clears the current key, bumps the serial and replaces any queued request. `cancel()` does the same and drops the queued request. The destructor cancels, requests the worker's stop and joins.
+- The worker takes the queued request, bumps the serial, makes a fresh `stop_source` and runs `SolverService::solve` unlocked. Progress is published through a callback that writes only while the serial is still the job's, and the final result likewise. A cancelled job's last writes are therefore dropped.
+- **Stale results:** `poll(key)` answers only the queued request's key (Running, "Starting") or the current job's key (its progress, or its result once done). Anything else returns nothing. The controller's key is `{decision_epoch, hand_number, action_count}`. The epoch is bumped for every Hero decision, including across `new_session()`, which restarts hand numbers. So a solve can only ever be shown for the decision it was submitted for. Replacing or cancelling a job discards even a finished result.
+- **The job** (`solve`, also callable synchronously):
+  1. Applicability, from the view alone. NotApplicable notes:
+     - "Postflop only: showing heuristic advice (preflop)"
+     - "Heads-up postflop only: showing heuristic advice (multiway)"
+     - "Opponent is all-in: showing heuristic advice"
+     - "Turn needs a faster machine (this one solves the river only): showing heuristic advice"
+     - "<tree label>: too big for this machine (needs X MB, budget Y MB): showing heuristic advice"
+     - "Solver unavailable on this machine: showing heuristic advice"
+  2. Ranges: the villain's is `infer_ranges(view, Baseline)[villain]` (Hero's cards already removed). Hero's is `infer_range_for(view, hero, Baseline, false)` with Hero's own combo raised to at least 0.01. `spot_from_view` removes the board.
+  3. The tree by tier and street. `estimate_bytes` is checked against the budget before anything is allocated.
+  4. A progress publish with the tree's label. Then the solver is built with `SolverLimits::interrupt` set to the job's token.
+  5. Iterations, one `run(1)` at a time, until any of:
+     - the time budget runs out. The budget counts setup, and the loop stops early enough for the closing check and `root()`: the larger of three average iterations and twice the last check's measured time. They cost 1.3 iterations together on the turn tree and 3.6 on the approximate flop tree. A fixed two-iteration margin overran 8 s by 0.4 s on the flop; this one is within 75 ms;
+     - the exploitability target is reached (0.3% river, 0.8% turn, 2% flop), checked when at least 10 iterations **and** 5% of the budget have passed since the last check;
+     - with `fixed_iterations`, exactly that many, in chunks of 10, then one check.
+  6. Advice from `root()` for Hero's combo: `freq` and `ev_best` per root action.
+     - Each tree action becomes a table action: Bet or Raise to `to`, clamped to `[min_raise_to, max_raise_to]`, becoming AllIn at the maximum.
+     - The tree's all-in is the shorter player's reach. With Hero deeper, it becomes a raise to that amount (`FacingABetMapsEveryOptionToALegalAction`: "RAISE to 940"). A raise the table does not reopen becomes AllIn if that is legal, or is dropped.
+     - Every action is checked against `view.legal`. Two sizes that clamp to one action merge (frequencies summed, the best EV kept).
+     - Labels follow the advisor: "CHECK", "BET 60 (50% Pot)", "CALL 100", "RAISE to 420 (100% Pot)", "ALL-IN 1940", "FOLD". The percentage is of the pot after calling, as `bet_pot_percent`.
+     - Best = the highest frequency; ties go to the action adding fewer chips.
+  7. The solver goes out of scope when the job ends, so only the advice is kept. Exceptions become Failed ("Solver failed: ..."), and the worker carries on.
+- **Hidden information:** the service reads only `PlayerView` (public table plus Hero's own cards), and the advice is for Hero's own combo. `src/controller/solver_service.*` was added to the `no_engine_access_in_players` text scan, and its header (with `solver/hardware.h`) to `player_boundary_test.cpp`.
+
+**Cancellation inside an iteration** (`SolverLimits::interrupt`, in `postflop_solver.{h,cpp}`)
+- Once the token is stopped, each first-layer chance task returns at its start, and so does each table-building task in the constructor. `run()` also checks it between iterations.
+- An abandoned pass leaves the solver unspecified, which is fine because the job is thrown away. `run()`'s own `stop_token` keeps its old clean between-iterations meaning, and nothing else changed (the existing solver tests and the bench are unchanged).
+- Latency is about one card's subtree, plus finishing the root street's walk. Not interruptible: range inference, the tree build and the river tree (which has no chance layer; its iterations take about 1 ms).
+
+**Measured** (Release, this 4-core container, `SolverService.DISABLED_ReportEndToEndTimes`)
+- **Spot:** heads-up, 100 BB. The button opens to 60 and the big blind calls. Board Kd7c2h, then 4s, then 9d, checked through; the big blind (KsQs) is first to act. 3 solver threads.
+- The heads-up Baseline ranges are wide: about 800 × 790 combos, against batch A's 6-max spot of 515 × 469.
+
+| Street (tree), budget | Combos | Estimate | Setup (ranges + solver) | Total | Iterations | Exploitability | Stopped by |
+|---|---|---|---|---|---|---|---|
+| River (river tier), 8 s | 741 × 731 | 1 MB | 1 ms | 0.40 s | 406 | 0.22% | target, at the first check (5% of 8 s) |
+| Turn (turn tier), 30 s | 777 × 766 | 86 MB | 36 ms | 12.7 s | 194 | 0.77% | target |
+| Turn (turn tier), 8 s (default) | | | | 7.9 s | 117 | 1.81% | budget |
+| Flop (check-down), 30 s | 798 × 790 | 96 MB | 331 ms | 12.0 s | 71 | 1.86% | target |
+| Flop (check-down), 8 s (default) | | | | 8.1 s | 41 | 5.77% | budget |
+| Flop (full), 20 s | 798 × 790 | 5,248 MB | 2.3 s | 20.0 s | 4 | 237% | budget |
+| Flop (full), 60 s | 798 × 790 | 5,248 MB | 2.3 s | 59.1 s | 14 | 45.9% | budget |
+
+- The full-flop rows were measured before the 120 s gate and with the earlier two-iteration tail margin. The 8 s rows come from a scratch program calling `SolverService::solve` on the same spots.
+- At the default 8 s budget, the turn and approximate flop solves stop on time, short of their targets: 1.81% against 0.8%, and 5.77% against 2%.
+- The river's first check comes only after 5% of the budget (400 ms at 8 s), although it reaches 0.3% after about 100 iterations. The rule follows the plan; a cheaper check rule would finish the river about 4x sooner.
+- **Cancel latency** (submit a new decision mid-solve, until the new job's answer):
+
+  | Tree | Latency |
+  |---|---|
+  | River | 2 ms |
+  | Turn | 6-8 ms (`NewDecisionCancelsQuickly`: 6.3 ms Release, 12.9 ms Debug) |
+  | Flop check-down | 4 ms |
+  | Flop full, mid-iteration | 141-146 ms |
+
+  Without the in-iteration checks, flop full would take up to one whole iteration (about 4 s here).
+- The destructor mid-solve on the turn: under 500 ms in the test (one card's subtree).
+- **ThreadSanitizer** (GCC, the existing `/tmp/claude-0/b/tsan` RelWithDebInfo build): `SolverService.*`, `Controller.Solver*` and `WorkerPool.*` report nothing.
+
+**Controller** (`local_game_controller.{h,cpp}`)
+- The hardware is detected once at construction (`ControllerOptions::hardware_override` for tests), and the tier comes from it or from `solver_tier_override`.
+- In `after_state_change()`, every Hero decision bumps `decision_epoch_`. With solver mode on, the decision is submitted. A decision that the armed Fold Early folds at once is not submitted. Any other state cancels and resets the panel to Off.
+- `tick()` polls first, before its early returns, and copies the progress into `snapshot_.solver`. `rebuild_snapshot()` copies the panel too.
+- `set_solver_enabled(true)` submits the pending decision under its existing key, and `false` cancels. `set_solver_budget_ms` applies from the next submit.
+- The heuristic hint, `submit_hero_action`, Fold Early, mistakes (on Baseline `base_ev`) and the JSONL are untouched. The service is the last member, so it is cancelled and joined first.
+- `IGameController` gains `set_solver_enabled`, `solver_enabled`, `set_solver_budget_ms` and `solver_budget_ms` (also in `FakeController`). `TableSnapshot::solver` is a `SolverPanel{available, hardware_summary, tier, progress}`.
+- `ControllerOptions` gains `solver_enabled`, `solver_budget_ms`, `solver_fixed_iterations`, `solver_threads`, `solver_tier_override` and `hardware_override`.
+- `main.cpp` gains `--solver`, `--solver-budget MS` and `--solver-tier off|river|turn|flop` (`off` is Unavailable). The usage line and CLAUDE.md §9 list them.
+- `local_game_controller.cpp`'s 24 pre-existing `-Wsign-conversion` hits (int indices into `std::array`) were cast through a local `at()`, so `strict.sh` is clean on it. Bot seeds are unchanged.
+
+482 tests pass in Release (10.0 s wall) and Debug (36.7 s): 470 plus 12 new. GCC Release and Debug and clang build with zero warnings. `strict.sh` is clean on `hardware.cpp`, `solver_service.cpp`, `local_game_controller.cpp`, `main.cpp`, `postflop_solver.cpp` and `tests/solver_service_test.cpp`. `advisor_bench` is unchanged at 0.694 bb and 57%.
+
+**Deviations**
+- `HardwareInfo` gained `ram_known`, because "unknown → River tier" can't be told apart from "0 bytes available → Unavailable" otherwise.
+- `ControllerOptions` gained `hardware_override` (the brief's "overridable for tests").
+- Full flop also needs a 120 s budget (above).
+- `SolverProgress` has no `solved_street` field. The street label is in `advice.street_label`, and in `note` while running (the brief's type list).
+- `SolverService::solve` is public and static, so tests and the timing report can run a job synchronously.
+- `SolverLimits::interrupt` is new solver API.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -1056,6 +1162,13 @@ Every street also has all-in, and the flop tiers raise all-in only.
 - Stage 8 batch A: the first check-down version (48 sweeps per node) had a different exploitability path on the same spot (5.6% at 90 iterations against 1.25% for the table). It was replaced before the brute-force test existed, so whether it had a bug is unknown. The table version matches the brute force and the chance-node tree.
 - Stage 8 batch A: the thread cap (the first layer's cards, at most 1024) and the dynamic task hand-out were chosen, not tuned.
 - Stage 8 batch A: the hot loops (showdown sweeps 46% and the walk 38% of turn-tier instructions under callgrind) were not optimized. The known options are folding the reach-total pass into the forward sweep and skipping zero-reach hands. The turn tier misses the plan's 15-20 ms per iteration on 3 threads (31 ms on 4).
+
+- Stage 8 batches B and C: Windows memory detection (`GlobalMemoryStatusEx`) was compiled only in reading, never run; macOS and other platforms fall back to the river tier untested. Container (cgroup) memory limits are not read, so a container could report more memory than it may use.
+- Stage 8 batches B and C: the tier thresholds, the 50% / 16 GB budget and the 120 s gate for full flop are the plan's or chosen; whether full flop at 120 s on 8+ threads beats the approximate tree was not measured (no 8-thread machine).
+- Stage 8 batches B and C: end-to-end times and cancel latencies come from one heads-up spot on this container. 6-max heads-up pots have narrower ranges, so they solve faster.
+- Stage 8 batches B and C: ThreadSanitizer ran with GCC only, on the service, controller-solver and pool tests; clang's TSan and the full suite under TSan are batch E.
+- Stage 8 batches B and C: range inference, the tree build and river iterations are not interruptible. They were short in every measurement here (river iterations about 1 ms, inference a few ms), but a slow machine could stretch a cancel by their length.
+- Stage 8 batches B and C: the advice is the solver's average strategy when the budget ends, not a converged one. At the default 8 s on this box, the wide heads-up spot stopped at 1.81% of the pot on the turn and 5.77% on the approximate flop. How much Hero's own frequencies move between those and the targets was not measured.
 
 ## Test changes
 
@@ -1182,3 +1295,19 @@ Every street also has all-in, and the flop tiers raise all-in only.
   - **New tests:** `PlayGtoFollowsTheSelectedLine` (each radio, then Play GTO plays that line's action, Baseline again at the end), `PlayVsLabelNamesTheArchetype` (labels per line, and "Play vs Station" with the advisor hidden still plays it), `PlayGtoFallsBackToBaselineWithoutLines`, `VersusRowSelectsItsLine`, `ExistingSidebarButtonsDidNotMove` (New Session, the toggle and the four radios hit their own IDs at the constants; New Session and the toggle still act), `TooltipAppearsOnHover` (30 frames at 1/60 s over the table: no `##Tooltip_00`; over Station: active this frame), `Screenshot.ChecksumsMatchKnownValues`, `Screenshot.TinyImageHasTheExactLayout`, `Screenshot.LargeImagesSplitIntoStoredBlocks`.
 
 - **Stage 8 batch A** (`tests/solver_test.cpp`): no existing assertion changed. `BettingTree.TurnTreeDealsEveryRiver` and the river tests pass unchanged, because only `check_down_river` trees use the new node. New tests: `SolverTiers.AbstractionsHaveTheirSizes`, `SolverTiers.CountingWalkMatchesTheBuiltTree`, `TurnSolver.SmallRangesConverge`, `TurnSolver.MemoryEstimateMatchesAllocation`, `FlopSolver.CheckDownApproximationRuns`, `FlopSolver.EstimateRejectsHugeTreesWithoutBuilding`, `Solver.DeterministicAcrossThreadCounts` and `WorkerPool.RunsEveryTaskOnceAndPropagatesExceptions`. Debug builds use smaller ranges and fewer iterations (`kOptimized`). `tests/player_boundary_test.cpp` also includes `solver/worker_pool.h`.
+
+- **Stage 8 batches B and C** (new `tests/solver_service_test.cpp`, `tests/game_controller_test.cpp`, `tests/trainer_ui_test.cpp`, `tests/player_boundary_test.cpp`, `tests/check_no_engine_access.cmake`): no existing assertion changed. Release / Debug times:
+  - `Hardware.TierThresholds` (0 / 0 ms): every tier boundary, unknown memory, budget, threads, `tree_for` for every tier and street, labels, targets, summaries.
+  - `Hardware.DetectReturnsSomethingSane` (0 / 0 ms): threads ≥ 1, RAM known on Linux and Windows, available ≤ total.
+  - `SolverService.ResultMatchesKeyAndStaleIsRejected` (0.12 / 1.2 s): another epoch or action count gets nothing; Done after exactly 60 iterations; the options equal a hand-built solve's root `freq` and `ev_best` for Hero's combo; best is the most frequent; a new submit or cancel hides the old result.
+  - `SolverService.FacingABetMapsEveryOptionToALegalAction` (9 / 87 ms): uneven stacks, facing 100 on the river: FOLD, "CALL 100", at least 2 raises up to 940 (the shorter stack), no AllIn, all legal.
+  - `SolverService.NotApplicableSpotsSayWhy` (12 / 20 ms): preflop, Turn on the river tier, Unavailable, too big, and the flop-full gating by budget and memory.
+  - `SolverService.NewDecisionCancelsQuickly` (0.19 / 0.83 s): a turn solve mid-iteration gives way in under 200 ms (6.3 / 12.9 ms).
+  - `SolverService.DestructorJoinsMidSolve` (0.12 / 0.73 s): under 500 ms mid-solve, under 2 s right after a submit.
+  - `SolverService.ExceptionsBecomeFailed` (10 / 71 ms): a broken view gives Failed, and the next job still runs.
+  - `SolverService.DISABLED_ReportEndToEndTimes`: the table above (about 3.5 minutes; full flop needs about 5.3 GB).
+  - `Controller.SolverModeHeadsUpRiverProducesAdvice` (40 / 312 ms): River override, fixed 200 iterations, Done within 10 s, legal options summing to 1, and the best action is accepted by `submit_hero_action`.
+  - `Controller.SolverModeMultiwayFallsBack` (11 / 27 ms): NotApplicable "(multiway)" with the heuristic hint present.
+  - `Controller.SolverDoesNotChangeMistakesOrLogs` (1.2 / 3.1 s): 25 seeded hands with the Turn tier, solves running when Hero acts. JSONL byte-identical without session ids, same mistakes, EV lost and hands.
+  - `Controller.SolverIsCancelledWhenHeroActs` (53 / 154 ms): turning the mode on mid-decision submits it, acting resets the panel to Off at once, and it stays Off over later ticks.
+  - `FakeController` implements the four new methods. `player_boundary_test.cpp` includes `controller/solver_service.h` and `solver/hardware.h`. The text scan covers `src/controller/solver_service.*`.

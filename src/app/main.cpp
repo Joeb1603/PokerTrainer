@@ -16,6 +16,9 @@
 //   --size WxH              Open the window at this size (unscaled), e.g. the 1180x760 minimum
 //   --screenshot PATH       Save the last frame as a PNG (with --exit-after-frames, or
 //                           when the window is closed)
+//   --solver                Start with solver mode on
+//   --solver-budget MS      Each solve's time budget (default 8000)
+//   --solver-tier TIER      Use off, river, turn or flop instead of the detected tier
 
 #include <algorithm>
 #include <cstdint>
@@ -113,7 +116,18 @@ struct Arguments {
     std::optional<std::filesystem::path> screenshot;
     int width = 1360;
     int height = 860;
+    bool solver = false;
+    std::optional<int> solver_budget_ms;
+    std::optional<poker::SolverTier> solver_tier;
 };
+
+std::optional<poker::SolverTier> parse_tier(std::string_view text) {
+    if (text == "off") return poker::SolverTier::Unavailable;
+    if (text == "river") return poker::SolverTier::River;
+    if (text == "turn") return poker::SolverTier::Turn;
+    if (text == "flop") return poker::SolverTier::Flop;
+    return std::nullopt;
+}
 
 std::optional<poker::Archetype> parse_archetype(std::string_view text) {
     for (int i = 0; i < poker::kArchetypeCount; ++i) {
@@ -214,6 +228,15 @@ std::optional<Arguments> parse_arguments(int argc, char** argv) {
             }
         } else if (arg == "--screenshot" && i + 1 < argc) {
             arguments.screenshot = argv[++i];
+        } else if (arg == "--solver") {
+            arguments.solver = true;
+        } else if (arg == "--solver-budget" && i + 1 < argc) {
+            const long budget = std::strtol(argv[++i], nullptr, 10);
+            if (budget < 1 || budget > 3'600'000) return std::nullopt;
+            arguments.solver_budget_ms = static_cast<int>(budget);
+        } else if (arg == "--solver-tier" && i + 1 < argc) {
+            arguments.solver_tier = parse_tier(argv[++i]);
+            if (!arguments.solver_tier) return std::nullopt;
         } else {
             return std::nullopt;
         }
@@ -265,6 +288,9 @@ int run(const Arguments& arguments) {
         options.log_dir = arguments.log_dir;
         options.instant_play = arguments.auto_shove;
         if (arguments.bot_delay_ms) options.bot_delay_ms = *arguments.bot_delay_ms;
+        options.solver_enabled = arguments.solver;
+        if (arguments.solver_budget_ms) options.solver_budget_ms = *arguments.solver_budget_ms;
+        options.solver_tier_override = arguments.solver_tier;
         poker::LocalGameController controller(options);
         poker::TrainerUi ui(controller, fonts, scale);
         ui.set_advice_focus(arguments.advice);
@@ -317,7 +343,7 @@ int run(const Arguments& arguments) {
 int main(int argc, char** argv) {
     const auto arguments = parse_arguments(argc, argv);
     if (!arguments) {
-        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT] [--reveal] [--bot-delay MS] [--advice TYPE] [--hover X,Y] [--size WxH] [--screenshot PATH]");
+        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT] [--reveal] [--bot-delay MS] [--advice TYPE] [--hover X,Y] [--size WxH] [--screenshot PATH] [--solver] [--solver-budget MS] [--solver-tier off|river|turn|flop]");
         return 2;
     }
     return run(*arguments);

@@ -42,7 +42,8 @@ endforeach()
 # A pattern for a missing folder (src/solver before it exists) matches nothing.
 file(GLOB_RECURSE sources
      ${ROOT}/src/bots/* ${ROOT}/src/advisor/* ${ROOT}/src/strategy/* ${ROOT}/src/equity/*
-     ${ROOT}/src/range/* ${ROOT}/src/solver/*)
+     ${ROOT}/src/range/* ${ROOT}/src/solver/*
+     ${ROOT}/src/controller/solver_service.*)
 if(NOT sources)
     message(FATAL_ERROR "No sources found under ${ROOT}: the check would pass vacuously")
 endif()

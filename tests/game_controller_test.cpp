@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -790,4 +792,197 @@ TEST_F(Controller, UnwritableLogDirectoryIsReportedButPlayContinues) {
     EXPECT_TRUE(c.snapshot().log_error.has_value());
     play_hand_out(c, [](const TableSnapshot& s) { return passive(s.legal); });
     EXPECT_NE(c.snapshot().phase, ControllerPhase::BotToAct);
+}
+
+// --- Solver mode -------------------------------------------------------------------
+
+namespace {
+
+bool contests(SeatStatus status) { return status == SeatStatus::Active || status == SeatStatus::AllIn; }
+
+int contesting(const TableSnapshot& s) {
+    int count = 0;
+    for (const SeatSnapshot& seat : s.seats) count += contests(seat.status) ? 1 : 0;
+    return count;
+}
+
+// Hero to act postflop heads-up against an opponent with chips behind: what the
+// solver handles.
+bool solvable(const TableSnapshot& s) {
+    if (s.phase != ControllerPhase::HeroToAct || s.street == Street::Preflop || contesting(s) != 2) return false;
+    for (int seat = 1; seat < kMaxSeats; ++seat) {
+        if (s.seats[static_cast<std::size_t>(seat)].status == SeatStatus::AllIn) return false;
+    }
+    return true;
+}
+
+// Ticks until the solve for the current decision leaves Running, or the time is up.
+const SolverProgress& wait_for_solver(IGameController& c, double timeout_ms) {
+    const auto start = std::chrono::steady_clock::now();
+    while (c.snapshot().solver.progress.state == SolverState::Running &&
+           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() < timeout_ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        c.tick(0.0);
+    }
+    return c.snapshot().solver.progress;
+}
+
+bool legal_for(const LegalActions& legal, const Action& action) {
+    if (!legal.allows(action.type)) return false;
+    if (action.type == ActionType::Bet || action.type == ActionType::Raise) {
+        return action.amount >= legal.min_raise_to && action.amount <= legal.max_raise_to;
+    }
+    return true;
+}
+
+// Plays hands with Hero passive until `stop` returns true at a Hero decision; then
+// returns with that decision pending. Fails after `hands` hands.
+template <typename Stop>
+bool play_until(LocalGameController& c, int hands, Stop stop) {
+    for (int hand = 0; hand < hands; ++hand) {
+        c.tick(0.0);
+        for (int guard = 0; guard < 500; ++guard) {
+            const TableSnapshot& s = c.snapshot();
+            if (s.phase == ControllerPhase::HandComplete || s.phase == ControllerPhase::SessionOver) break;
+            if (s.phase == ControllerPhase::HeroToAct) {
+                if (stop(s)) return true;
+                if (!c.submit_hero_action(passive(s.legal))) return false;
+            }
+            c.tick(1e9);
+        }
+        if (c.snapshot().phase == ControllerPhase::SessionOver) {
+            c.new_session();
+        } else if (!c.next_hand()) {
+            return false;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST_F(Controller, SolverModeHeadsUpRiverProducesAdvice) {
+    ControllerOptions o = options();
+    o.solver_enabled = true;
+    o.solver_tier_override = SolverTier::River;
+    o.solver_fixed_iterations = 200;
+    LocalGameController c(o);
+    EXPECT_TRUE(c.solver_enabled());
+    EXPECT_TRUE(c.snapshot().solver.available);
+    EXPECT_EQ(c.snapshot().solver.tier, SolverTier::River);
+    EXPECT_NE(c.snapshot().solver.hardware_summary.find("(tier set to River)"), std::string::npos);
+
+    ASSERT_TRUE(play_until(c, 200, [](const TableSnapshot& s) { return solvable(s) && s.street == Street::River; }));
+    const SolverProgress progress = wait_for_solver(c, 10'000);
+    ASSERT_EQ(progress.state, SolverState::Done) << progress.note;
+    EXPECT_EQ(progress.iterations, 200);
+    ASSERT_TRUE(progress.advice);
+    ASSERT_TRUE(progress.exploitability_pct);
+    EXPECT_EQ(progress.advice->street_label, "River");
+    const TableSnapshot& s = c.snapshot();
+    double total = 0.0;
+    for (const SolverOption& option : progress.advice->options) {
+        EXPECT_TRUE(legal_for(s.legal, option.action)) << option.label;
+        EXPECT_GE(option.freq, 0.0);
+        total += option.freq;
+    }
+    EXPECT_NEAR(total, 1.0, 1e-3);
+    EXPECT_TRUE(s.hint.has_value());  // The heuristic hint is still there
+    ASSERT_TRUE(c.submit_hero_action(progress.advice->best));
+    EXPECT_EQ(c.snapshot().solver.progress.state, SolverState::Off);
+}
+
+TEST_F(Controller, SolverModeMultiwayFallsBack) {
+    ControllerOptions o = options();
+    o.solver_enabled = true;
+    o.solver_tier_override = SolverTier::Turn;
+    LocalGameController c(o);
+    ASSERT_TRUE(play_until(c, 200, [](const TableSnapshot& s) {
+        return s.phase == ControllerPhase::HeroToAct && s.street != Street::Preflop && contesting(s) > 2;
+    }));
+    const SolverProgress progress = wait_for_solver(c, 10'000);
+    EXPECT_EQ(progress.state, SolverState::NotApplicable);
+    EXPECT_NE(progress.note.find("(multiway)"), std::string::npos) << progress.note;
+    EXPECT_FALSE(progress.advice);
+    EXPECT_TRUE(c.snapshot().hint.has_value());
+}
+
+// Solver mode only adds advice: the same seeded session logs the same hands and the
+// same mistakes with it on, while solves run (and are cancelled) beside the play.
+TEST_F(Controller, SolverDoesNotChangeMistakesOrLogs) {
+    const auto run = [&](const std::string& name, bool solver) {
+        ControllerOptions o = options(11);
+        o.log_dir = dir_ / name;
+        o.solver_enabled = solver;
+        o.solver_tier_override = SolverTier::Turn;
+        o.solver_budget_ms = 2000;
+        o.solver_threads = 2;
+        LocalGameController c(o);
+        int solved = 0;
+        for (int hand = 0; hand < 25; ++hand) {
+            play_hand_out(c, [&](const TableSnapshot& s) {
+                if (solver && solvable(s)) {
+                    // Let the solve start, so it is running when Hero acts.
+                    for (int i = 0; i < 5; ++i) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        c.tick(0.0);
+                    }
+                    ++solved;
+                }
+                return passive(s.legal);
+            });
+            if (c.snapshot().phase == ControllerPhase::SessionOver) c.new_session();
+            else EXPECT_TRUE(c.next_hand());
+        }
+        return std::pair{c.snapshot().session, solved};
+    };
+    const auto [off, unused] = run("off", false);
+    const auto [on, solved] = run("on", true);
+    EXPECT_GT(solved, 0);
+    EXPECT_EQ(off.mistakes, on.mistakes);
+    EXPECT_EQ(off.ev_lost, on.ev_lost);
+    EXPECT_EQ(off.hands_played, on.hands_played);
+    const auto plain = log_without_session_ids(dir_ / "off" / "hand_history.jsonl");
+    EXPECT_FALSE(plain.empty());
+    EXPECT_EQ(plain, log_without_session_ids(dir_ / "on" / "hand_history.jsonl"));
+}
+
+TEST_F(Controller, SolverIsCancelledWhenHeroActs) {
+    ControllerOptions o = options();
+    o.instant_play = false;
+    o.bot_delay_ms = 1e6;  // Bots act only when the test says so
+    o.solver_tier_override = SolverTier::Turn;
+    o.solver_budget_ms = 60'000;
+    o.solver_threads = 2;
+    LocalGameController c(o);
+    EXPECT_FALSE(c.solver_enabled());
+    EXPECT_EQ(c.solver_budget_ms(), 60'000);
+    ASSERT_TRUE(play_until(c, 200, [](const TableSnapshot& s) { return solvable(s) && s.street != Street::River; }));
+    EXPECT_EQ(c.snapshot().solver.progress.state, SolverState::Off);  // The mode is off
+
+    // Turning it on solves the decision already pending.
+    c.set_solver_enabled(true);
+    EXPECT_EQ(c.snapshot().solver.progress.state, SolverState::Running);
+    const auto start = std::chrono::steady_clock::now();
+    while (c.snapshot().solver.progress.iterations == 0 && c.snapshot().solver.progress.state == SolverState::Running &&
+           std::chrono::steady_clock::now() - start < std::chrono::seconds(30)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        c.tick(0.0);
+    }
+    ASSERT_EQ(c.snapshot().solver.progress.state, SolverState::Running) << c.snapshot().solver.progress.note;
+    const std::string street_label = c.snapshot().solver.progress.note;
+    EXPECT_TRUE(street_label == "Turn" || street_label == "Flop (approximate: no river betting)") << street_label;
+
+    // Acting clears the panel at once, and nothing from the old solve comes back.
+    ASSERT_TRUE(c.submit_hero_action(passive(c.snapshot().legal)));
+    EXPECT_EQ(c.snapshot().solver.progress.state, SolverState::Off);
+    for (int i = 0; i < 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        c.tick(0.0);
+        EXPECT_EQ(c.snapshot().solver.progress.state, SolverState::Off);
+    }
+    c.set_solver_budget_ms(3000);
+    EXPECT_EQ(c.solver_budget_ms(), 3000);
+    c.set_solver_enabled(false);
+    EXPECT_FALSE(c.solver_enabled());
 }

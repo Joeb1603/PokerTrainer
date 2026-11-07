@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "advisor/training_advisor.h"
+#include "controller/solver_service.h"
 #include "core/card.h"
 #include "engine/pots.h"
 #include "engine/table_types.h"
@@ -50,6 +51,15 @@ struct SessionStats {
     double ev_lost = 0.0;
 };
 
+// Solver mode, as the front end shows it. The advice is for Hero's own cards only,
+// from the public table and the range model, so it holds no hidden information.
+struct SolverPanel {
+    bool available = false;        // The machine (or the tier override) supports some solving
+    std::string hardware_summary;  // e.g. "4 threads, 15.6 GB free: solves river and turn, flop approximate"
+    SolverTier tier = SolverTier::Unavailable;
+    SolverProgress progress;       // For Hero's current decision; Off when there is none or the mode is off
+};
+
 // Everything a front end needs for one frame, with hidden information already removed.
 // A REST or WebSocket server could serialize this as is.
 struct TableSnapshot {
@@ -82,6 +92,7 @@ struct TableSnapshot {
     std::vector<HeroMistake> hand_mistakes;    // Noted so far in this hand
     SessionStats session;
     std::optional<std::string> log_error;      // Logging failed; play can continue
+    SolverPanel solver;
 };
 
 // The chips a raise reaches for a share of the pot, clamped to what is legal. It sizes
@@ -128,6 +139,15 @@ public:
     virtual double bot_delay_ms() const = 0;
     virtual void set_instant_play(bool instant) = 0;
     virtual bool instant_play() const = 0;
+
+    // Solver mode: a background solve of Hero's heads-up postflop decisions, shown
+    // beside the heuristic hint (which stays the advice that mistakes are judged on).
+    // Turning it on solves the current decision; turning it off cancels.
+    virtual void set_solver_enabled(bool enabled) = 0;
+    virtual bool solver_enabled() const = 0;
+    // The time budget of each solve, from the next decision on.
+    virtual void set_solver_budget_ms(int budget_ms) = 0;
+    virtual int solver_budget_ms() const = 0;
 };
 
 }  // namespace poker

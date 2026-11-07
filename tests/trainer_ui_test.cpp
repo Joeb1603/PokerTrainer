@@ -82,6 +82,13 @@ public:
     double bot_delay_ms() const override { return 400.0; }
     void set_instant_play(bool) override {}
     bool instant_play() const override { return false; }
+    void set_solver_enabled(bool enabled) override { solver_on = enabled; }
+    bool solver_enabled() const override { return solver_on; }
+    void set_solver_budget_ms(int budget_ms) override { solver_budget = budget_ms; }
+    int solver_budget_ms() const override { return solver_budget; }
+
+    bool solver_on = false;
+    int solver_budget = 8000;
 };
 
 class UiTest : public ::testing::Test {

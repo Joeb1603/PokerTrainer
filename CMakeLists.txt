@@ -67,6 +67,7 @@ add_library(poker_core STATIC
     src/core/card.cpp
     src/core/deck.cpp
     src/controller/local_game_controller.cpp
+    src/controller/solver_service.cpp
     src/core/hand_evaluator.cpp
     src/engine/game_engine.cpp
     src/engine/player_view.cpp
@@ -80,6 +81,7 @@ add_library(poker_core STATIC
     src/range/range_model.cpp
     src/range/weighted_range.cpp
     src/solver/betting_tree.cpp
+    src/solver/hardware.cpp
     src/solver/postflop_solver.cpp
     src/solver/showdown.cpp
     src/solver/spot_from_view.cpp
@@ -202,6 +204,7 @@ if(POKER_BUILD_TESTS)
         tests/training_advisor_test.cpp
         tests/hand_logger_test.cpp
         tests/game_controller_test.cpp
+        tests/solver_service_test.cpp
     )
     target_link_libraries(core_tests PRIVATE poker_core GTest::gtest_main nlohmann_json::nlohmann_json)
     target_compile_options(core_tests PRIVATE ${POKER_WARNINGS})

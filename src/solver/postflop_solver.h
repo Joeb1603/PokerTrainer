@@ -28,6 +28,14 @@ struct SolverLimits {
     // capped at the cards of the first chance layer. A river tree has no chance node
     // and always runs on the calling thread. Results are bit-identical for any value.
     int threads = 1;
+    // A cancel that abandons work mid-pass, for a solve that will be thrown away:
+    // once it is stopped, the table setup in the constructor and every pass (run(),
+    // best_response_values(), exploitability_pct_pot(), root()) skip the first
+    // chance layer's remaining cards and return early, so latency is about one
+    // card's subtree. Everything the solver reports after that is unspecified;
+    // only destroying it is meaningful. run()'s own stop_token is the clean way to
+    // pause between iterations.
+    std::stop_token interrupt;
 };
 
 class WorkerPool;
@@ -118,7 +126,8 @@ public:
     // allocated_bytes() on GCC. Throws std::invalid_argument for an invalid spot.
     static std::size_t estimate_bytes(const SolveSpot& spot, const BetAbstraction& abstraction, int threads = 1);
 
-    // Runs up to `iterations` more iterations, checking `stop` before each one.
+    // Runs up to `iterations` more iterations, checking `stop` (and SolverLimits::interrupt)
+    // before each one.
     void run(int iterations, std::stop_token stop = {});
     int iterations() const { return iterations_; }
 
