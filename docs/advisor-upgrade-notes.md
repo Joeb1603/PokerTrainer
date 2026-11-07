@@ -1,5 +1,29 @@
 # Advisor upgrade notes
 
+## Summary
+
+**What was built** (commits `7ffabb5` to `bbfe240` on top of `e531106`; the stage-by-commit map is in "Measured results"):
+- **Range model** (`src/range`): combos, weighted ranges, exact per-combo equity on every postflop street, a 169 × 169 preflop class matrix, and range inference from the public actions for four generic player types (Baseline, Nit, Station, Maniac).
+- **Range-based advice** (`src/advisor`): check, call and bet/raise EVs against the inferred ranges and each villain's predicted fold, call or raise; players still to act weighted by their predicted answer; one advice line per type in `hint.versus`, each with a `why`. Mistakes and the JSONL are still judged on Baseline `base_ev`, and the log's key set is unchanged.
+- **Preflop:** positional answers to 3-bets and 4-bets, advisor-only defence charts and 3-15 BB push/fold tables. The bots' charts and behaviour are unchanged.
+- **Solver mode:** our own Discounted CFR (`src/solver`), heads-up postflop, with river, turn and flop (full or approximate) trees, memory estimates before allocation, a thread pool and a background service (`src/controller/solver_service`) on a tier chosen from the machine.
+- **UI:** the "Advice:" selector, tooltips, the "Versus types" table and the solver panel; Play GTO follows the selected line, or a converged solve.
+- **Tools:** `advisor_bench` (36 river and 12 turn spots scored against the solver), `advisor_matchup`, `solver_cli` and the table generators.
+
+**Headline numbers**
+- **River bench** (36 spots, regret per decision against the solver): 1.946 BB before the upgrade, 0.694 BB at the end; agreement with the solver's top action 28% → 57%.
+- **Turn holdout** (12 spots, never tuned on): the tuned Baseline gives 0.543 BB and 33% agreement, against 0.614 BB and 39% with the pre-tuning parameters. Regret improved but agreement fell, so the holdout verdict is mixed (Stage 8 batch E).
+- **Matchups** (40,000 paired hands each, line minus Baseline): Nit line vs NitBots +19.8 ± 3.8 bb/100, Station line vs LooseBots +35.0 ± 16.9, Maniac line vs a maniac profile +187.2 ± 19.5 (Stage 9 matchups). Against GtoBots the Nit line loses 86.6 bb/100: a misapplied type is expensive.
+- **Hint latency** (Release, 4 threads, lines on): heads-up turn and river p95 under 3 ms; multiway turn and river p95 about 10.5-11 ms (the plan asked for ≤ 10 ms, see Deviations); multiway flop worst case 24 ms (≤ 50).
+- **Tests:** 355 at `e531106`, 495 at the end, passing in Release and Debug with zero GCC and clang warnings. ThreadSanitizer and AddressSanitizer + UBSan (GCC) reported nothing over the whole suite (Stage 8 batch E).
+
+**Where the caveats are**
+- "Unverified" below, per stage: chiefly MSVC `/W4` and the Windows build (never compiled here), Windows memory detection, hand-written bench ranges, type lines checked only against the bots, and judgment constants in the range model.
+- "Stage 5 tuning" (overfitting caveat), "Stage 8 batch E" (the mixed holdout), "Stage 9 matchups" (what the matchups do not show) and the "Found, not fixed" lists in the stage reviews.
+- CLAUDE.md section 12 keeps the user-facing list of known limits.
+
+---
+
 This file records the decisions, deviations, measurements, unverified items and test changes from the advisor upgrade. The upgrade covers range-based advice, player-type advice and an optional solver mode. It is meant for review later.
 
 Plan summary:
@@ -33,7 +57,7 @@ Each stage is committed to `main` when its tests pass.
 3. **`preferred_size` still uses random-hand equity,** because its strength bars were calibrated on it. Range EV decides whether to bet, and the size rule decides which size.
 4. **Player types are generic archetypes** (Baseline, Nit, Station, Maniac) applied to all opponents. No identity for individual seats reaches the advisor, so `PlayerView` is unchanged and the Shifter stays hidden. Reading each seat's type from its stats is future work.
 5. **The snapshot's `hint` is still the Baseline advice,** and the archetype lines live in `hint.versus`. Mistakes and the JSONL logs are judged only on Baseline `base_ev`. The schema is unchanged, but the rationale text changes.
-6. **Play GTO follows the "Advice:" selector** (default Baseline). In solver mode, once a solve is done, it plays the most frequent solver action, with ties going to the cheaper action.
+6. **Play GTO follows the "Advice:" selector** (default Baseline). It plays the solver's most frequent action (ties going to the cheaper action) only when solver mode is on, the advisor is shown, "Advice:" is Baseline, and the solve for this decision is Done with an exploitability within 3× its tree's target (`solve_is_usable`: 0.9% of the pot on the river, 2.4% on the turn, 6% on the flop). Otherwise it plays the selected heuristic line. The convergence gate was added after the Stage 8 review; before it, any Done result was followed.
 7. **The solver is our own Discounted CFR,** heads-up and postflop only. The repo has no LICENSE file, so AGPL solvers such as TexasSolver and postflop-solver are not linked. Multiway pots and preflop fall back to the heuristic.
 8. **Determinism rules for new code:**
    - No `std::uniform_real_distribution` or `std::shuffle`, because their output differs between standard libraries.
@@ -46,7 +70,7 @@ Each stage is committed to `main` when its tests pass.
 11. **The flop sampler is "balanced":** one seeded shuffle of the 47 unseen cards, with turn i taking the next K river cards. Each card is a turn once and a river K times. Measured against independent per-turn shuffles, this halves the error (K=8: 0.39 pp rms vs 0.77 pp).
 12. **Multiway sampling redraws the whole deal** when two villains' sampled combos collide. Redrawing one villain at a time would bias the joint distribution. For example, villain 1 holding {AA, 72o} and villain 2 holding {AK} should give AA 20% of villain 1's hands; redrawing one villain at a time gives 33%. After 16,384 failed redraws it throws.
 13. **Preflop range equity reads the 169 × 169 class matrix,** so it ignores which suits hero's own cards block. The measured bias is about 0.02 pp.
-14. **Stage 5: the villains judge Hero's bets against Hero's range as it stands before the bet.** `predict_postflop_response` gets `infer_range_for(view, hero, Baseline, false)` as `bettor_range`, as the plan's batch instructions say. Narrowing it first by Hero's own bet (`bet_likelihood` against each villain, or `raise_likelihood` against the last aggressor when raising) was implemented and measured: 0.886 bb regret and 52% agreement, against 0.867 bb and 54% without it. It was dropped as slightly worse and more expensive; batch D may revisit it.
+14. **Stage 5: the villains judge Hero's bets against Hero's range as it stands before the bet.** `predict_postflop_response` gets `infer_range_for(view, hero, Baseline, false)` as `bettor_range`, as the plan's batch instructions say. Narrowing it first by Hero's own bet (`bet_likelihood` against each villain, or `raise_likelihood` against the last aggressor when raising) was implemented and measured: 0.886 bb regret and 52% agreement, against 0.867 bb and 54% without it. It was dropped as slightly worse and more expensive; batch D re-measured it for raises alone and kept it dropped (decision 20).
 15. **Stage 5: a called bet or raise assumes one caller and a pot-sized re-raise.** e_call, e_raise and the matched chips are weighted over the villains by their call or raise shares. The re-raise goes to to + (P + a + m_i), capped by both stacks, and Hero calls it or folds, whichever is better. When Hero is all in, the "raise" branch is a call.
 16. **Stage 5: preflop all-in only short, cheap, or as the only raise.** With ranges, the single-street model valued a 100 BB UTG open-shove with AA at 258 chips against 93 for a 3.5 BB open, because only the strong part of each range calls a shove and `implied` is capped at half a tiny preflop pot. Preflop, all-in is now advised only with an effective stack of at most 15 BB, within 1.5 pots, or as the only raise left; its `ev` is capped at the advice and `base_ev` keeps the model number. This matches CLAUDE.md section 11's size-rule limit, which had been applied only postflop.
 17. **Stage 5: impossible multiway deals fall back to independent villains.** When narrowed ranges can almost never be dealt together (seen in random play: two villains' ranges reduced to the same three JJ combos), `equity_vs_ranges` throws. The advisor then multiplies the heads-up equities instead of failing.
@@ -70,6 +94,8 @@ Each stage is committed to `main` when its tests pass.
 - **What changed:** that was reversed (decision 1). Section 4 of the spec fixes the GTO bot's method, and the bots also serve as fixed opponents for measuring the exploit advice.
 - **A correction to numbers given earlier:** during planning I quoted 8c8d on Ah9s4c as 65.6% against a random hand, and QhJh on Qd9s8h as 82.3%. Those came from only 4,000 Monte Carlo rollouts, about ±0.75 pp. Exact enumeration gives 63.95% and 82.80%, and 2 million rollouts agree. The comparison still holds: the underpair is about 47% against the BB's defend range and about 23% against the part of it that continues.
 
+- **Bluff share formula (Stage 4):** the plan's table writes Baseline's bluffing as "bluff_mult (×s/(1+2s))" and expects an air share of about bluff_mult × s/(1+2s). The final model (`range_model.h`) sets the air mass to M_a = g · bluff_mult · s/(1+s) · M_v, where M_v is the value mass and g = 4 for the previous street's aggressor on the flop and turn (else 1). The air share of the polarised part is then m·r/(1+m·r), with r = s/(1+s) and m = g · bluff_mult. At m = 1 that is exactly s/(1+2s), the toy game's answer, which `BluffShareTracksSize` checks; for other m it is not m × s/(1+2s).
+- **Hint latency target (Stage 5):** the plan asked for ≤ 10 ms on the turn and river and ≤ 50 ms on a multiway flop (Release, 4 threads). Met: the multiway flop (worst case 24-27 ms) and heads-up turn and river (p95 under 3 ms). Missed: multiway turn and river with the type lines on, whose final p95 is 10.5 and 11.1 ms (Stage 6 follow-ups; 9.0-14.9 ms in earlier stages, 15.1 ms at the Stage 5 review). The "≤ 15 ms" in later entries is a working target adopted at Stage 5 batch B, not the plan's.
 - **Stage 5, `BetOutcome`:** its fields are percentages (0-100), like the other `_pct` fields of `HintRecommendation`, not the 0-1 shares the batch instructions described. It also has a fourth field, `equity_raised_pct`, because the raise branch of the EV can't be rebuilt or shown without it.
 - **Stage 5, preflop all-in rule:** decision 16 is new, a fix to a clear model bug rather than tuning.
 
@@ -325,14 +351,12 @@ The Stage 4 review found that value was judged only within the actor's own range
 | Baseline UTG limp-call of an iso | 4 combos | 14.3 | |
 | HU BTN open, Nit/Base/Station/Maniac | 14.2/75/69.8/75% | 45.1/75/79.8/89.1% | |
 
-**The river lead stays at 72.8%, and that was accepted.** The 55–65% band was the reviewer's estimate, not a solver result. In this model the BB 3-bets AQ and KQ preflop, so every one-pair hand it leads for value is worse than AQ. Its value range is sets, two pair and straights, plus thin queens, with about 30% bluffs. Tightening river value further only got to about 70%. Stage 5's bench measures whether this hurts the advice.
-
-- **The river lead is still high:** the BB 3-bets AQ and KQ, so every one-pair hand it leads for value is worse than AQ, and balanced bluffing (30% at 75% pot) sets a floor. Tightening river value further only reached about 70%.
+- **The river lead stays at 72.8%, and that was accepted.** The 55–65% band was the reviewer's estimate, not a solver result. In this model the BB 3-bets AQ and KQ preflop, so every one-pair hand it leads for value is worse than AQ. Its value range is sets, two pair and straights, plus thin queens, and balanced bluffing (about 30% at 75% pot) sets a floor. Tightening river value further only got to about 70%. Stage 5's bench was to measure whether this hurts the advice; after the Stage 5 tuning it is 67.5%.
 - **Check ranges:** a BB that checks the flop, turn and river keeps 156 of 453 combos (141 before). A BTN that checks back all three streets keeps 29 of 610 combos, mostly ace-high showdown value (107 before), because its c-bets and barrels now take most of its air.
 - **Viewer card removal** moves equity by at most 1.5 pp in the reviewer's three spots (≤ 0.8 pp before).
 - **Speed:** `infer_ranges` on a river view, over two runs: p50 0.74–0.79 ms and p95 0.88–1.37 ms with 2 opponents; p50 1.11–1.18 ms and p95 1.28–1.82 ms with 5 (was p95 1.29). Every dealt player is now tracked and judged against the others.
 
-### Stage 5 batch A (Baseline advisor on ranges), uncommitted, on top of `f9d64e5`
+### Stage 5 batch A (Baseline advisor on ranges), commit `4b7b985`
 
 **The model** is documented in full in `training_advisor.h`. In short:
 - Fold is 0. Check is e_L × contestable. Call is e_L × (contestable + to_call) − to_call, where e_L is the layered range equity, each pot layer against its own villains' ranges.
@@ -406,7 +430,7 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 - **The same bet with 88 on Kd8s3c (a set):** 97.2% against the calls and 94.9% against the raises; EV 446.4 against 194.2 for checking.
 - **K9o facing 150 into 200 on the flop:** 74.4% against the estimated range and 85.9% against a random hand. The advice is to raise to 400.
 
-### Stage 5 batch B (archetype lines), uncommitted, on top of `4b7b985`
+### Stage 5 batch B (archetype lines), commit `a052525`
 
 **What it adds:** `hint.versus[0..2]` for Nit, Station and Maniac when `AdvisorOptions::archetype_lines` is on (the default). The model is documented in `training_advisor.h` under "Archetype lines". No change in `src/range`, the bots or the JSONL schema; mistakes stay on Baseline `base_ev`.
 
@@ -449,7 +473,7 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 | River 3+ way (1434) | 3.9 / 7.7 / 254 | 5.3 / 14.7 / 258 | 4.5 / 13.6 / 624 | 10.2 / 27.6 / 633 |
 | River heads-up | 1.3 / 1.4 / 1.7 | 1.7 / 2.0 / 3.0 | 1.3 / 1.5 / 2.2 | 2.9 / 3.3 / 4.9 |
 
-- Targets with automatic threads: multiway flop worst case 27 ms (≤ 50), turn p95 11.3 ms and river p95 14.7 ms (≤ 15). The river maxima (about 250 ms) are Baseline's own redraw spikes (decision 17), present with lines off too. On one thread the targets are missed (river 3+ way p95 27.6 ms).
+- Targets with automatic threads: multiway flop worst case 27 ms (≤ 50), turn p95 11.3 ms and river p95 14.7 ms (≤ 15, the working target; the plan's is ≤ 10, see Deviations). The river maxima (about 250 ms) are Baseline's own redraw spikes (decision 17), present with lines off too. On one thread the targets are missed (river 3+ way p95 27.6 ms).
 
 **Three example spots** (heads-up, Kd8s3c2hJd, pot 200, 1900 behind; Hero is the BB; default options, seed 60)
 
@@ -466,7 +490,7 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 
 **Tests:** 428 pass in Release (424 + 4 new) and Debug. Release suite about 6 s, Debug 23.7 s. `ArchetypeLinesAreLegalAndDeterministic` takes 1.6 s in Release and about 10 s in Debug (3 random games, fast options with lines on). GCC Release/Debug and clang build with zero warnings; `strict.sh` clean on `training_advisor.cpp`. River bench unchanged: overall 0.867 BB, 54% agree.
 
-### Stage 5 tuning (batch D), uncommitted, on top of `a052525`
+### Stage 5 tuning (batch D), commit `0e388be`
 
 **The hook.** `TrainingAdvisor(seed, options, baseline_params)` runs the Baseline line (the hint's own fields: the opponents' ranges, their answers, and Hero's range as they read it) with the given `ArchetypeParams` instead of `archetype_params(Baseline)`; the Nit, Station and Maniac lines keep their rows. It is a constructor rather than an `AdvisorOptions` field because a new trailing field makes every brace-initialised `AdvisorOptions{...}` warn under `-Wmissing-field-initializers`. `advisor_bench --baseline-params C,V,B` uses it (C = `continue_mult`, V = `value_bet_top`, B = `bluff_mult`, the other Baseline fields unchanged). The trainer never calls it. `--baseline-params 0.95,0.33,1.0` reproduced the old defaults exactly (the same tables; the CSVs differed only in the timing column).
 
@@ -504,7 +528,7 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 
 **Rule and decision.** Adopt the lowest-regret config only if it beats the old defaults by at least 0.03 BB overall and no pot-type or hero-role group gets worse by more than 0.1 BB. {0.85, 0.28, 1.2} is 0.124 BB better overall (0.867 → 0.743) and better in all six of those groups, so it is now Baseline's default (`ArchetypeParams` defaults in `range_model.h`). The Nit, Station and Maniac rows set all three fields explicitly and are unchanged. `kReferenceValueTop` (0.33) and the standard continue share `Cref` (0.95 × MDF), which the value thresholds use, are unchanged too, so Baseline's value threshold now shifts by a = −0.05.
 - **Outside the rule:** wet boards get 0.111 BB worse (0.271 → 0.382), and the worst single spot, sb_btn_3bet-monotone-xx, goes from 5.9 to 6.8 BB (all-in 37% where the solver calls 92%).
-- **Overfitting caveat:** the bench ranges are hand-written assumptions, and the winner sits at a corner of the grid on all three axes (lowest continue, lowest value_bet_top, highest bluff_mult), so the bench would probably prefer going further. It was not extended (one round only). Stage 8's turn spots are the planned holdout.
+- **Overfitting caveat:** the bench ranges are hand-written assumptions, and the winner sits at a corner of the grid on all three axes (lowest continue, lowest value_bet_top, highest bluff_mult), so the bench would probably prefer going further. It was not extended (one round only). Stage 8's turn spots were the holdout: tuned 0.543 BB and 33% agreement against 0.614 BB and 39% pre-tuning, a mixed verdict (Stage 8 batch E).
 - **Direction:** the bench rewards a Baseline that folds more to bets (0.85 × MDF), value-bets a little tighter and bluffs more (a more polarised bettor). bluff_mult 1.2 beats 1.0 in 8 of the 9 (continue_mult, value_bet_top) pairs, all but (0.85, 0.40).
 
 **Hold-out checks** (Stage 4 range-plausibility tests, not part of the bench; old defaults → new):
@@ -580,14 +604,14 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 | River 3+ way (1434) | 3.9 / 8.4 / 161 | 5.1 / 14.9 / 158 | 4.6 / 14.6 / 447 | 10.4 / 29.2 / 489 |
 | River heads-up (300) | 1.3 / 1.4 / 1.8 | 1.8 / 2.2 / 7.3 | 1.3 / 1.6 / 2.1 | 2.8 / 3.0 / 8.6 |
 
-- With automatic threads the targets hold: multiway flop worst case 24 ms (≤ 50), turn p95 10.5 ms and river p95 14.9 ms (≤ 15), heads-up turn and river p95 under 3 ms. On one thread river 3+ way p95 is 29.2 ms, as in batch B.
+- With automatic threads the targets hold: multiway flop worst case 24 ms (≤ 50), turn p95 10.5 ms and river p95 14.9 ms (≤ 15, the working target), heads-up turn and river p95 under 3 ms. The plan's ≤ 10 ms holds heads-up only. On one thread river 3+ way p95 is 29.2 ms, as in batch B.
 - The 3+ way maxima moved (turn about 100 ms, up from 33-42; river about 160 ms, down from about 255). The new parameters change which random-play ranges become nearly impossible to deal together, where the multiway redraw spikes come from (decision 17). The p95 values barely moved.
 
 **Earlier numbers:** the batch A and B examples and tables above were measured with the old defaults; Baseline's shares in them (for example "Baseline 24%" folds in the 5c4d `why`) are now different. The archetype-line tests still pass.
 
 **Tests:** all 428 pass in Release (5.7 s) and Debug (23.3 s), with no assertion changed. GCC Release/Debug and clang build with zero warnings, and `strict.sh` is clean on `training_advisor.cpp`, `range_model.cpp` and `advisor_bench.cpp`.
 
-### Stage 5 review, uncommitted, on top of `0e388be`
+### Stage 5 review, commit `cf3b6c3`
 
 **Fixed** (`training_advisor.cpp` `raise_value` and `evaluate_line`; formulas updated in `training_advisor.h`). All three were in multiway pots with unequal stacks only, so heads-up advice, the river bench (still 0.743 BB, 56%) and every existing test are unchanged.
 - **The "everybody folds" term beside an all-in player.** It was F × P × k with k = Σ layer × e(all-in players) / Σ layer. The layers are the pot after Hero's call, so that left out the call Hero pays to play the main pot. It is now F × (Σ layer × e(all-in players) − to_call), which is F × P when nobody is all in (k = 1, bit-identical). Real numbers, BTN JhTh on 9h8c2h Kd, BB all in for 300, SB bets 500 into 900: the main layer is 900 (Hero has 36.8% against the BB's range) and the side layer 1000, so folds win 900 × 0.368 + 1000 − 500 = 831, not 1400 × 1331 / 1900 = 981. The all-in EV fell from 265.3 to 197.7, and the 25% and 50% raises from 207.1 / 256.1 to 166.7 / 194.5 (all-in is still the advice; the Maniac line flips from all-in to call). The bug predates Stage 5 (the old `raise_ev` had the same k).
@@ -602,10 +626,10 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 3. *Preflop 3-bet:* BTN vs a CO open to 50, blinds behind. AJs: model raise 45.5 − prior 40.75 = 4.7, call −5.2 + 32.5 = 27.0, so CALL (chart call). KTo FOLD (raise −1.5). 72o FOLD (raise model +26.6 before the −40.75 prior). QQ RAISE to 180 (model 118.5 + 20). Each villain's answer recomputed from `predict_preflop_response` (levels 2, size ratio to / 150).
 
 **Found, not fixed (larger or by design):**
-- *Players yet to act count as certain callers with their full ranges.* Call and check EVs use equity against every Active player, including those who have not acted this street; preflop that means untouched blind ranges. BTN AJs facing a CO open is 34.3% "against the range" (three-way) instead of about 45% heads-up, and CO AQo facing a 10 BB UTG shove with three players behind is 27.8% and FOLD (call −10.3 after a +70 chart prior), though calling is clearly profitable heads-up. The pre-Stage-5 advisor folded there too (random-hand equity against 4). Suggest weighting players behind by their continue share (Stage 6).
-- *Preflop raises below the standard size gain no calls.* `predict_preflop_response` widens the call chart for size_ratio < 1, but `resize_range` grows it in strength order through classes already in the raise chart, so call shares are flat from ratio 0.4 to 1.0 (CO vs a 3-bet: 5.70% call at every ratio from 0.55 to 1.01). A min-3-bet then folds out as much as a standard one, which flatters small raises with weak hands (AJs: model 45.5 at 83 vs 33.7 at 180). Range model (Stage 4) issue, for the Stage 6 sizing review.
+- *Players yet to act count as certain callers with their full ranges.* Call and check EVs use equity against every Active player, including those who have not acted this street; preflop that means untouched blind ranges. BTN AJs facing a CO open is 34.3% "against the range" (three-way) instead of about 45% heads-up, and CO AQo facing a 10 BB UTG shove with three players behind is 27.8% and FOLD (call −10.3 after a +70 chart prior), though calling is clearly profitable heads-up. The pre-Stage-5 advisor folded there too (random-hand equity against 4). Suggest weighting players behind by their continue share (Stage 6). **Fixed in Stage 6 batch C** (must-fix B: players still to act are weighted by their predicted answer).
+- *Preflop raises below the standard size gain no calls.* `predict_preflop_response` widens the call chart for size_ratio < 1, but `resize_range` grows it in strength order through classes already in the raise chart, so call shares are flat from ratio 0.4 to 1.0 (CO vs a 3-bet: 5.70% call at every ratio from 0.55 to 1.01). A min-3-bet then folds out as much as a standard one, which flatters small raises with weak hands (AJs: model 45.5 at 83 vs 33.7 at 180). Range model (Stage 4) issue, for the Stage 6 sizing review. **Fixed in Stage 6 batch C** (must-fix D).
 - *A size-rule bet that takes the stack becomes all-in even beyond 1.5 pots* (pre-existing). Facing a bet, a 75% or 100% raise that does not fit the stack is listed only as all-in, and the fit chooses it without the 1.5-pot test. The all-in is then smaller than the raise the rule chose, so it is arguably not an over-shove; left as is.
-- *Latency target:* the plan's ≤ 10 ms on the turn and river holds heads-up (p95 under 3 ms) but not multiway (re-measured: turn p95 11.1, river p95 15.1 ms, automatic threads). The ≤ 15 ms figure in batch B is not the plan's.
+- *Latency target:* the plan's ≤ 10 ms on the turn and river holds heads-up (p95 under 3 ms) but not multiway (re-measured: turn p95 11.1, river p95 15.1 ms, automatic threads). The ≤ 15 ms figure in batch B is not the plan's (see Deviations, "Hint latency target").
 
 **ThreadSanitizer:** clang's TSan runtime is not installed here, so GCC 13 `-fsanitize=thread` (RelWithDebInfo, `/tmp/claude-0/b/tsan`) ran `Advisor*:HandVsRange*:MultiwayRangeEquity*` (51 tests) before the fixes, and the same plus `Controller*` (78 tests) after them: all passed, with no ThreadSanitizer reports. Default options use automatic threads, so the parallel lines and the parallel equity code both ran.
 
@@ -613,7 +637,7 @@ The model alone now spreads over sizes rather than piling on pot-sized bets. No 
 
 **Tests:** 429 pass in Release (5.8 s), Debug (23.2 s) and clang, with zero warnings; `strict.sh` clean on `training_advisor.cpp`, `range_model.cpp` and `advisor_bench.cpp`.
 
-### Stage 6 batches A and B (positional 3-bet/4-bet charts, push/fold tables), uncommitted, on top of `cf3b6c3`
+### Stage 6 batches A and B (positional 3-bet/4-bet charts, push/fold tables), commit `d623daf`
 
 **Batch A: positional answers to 3-bets and 4-bets** (`preflop_charts.{h,cpp}`)
 - New: `vs_three_bet_ranges(opener, three_bettor, players)` and `vs_four_bet_ranges(three_bettor, four_bettor, players)`. The bots' `vs_three_bet_response` and `vs_four_bet_response` are untouched, and `VsReraises.BotsChartsUnchanged` pins their answers for all 169 classes.
@@ -686,7 +710,7 @@ Jam share, as a percent of all combos:
 
 **Tests:** 440 pass in Release (5.8 s) and Debug (24.0 s), with zero warnings in Release, Debug and clang. `strict.sh` is clean on `preflop_charts.cpp`, `push_fold.cpp`, `gen_push_fold.cpp`, the generated data and both test files. Every new test takes at most 0.02 s in Release.
 
-### Stage 6 batch C (advisor and range model on the new tables), uncommitted, on top of `d623daf`
+### Stage 6 batch C (advisor and range model on the new tables), commit `becbe81`
 
 **What it adds:** `src/advisor/advisor_charts.{h,cpp}` (`advisor_chart`, `advisor_chart_response`), `PreflopSpot` and its `predict_preflop_response` overload in `range_model.h`, and the players-still-to-act call model in `training_advisor.cpp`. The bots, the JSONL schema, mistakes on `base_ev` and the snapshot are unchanged.
 
@@ -757,12 +781,12 @@ Jam share, as a percent of all combos:
 | River 3+ way (1434) | 3.9 / 6.9 / 79 | 5.3 / 9.7 / 92 | 4.3 / 8.5 / 211 | 10.6 / 20.0 / 214 |
 | River heads-up (300) | 1.3 / 1.9 / 4.0 | 1.7 / 2.0 / 5.8 | 1.2 / 1.4 / 2.1 | 2.9 / 3.1 / 5.3 |
 
-- With automatic threads every 3+ way p95 is at most 11.3 ms (target 15): preflop 8.2 (Stage 5: 7.7), flop 11.3 (11.0), turn 9.0 (10.5), river 9.7 (14.9).
+- With automatic threads every 3+ way p95 is at most 11.3 ms (working target 15; the plan's ≤ 10 ms on the turn and river holds here, at 9.0 and 9.7, and the flop is within its ≤ 50 ms): preflop 8.2 (Stage 5: 7.7), flop 11.3 (11.0), turn 9.0 (10.5), river 9.7 (14.9).
 - A first version (the continuing ranges' Monte Carlo at full rollouts) measured turn p95 17.9 and river 17.3 ms (lines on, 20 games). Callgrind put 24% of all time in that Monte Carlo, mostly redrawing deals of narrow call ranges that collide. Two changes fixed it: when the call model applies, the equity against everyone still in is no longer computed (nothing uses it then), and the continuing Monte Carlo draws at most about 30,000 deals (a 512-deal acceptance trial sets the rollouts, at least 100). The river and turn are now faster than at Stage 5 because the skipped Monte Carlo was where some of the redraw spikes were.
 
 **Tests:** 447 pass in Release (6.6 s) and Debug (26.7 s), 440 + 7 new. GCC Release/Debug and clang build with zero warnings; `strict.sh` is clean on `advisor_charts.cpp`, `training_advisor.cpp` and `range_model.cpp`. Each new test takes at most 0.7 s in Release (1.9 s in Debug).
 
-### Stage 6 review, uncommitted, on top of `becbe81`
+### Stage 6 review, commit `25faff8`
 
 No defect needed a code change; one test comment was moved. Bench unchanged (0.708 BB, 56%). 447 tests pass in Release and Debug, zero warnings in Release, Debug and clang, `strict.sh` clean on the six Stage 6 files and the generated data.
 
@@ -788,12 +812,12 @@ No defect needed a code change; one test comment was moved. Bench unchanged (0.7
 Judgement: the open ranges and the 12 BB jams are in line with common 6-max charts and push/fold tables. The BB's defence against the BTN is tight next to solver outputs (which defend about 55-65% with 12-15% 3-bets); that is the bots' BB-vs-BTN chart, which this stage may not change. The open sizes are plausible in size, but the 3.5 BB opens with premiums are a size tell (already noted under batch C).
 
 **Found, not fixed**
-- `advisor_charts.cpp` `push_fold_answer`: facing a lone jam, the table applies whenever Hero's effective stack is at most 15 BB, even when the jammer is deep and a deep player was still to act behind it. Example: BB with 10 BB, SB 100 BB, BTN jams 100 BB. The range model reads that jam at 100 BB depth (JJ+, AK), but the chart prior is the BB's 10 BB call range against a BTN jam, so 22 and 55 are advised to call (model -50 chips, prior +65). Restricting push/fold to jams the range model also reads as short (tried) does not change the advice: the jam is a call of 9 BB, not "committing" by the bots' test, so the chart falls back to `vs_open_response`, which also calls 22. A real fix means a commit-aware answer to deep jams in the chart; left for a decision.
-- The inference (a villain's range after it calls) ignores raise size, while `predict_preflop_response` widens calls below the standard size: a flat of a min-raise is read as the standard flat range. Pre-existing for sizes above standard; not changed.
+- `advisor_charts.cpp` `push_fold_answer`: facing a lone jam, the table applies whenever Hero's effective stack is at most 15 BB, even when the jammer is deep and a deep player was still to act behind it. Example: BB with 10 BB, SB 100 BB, BTN jams 100 BB. The range model reads that jam at 100 BB depth (JJ+, AK), but the chart prior is the BB's 10 BB call range against a BTN jam, so 22 and 55 are advised to call (model -50 chips, prior +65). Restricting push/fold to jams the range model also reads as short (tried) does not change the advice: the jam is a call of 9 BB, not "committing" by the bots' test, so the chart falls back to `vs_open_response`, which also calls 22. A real fix means a commit-aware answer to deep jams in the chart; left for a decision. **Fixed in the Stage 6 follow-ups** (fix 2: push/fold only for short jams, no chart prior for a deep jam into a short Hero).
+- The inference (a villain's range after it calls) ignores raise size, while `predict_preflop_response` widens calls below the standard size: a flat of a min-raise is read as the standard flat range. Pre-existing for sizes above standard; not changed here. **Fixed in the Stage 6 follow-ups** (fix 4).
 
 **Test changes:** none to assertions. The `DISABLED_LatencyByStreet` comment, which batch C's new tests had separated from its test, is back above it.
 
-### Stage 6 follow-ups, uncommitted, on top of `25faff8`
+### Stage 6 follow-ups, commit `886a46f`
 
 Five fixes from the Stage 6 review. The bots, the JSONL schema, the snapshot and mistakes on `base_ev` are unchanged; `VsReraises.BotsChartsUnchanged` now also pins the bots' answers to an open for every hero, opener and table size.
 
@@ -867,11 +891,11 @@ Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the
 | River 3+ way (1434) | 4.1 / 8.4 / 114 | 5.3 / 11.1 / 110 | 4.4 / 8.8 / 260 | 10.6 / 23.8 / 284 |
 | River heads-up (300) | 1.3 / 1.5 / 2.3 | 1.8 / 2.2 / 2.6 | 1.3 / 1.4 / 2.7 | 2.8 / 3.0 / 4.1 |
 
-- With automatic threads every 3+ way p95 is at most 12.7 ms (target 15): preflop 10.1 (was 8.2), flop 12.7 (11.3), turn 10.5 (9.0), river 11.1 (9.7). The preflop rise is the per-scenario Monte Carlo runs (most below the threading threshold, so inline) and the wider blind ranges (more scenarios with a caller). One thread with the lines on is slower than before (preflop p95 26 against 17.9), as each scenario now has its own run.
+- With automatic threads every 3+ way p95 is at most 12.7 ms (working target 15; the plan's ≤ 10 ms for the turn and river is missed at 10.5 and 11.1, and the flop's ≤ 50 ms holds): preflop 10.1 (was 8.2), flop 12.7 (11.3), turn 10.5 (9.0), river 11.1 (9.7). The preflop rise is the per-scenario Monte Carlo runs (most below the threading threshold, so inline) and the wider blind ranges (more scenarios with a caller). One thread with the lines on is slower than before (preflop p95 26 against 17.9), as each scenario now has its own run.
 
 **Tests:** 453 pass in Release (7.8 s) and Debug (30.3 s), 447 + 6 new; GCC Release/Debug and clang build with zero warnings; `strict.sh` is clean on `preflop_charts.cpp`, `advisor_charts.cpp`, `training_advisor.cpp` and `range_model.cpp`. Each new test takes at most 0.14 s in Release (0.35 s in Debug).
 
-### Stage 7 (UI for player-type advice and tooltips), uncommitted, on top of `886a46f`
+### Stage 7 (UI for player-type advice and tooltips), commit `1153cc7`
 
 **What it adds:** an "Advice:" selector in the sidebar, the selected line in the advisor panel, tooltips, and Play GTO following the selection. UI only: no change to the engine, bots, advisor, snapshot or JSONL schema. The UI still reads only `IGameController` and `TableSnapshot` (`hint.versus`), and no seat is labelled with a type, so the Shifter stays hidden.
 
@@ -907,7 +931,7 @@ Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the
 
 **Tests:** 462 pass in Release (7.8 s) and Debug (30.8 s), 453 + 9 new; GCC Release/Debug and clang build with zero warnings; `strict.sh` is clean on `trainer_ui.cpp`, `main.cpp`, `screenshot.cpp`, `trainer_ui_test.cpp` and `screenshot_test.cpp` (four pre-existing sign-conversion warnings in `trainer_ui.cpp` and `trainer_ui_test.cpp` fixed with casts).
 
-### Stage 8 batch A (tiered trees, memory-first estimates, threads), uncommitted, on top of `1153cc7`
+### Stage 8 batch A (tiered trees, memory-first estimates, threads), commit `37f079f`
 
 **Abstractions** (factories in `src/solver/betting_tree.h`). Every tier puts the advisor's ladder (25/50/75/100% + all-in) at the root decision only, so the advisor's options map onto the tree, as `river_default_abstraction` does. All tiers merge a size into all-in at 0.67 of the stack.
 
@@ -1014,7 +1038,7 @@ Every street also has all-in, and the flop tiers raise all-in only.
 - The tree lost nothing; `TreeShape` and `count_betting_tree` are new public API.
 - The turn tier misses the plan's per-iteration estimate (see above).
 
-### Stage 8 batches B and C (hardware tiers, `SolverService`, controller), uncommitted, on top of `37f079f`
+### Stage 8 batches B and C (hardware tiers, `SolverService`, controller), commit `e0e0d38`
 
 **Hardware** (`src/solver/hardware.{h,cpp}`)
 - `detect_hardware()` returns threads (`hardware_concurrency`, 0 read as 1), total and available RAM, and `ram_known`.
@@ -1120,7 +1144,7 @@ Every street also has all-in, and the flop tiers raise all-in only.
 - `SolverService::solve` is public and static, so tests and the timing report can run a job synchronously.
 - `SolverLimits::interrupt` is new solver API.
 
-### Stage 8 batch D (solver mode UI), uncommitted, on top of the batches B and C work
+### Stage 8 batch D (solver mode UI), commit `4846048`
 
 **What it adds:** the "Solver mode" checkbox, a solver section in the advisor panel, and Play GTO following a finished solve. UI and tests only: no change to the controller, service, solver, advisor, snapshot or JSONL schema. The UI reads only `IGameController` (`solver_enabled`, `solver_budget_ms` and their setters) and `TableSnapshot::solver`.
 
@@ -1159,7 +1183,7 @@ Every street also has all-in, and the flop tiers raise all-in only.
 
 **Tests:** 488 pass in Release (9.2 s wall) and Debug (36.2 s): 482 plus 6 new. GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `trainer_ui.cpp` and `trainer_ui_test.cpp`.
 
-### Stage 8 batch E (turn bench holdout, sanitizers), uncommitted, on top of `4846048`
+### Stage 8 batch E (turn bench holdout, sanitizers), commit `e07d799`
 
 **Turn bench design** (`tools/bench/turn_spots.json`, from the new `gen_turn_spots.py`, a sibling of `gen_river_spots.py` with the same syntax and the same independent pot and stack check)
 - 12 heads-up turn decisions at 100 BB: the river bench's three pot types (BTN vs BB, CO vs BTN, SB 3-bets BTN) × dry / wet / paired / monotone, on the river bench's flops. The dry and paired turns add a second suit (Kd7c2h **4d**, As8d3c **5d**, Kc8h3d **2c**, 7c7d4s **Jd**, QsQd6c **3d**, 8s8c3d **Kc**), so every spot has flush or straight draws.
@@ -1217,7 +1241,7 @@ Regret above 1 BB covers 13% of tuned hands (15% pre-tuning); the solver's frequ
 
 **ThreadSanitizer** (GCC 13.3, `/tmp/claude-0/b/tsan`, RelWithDebInfo, `-fsanitize=thread`, `POKER_BUILD_APP=OFF`, rebuilt at `4846048`)
 - The full suite, `ctest -j 4` (449 tests run, 10 disabled) in 183 s: no ThreadSanitizer report anywhere in the log.
-- One failure, not a race: `SolverService.NewDecisionCancelsQuickly` measured 216 ms against its 200 ms bound, while a 4-thread `advisor_bench` ran on the same 4 cores. Run alone under TSan it passes (no report). Left as is.
+- One failure, not a race: `SolverService.NewDecisionCancelsQuickly` measured 216 ms against its then 200 ms bound, while a 4-thread `advisor_bench` ran on the same 4 cores. Run alone under TSan it passes (no report). The bound was then raised to 1000 ms (see Test changes, "Stage 8 batch E follow-up").
 - After the batch's changes: `Bench.*`, and a threaded turn-tier solve through `advisor_bench --threads 4 --stability` (30 + 30 iterations, `halt_on_error=1`): clean.
 
 **AddressSanitizer + UBSan** (new `/tmp/claude-0/b/asan`: GCC, RelWithDebInfo, `POKER_BUILD_APP=OFF`, `-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined`, dependency sources from the Release build's `_deps`)
@@ -1230,7 +1254,7 @@ Regret above 1 BB covers 13% of tuned hands (15% pre-tuning); the solver's frequ
 
 **Tests:** 491 pass in Release (9.3 s wall) and Debug (37.5 s): 488 plus 3 new. GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `advisor_bench.cpp` and `bench_test.cpp`.
 
-### Stage 8 review, on top of `e07d799`
+### Stage 8 review, commit `62b98a5` (fixes in `ebdf99c`)
 
 No defect needed a code change. 491 tests pass in Release and Debug, zero warnings in Release, Debug and clang, `strict.sh` clean on `src/solver/*.cpp`, `solver_service.cpp`, `local_game_controller.cpp`, `trainer_ui.cpp` and `main.cpp`; clang `-Wshadow-all` (lambda parameters too, which MSVC's C4456 also flags) is clean on the same files and the two solver test files. Bench unchanged (0.694 BB, 57%).
 
@@ -1244,11 +1268,11 @@ No defect needed a code change. 491 tests pass in Release and Debug, zero warnin
 - Hardware: the Windows branch reads correctly (`WIN32_LEAN_AND_MEAN` and `NOMINMAX` before `<windows.h>`, which comes after every project header in `hardware.cpp`; `dwLength` set; `ullTotalPhys` / `ullAvailPhys`). The headers newly reached from `main.cpp`, where `<windows.h>` precedes the project headers, use no identifier that `<windows.h>` defines as a macro. `/proc/meminfo` parsing tolerates missing lines (falls back to `sysconf`).
 
 **Found, not fixed**
-- Play GTO follows any Done result, however far from converged. Measured on the heads-up spot (`SolverService.DISABLED_ReportEndToEndTimes`'s), Turn tier: a 2 s budget ends the flop at 31.6% of the pot on 3 threads (221% on 1), the turn at 16.4%; the default 8 s gives 5.8% and 1.6%. The most frequent action flips between budgets (CHECK, BET 100%, BET 25% on the flop). A rule such as "solver advice only below a few times the target" needs a decision.
+- Play GTO follows any Done result, however far from converged. Measured on the heads-up spot (`SolverService.DISABLED_ReportEndToEndTimes`'s), Turn tier: a 2 s budget ends the flop at 31.6% of the pot on 3 threads (221% on 1), the turn at 16.4%; the default 8 s gives 5.8% and 1.6%. The most frequent action flips between budgets (CHECK, BET 100%, BET 25% on the flop). A rule such as "solver advice only below a few times the target" needs a decision. **Fixed below** (`solve_is_usable`, 3× the target).
 - Below the minimum a solve can take (setup, one iteration, the closing check and `root()`), the budget overruns: flop check-down at 2 s took 2.21 s on 3 threads and 2.95 s on 1.
 - The villain's range has Hero's cards removed (`infer_ranges` conditions on the viewer) while Hero's range is the public one. The solver already removes conflicting pairs per matchup, so this only shifts Hero's other combos and, through them, the equilibrium; small, but not the public-range game a solver normally solves.
-- At 1180x760 the "Approximate solver: ..." line sits below the advisor child's scroll when a solve is Done; the visible heading reads "Solver: X (most frequent)". The status line's exploitability and the toggle's tooltip still say it is approximate.
-- Playing the solver's action can be recorded as a hero mistake, because mistakes stay on Baseline `base_ev` (decision 5); the UI does not say so.
+- At 1180x760 the "Approximate solver: ..." line sits below the advisor child's scroll when a solve is Done; the visible heading reads "Solver: X (most frequent)". The status line's exploitability and the toggle's tooltip still say it is approximate. **Fixed below** (the heading says "approximate").
+- Playing the solver's action can be recorded as a hero mistake, because mistakes stay on Baseline `base_ev` (decision 5); the UI does not say so. **Fixed below** (a tooltip says so; the rule itself is unchanged).
 
 **Test changes:** none.
 
@@ -1318,6 +1342,33 @@ Information only, vs 5 × GtoBot (40,000 hands; Baseline −7.7 ± 8.0):
   - Results come from one seed. The halves agree in sign, but the Station first-half and second-half differences are individually within 2 SE of zero.
   - The maniac is a tool-only profile, not one of the game's bots.
 
+### Stage 9 final review (batch C), on top of `bbfe240`
+
+Over the whole upgrade, `git diff e531106..HEAD`.
+
+**Verified**
+- **Boundaries (CLAUDE.md section 10):** the anti-cheat scan globs `src/bots`, `src/advisor`, `src/strategy`, `src/equity`, `src/range`, `src/solver` and `src/controller/solver_service.*`, and `tests/player_boundary_test.cpp` includes every header in `src/advisor`, `src/range`, `src/solver` and `src/strategy`, plus `controller/solver_service.h`. `src/engine` and `src/logging` have no diff. `TrainerUi` includes only `controller/game_controller.h`. No seat type or bot identity reaches the advisor, the solver or the UI; "Shift:" appears only in the hand log's labels.
+- **Bots:** `git diff e531106..HEAD -- src/bots` is only the additive `PotLayer::opponent_seats`, and `tests/bots_test.cpp` has no diff.
+- **Section 11 rules,** checked in the code: `equity_pct` is the random-hand Monte Carlo and `range_equity_pct` sits beside it; `preferred_size` takes the random-hand equity; `base_ev` is copied before the fit and the all-in cap; the snapshot's hint is Baseline's; postflop all-in only within 1.5 pots or as the only raise, and preflop also at 15 BB effective or less; `implied` is 0 preflop and on the river; Play GTO's solver gate (`solve_is_usable`, Baseline, advisor shown, Done); ties to the cheaper action; the solver key `{epoch, hand, action count}` with the epoch bumped per Hero decision; the 120 s full-flop gate.
+- **Determinism:** no `std::uniform_real_distribution`, `std::uniform_int_distribution` or `std::shuffle` in new code, and every new sort breaks ties by index.
+- **JSONL schema:** a scratch program played the same seeded 150-hand `LocalGameController` session (Hero follows the hint, with periodic checks, folds and calls) built from `e531106` and from `bbfe240`. The hand logs' key sets (49 paths, nested keys included) are identical, and equal to the schema in `src/logging/hand_logger.h`. The values differ from hand 5 on, because the advice changed and so did Hero's play. The session summaries differ only by a `"winner"` key, which the unchanged logger writes when a session has a winner (one did in the new run).
+- **Test changes:** every pre-existing test whose assertions changed has an entry below. Missing entries were added for Stages 2, 3 and 4 (new tests only) and the Stage 6 and Stage 8 reviews.
+
+**Fixed (MSVC `/W4` risks; none can be checked here)**
+- `src/app/main.cpp`: `--hover` and `--size` were parsed with `std::sscanf`, which MSVC's CRT deprecates (C4996). They now use `strtod` through a small `parse_pair`, which is also stricter: no trailing text, no hex, and whole numbers up to 16384 for `--size`. Checked by hand: `1180x760` and `10,20` are accepted; `1179x760`, `1200x`, `0x1200`, `1300.5x800`, `10;20` and `,3` are rejected.
+- `tests/solver_test.cpp`: `if (kOptimized)` on a `constexpr bool` is C4127 at `/W4`; now `if constexpr`.
+- `src/solver/hardware.cpp`: `WIN32_LEAN_AND_MEAN` and `NOMINMAX` are defined only if not already defined, so a command-line definition does not give C4005.
+
+**Deviations from the plan's Stage 9**
+- The plan's seeded-log *byte* comparison ("values unchanged except the `why` text") cannot hold: the advice changed, so Hero's play and every later hand change. The key-set comparison above replaces it, and `Controller.SolverDoesNotChangeMistakesOrLogs` checks byte identity with solver mode on and off.
+- The plan's `DISABLED_` 200-hand smoke gtest is the `advisor_matchup_smoke` ctest instead (6 hands per matchup, run on every `ctest`), and the matchups ran 40,000 hands per line instead of 3,000, because there was time.
+
+**Not changed**
+- `"Starting…"` uses U+2026, which ImGui 1.92 loads from the TTF on demand (Segoe UI and DejaVu Sans have it); only ImGui's built-in fallback font, used when no system font is found, lacks it.
+- A size-rule bet that would take the whole stack still becomes all-in beyond 1.5 pots (Stage 5 review, "Found, not fixed"); the all-in is then smaller than the bet the rule chose.
+
+**Results after the fixes:** 495 tests pass in Release (12.0 s wall) and Debug (48 s wall); GCC Release and Debug and clang build with zero warnings; `strict.sh` is clean on `main.cpp`, `hardware.cpp` and `solver_test.cpp`; `advisor_bench` is unchanged at 0.694 BB and 57%.
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -1326,15 +1377,15 @@ Information only, vs 5 × GtoBot (40,000 hands; Baseline −7.7 ± 8.0):
 - The combo tables (`combos.cpp`) are built at run time behind a function-local static rather than with `constexpr`, to stay clear of MSVC's constexpr step limit. Whether MSVC would actually hit that limit wasn't tested.
 - The multiway redraw cap (16,384) and the flop threading threshold (64 needed combos) were chosen, not tuned.
 - Timings come only from this container.
-- Solver threads (Stage 2: unused) and the memory check before building a flop tree (Stage 2: after) were done in Stage 8 batch A. See its entries below.
+- Solver threads (Stage 2: unused) and the memory check before building a flop tree (Stage 2: after) were done in Stage 8 batch A. See "Stage 8 batch A" under Measured results above, and its entries later in this list.
 
 - Stage 5: the preflop all-in rule's 15 BB line was chosen to match the range model's short-stack threshold and Stage 6's push/fold range; it was not measured.
 - Stage 5: the 3+ way hint latencies come from random play, whose lines are not representative of real games.
-- Stage 5 batch B: the archetype lines are not checked against a solver or against the bots; the river bench scores Baseline only. The exploit directions in the examples are judgment.
+- Stage 5 batch B: the archetype lines are not checked against a solver; the river bench scores Baseline only. The exploit directions in the examples are judgment. (Against the bots they were measured later, in "Stage 9 matchups": each line beats Baseline on its own table.)
 - Stage 5 batch B: the line Monte Carlo budget (a third of the rollouts, 150,000 deals, 512 trial deals) was chosen for latency; its effect on line advice was not measured beyond the 1-2 pp noise estimate. Spots where no trial deal fits use the independence product, whose error there is unmeasured.
 - Stage 5 batch B: Hero's Baseline-read range as the bettor range for every line was not compared with a per-type reading.
 - Stage 5 batch B: the threads used for the lines were run under GCC's ThreadSanitizer only for the advisor, range-equity and controller tests (Stage 5 review); clang's TSan and MSVC were not available.
-- Stage 5 batch D: the tuned Baseline parameters were fitted to the river bench's hand-written ranges. The winner sits at a corner of the grid, the grid was not extended, and the turn holdout (Stage 8) does not exist yet. Their effect on flop and turn advice was checked only through the Stage 4 plausibility tests and the unchanged test suite. (The three parameters are postflop only, so preflop advice does not change.)
+- Stage 5 batch D: the tuned Baseline parameters were fitted to the river bench's hand-written ranges. The winner sits at a corner of the grid, and the grid was not extended. The Stage 8 turn holdout (batch E) is mixed: tuned 0.543 BB and 33% agreement against 0.614 BB and 39% pre-tuning, so regret improved but agreement fell, on 12 hand-written spots. Flop advice was checked only through the Stage 4 plausibility tests and the unchanged test suite. (The three parameters are postflop only, so preflop advice does not change.)
 - Stage 5 batch D: the diagnosis of the 3-bet-pot spots compares the model's inferred lead range with the bench's assumed range. Neither range is solved, so which story is closer to real play is unverified.
 
 - Stage 6 batch A: the positional 3-bet and 4-bet tables are hand-authored to the stated bands, in the style of published 100 BB 6-max charts. They were not solved or compared with a specific solver output.
@@ -1342,8 +1393,8 @@ Information only, vs 5 × GtoBot (40,000 hands; Baseline −7.7 ± 8.0):
 
 - Stage 6 batch C: the players-still-to-act model treats each player's continue as independent and lets a folded player hold cards from its call range in the Monte Carlo (heads-up scenarios use the exact per-combo vector, so only the multiway ones carry this; in the AQo spot it moves AQo's heads-up equity from 53.8% to 51.0% when the call ranges of two folded players are dealt, so the multiway scenarios are biased by a similar order); an overcall of a short jam uses the lone-call push/fold range, and the original bettor never re-raises after a squeeze. None of these was measured against a multiway solve.
 - Stage 6 batch C: the continuing Monte Carlo's 30,000-deal budget was chosen for latency. Spots where it bites (acceptance below 10%) get fewer rollouts, down to 100; their error was not measured.
-- Stage 6 batch C: the 15-25 BB blend (linear, into the commit range for jams and the chart answer for predicted calls) and the size exponents (ratio^-1 below standard, ratio^-0.5 above) are judgment, not fitted. The BB's defend shares against 2 and 2.5 BB opens (55% and 45% with 3-bets) look a little tight next to published solver outputs; not compared with any.
-- Stage 6 batch C: `implied` 0 preflop was checked through the 169-class spots and the test suite only; its effect on preflop mistakes in real play was not measured. The AQo call EV was checked approximately by hand (+24 against the model's +18.1), not exactly.
+- Stage 6 batch C: the 15-25 BB blend (linear, into the commit range for jams and the chart answer for predicted calls) and the size exponents (ratio^-1 below standard, ratio^-0.5 above) are judgment, not fitted. The BB's defend shares against 2 and 2.5 BB opens (55% and 45% with 3-bets) looked a little tight next to published solver outputs; superseded by the Stage 6 follow-ups' advisor-only vs-open tables, with which the BB defends 58.1% against a BTN open of 2 or 2.5 BB (13.4% 3-bets). Neither was compared with a specific solver output.
+- Stage 6 batch C: `implied` 0 preflop was checked through the 169-class spots and the test suite only; its effect on preflop mistakes in real play was not measured. The AQo call EV was checked approximately by hand (+24 against the model's +18.1), not exactly. (The Stage 6 review's independent Monte Carlo gave +22.9, and after the follow-ups the model gives +21.8; see there.)
 
 - Stage 6 follow-ups: the advisor's vs-open tables are hand-authored to the stated bands, in the style of published 100 BB 6-max outputs; they were not solved or compared with a specific solver. The cold callers' flats and the SB's pure 3-bet-or-fold are simplifications.
 - Stage 6 follow-ups: the 3.5x out-of-position standard 3-bet was chosen from the tables' stated size; the bench was checked at 3.0, 3.5, 3.6 and 3.75 only, and its sensitivity there (0.69-0.76) is larger than any principled reason to prefer one of them.
@@ -1353,7 +1404,7 @@ Information only, vs 5 × GtoBot (40,000 hands; Baseline −7.7 ± 8.0):
 - Stage 7: the new controls were tested with injected ImGui input and the `--hover` flag only; real GLFW mouse input, Windows fonts (Segoe UI widths) and DPI scales other than 1 were not checked. The screenshots come from Mesa under Xvfb with DejaVu Sans.
 - Stage 7: the 560 px threshold for showing the `why` under the action was chosen from the two window sizes, not from user feedback.
 
-- Stage 8 batch A: ThreadSanitizer has not been run on `WorkerPool` or the threaded solver (planned for batch E). Thread safety rests on the design: tasks write disjoint storage, and region start and end go through the pool's mutex. The determinism test only shows equal results.
+- Stage 8 batch A: thread safety rests on the design: tasks write disjoint storage, and region start and end go through the pool's mutex. The determinism test only shows equal results. GCC's ThreadSanitizer later ran clean on `WorkerPool`, the threaded solver tests and a threaded turn-bench solve (batches B-C and E); clang's TSan and MSVC were not run.
 - Stage 8 batch A: speeds come from this 4-core container only, with no tests above 4 threads. The scaling to 8+ threads that the flop tier assumes was not measured. Memory bandwidth may limit it, since a flop full iteration streams about 3 GB of regrets and sums.
 - Stage 8 batch A: flop full was measured on one spot only (515 × 469 combos, 100 BB, single-raised pot). Other boards, deeper stacks or wider ranges scale it (full ranges: 7.7 GB). Its 1- and 2-thread times to target and all 8-thread figures are extrapolated.
 - Stage 8 batch A: the approximate tier's error from having no river betting was not measured against flop full on the same spot. Their root strategies differ by a few points, and neither is the true game.
@@ -1364,7 +1415,7 @@ Information only, vs 5 × GtoBot (40,000 hands; Baseline −7.7 ± 8.0):
 - Stage 8 batches B and C: Windows memory detection (`GlobalMemoryStatusEx`) was compiled only in reading, never run; macOS and other platforms fall back to the river tier untested. Container (cgroup) memory limits are not read, so a container could report more memory than it may use.
 - Stage 8 batches B and C: the tier thresholds, the 50% / 16 GB budget and the 120 s gate for full flop are the plan's or chosen; whether full flop at 120 s on 8+ threads beats the approximate tree was not measured (no 8-thread machine).
 - Stage 8 batches B and C: end-to-end times and cancel latencies come from one heads-up spot on this container. 6-max heads-up pots have narrower ranges, so they solve faster.
-- Stage 8 batches B and C: ThreadSanitizer ran with GCC only, on the service, controller-solver and pool tests; clang's TSan and the full suite under TSan are batch E.
+- Stage 8 batches B and C: ThreadSanitizer ran with GCC only, on the service, controller-solver and pool tests. Batch E then ran the full suite under GCC's TSan with no report; clang's TSan was not available.
 - Stage 8 batches B and C: range inference, the tree build and river iterations are not interruptible. They were short in every measurement here (river iterations about 1 ms, inference a few ms), but a slow machine could stretch a cancel by their length.
 - Stage 8 batches B and C: the advice is the solver's average strategy when the budget ends, not a converged one. At the default 8 s on this box, the wide heads-up spot stopped at 1.81% of the pot on the turn and 5.77% on the approximate flop. How much Hero's own frequencies move between those and the targets was not measured.
 - Stage 8 batch D: the solver UI was tested with injected ImGui input and the real app under Xvfb (Mesa, DejaVu Sans) only; real GLFW mouse input, Windows fonts and DPI scales other than 1 were not checked. The Running and Done screenshots depend on frame timing under Xvfb, so the same flags can catch a different moment.
@@ -1375,8 +1426,11 @@ Information only, vs 5 × GtoBot (40,000 hands; Baseline −7.7 ± 8.0):
 
 (Each entry gives the test name, the old assertion, the new assertion and the reason.)
 
-- **Stage 1:** no existing test changed; all new tests are in `tests/range_test.cpp`.
+- **Stage 1:** no existing test changed; all new tests are in `tests/range_test.cpp`. The anti-cheat scan (`tests/check_no_engine_access.cmake`) also globs `src/range/*` and `src/solver/*` (a missing folder matches nothing), and `tests/player_boundary_test.cpp` includes the new range headers. Later stages added their headers there in the same way.
 - **Tolerance note:** `PreflopMatrix.SpotChecksAgainstMonteCarlo` uses max(3 combined standard errors, 0.6 pp). Three standard errors is about 0.43 pp there, so the 0.6 pp floor is a little looser than the plan's "within 3 standard errors". It was kept so the test can't be flaky.
+- **Stage 2** (`c5737a8`, `ae8919f`, `dd9e9ed`): no existing test changed. New `tests/solver_test.cpp` (`Dcfr.*` including Kuhn's −1/18, `BettingTree.*`, `Showdown.MatchesBruteForceWithCardRemoval`, `RiverToy.PolarizedVsBluffCatcher`, `RiverSolver.*`, `TurnSolver.CheckDownEvMatchesExactEquity` and `TurnSolver.SmallTreeConverges`), the `solver_cli_smoke` ctest, and the review's bet-rounding regression assertion in the solver tests.
+- **Stage 3** (`bfc8234`, `1ca211a`): no existing test changed. New `tests/bench_test.cpp` (`SpotFromView.*`, including the review's two uncalled-excess tests, `Bench.RangeTextSuitFiltersAndCombos`, `Bench.SpotFileParsesAndEverySpotIsLegal`), `RiverSolver.BestContinuationEvBoundsAverageEv`, and the `advisor_bench_smoke` ctest.
+- **Stage 4** (`69daa92`, `1ca211a`): no existing test changed. New `tests/range_model_test.cpp` (`ResizeRange.*`, `StreetStrength.*` and `RangeModel.*`, plus the reports `RangeModelReport.DISABLED_ThreeSpots` and `DISABLED_Timing`), plus `RangeModel.RaiseShareFallsAsBetSizeGrows` for the size-scaled raise share.
 - **Stage 4 review fixes** (`tests/range_model_test.cpp`):
   - `RangeModel.BluffShareTracksSize`:
     - **Old:** the BTN's river bet after checks equals prior × `bet_breakdown(prior, ...)` (own-range rule), and the measured air share (top_share > 0.6 in the prior) is within 0.05 of s/(1+2s).
@@ -1503,7 +1557,7 @@ Information only, vs 5 × GtoBot (40,000 hands; Baseline −7.7 ± 8.0):
   - `SolverService.ResultMatchesKeyAndStaleIsRejected` (0.12 / 1.2 s): another epoch or action count gets nothing; Done after exactly 60 iterations; the options equal a hand-built solve's root `freq` and `ev_best` for Hero's combo; best is the most frequent; a new submit or cancel hides the old result.
   - `SolverService.FacingABetMapsEveryOptionToALegalAction` (9 / 87 ms): uneven stacks, facing 100 on the river: FOLD, "CALL 100", at least 2 raises up to 940 (the shorter stack), no AllIn, all legal.
   - `SolverService.NotApplicableSpotsSayWhy` (12 / 20 ms): preflop, Turn on the river tier, Unavailable, too big, and the flop-full gating by budget and memory.
-  - `SolverService.NewDecisionCancelsQuickly` (0.19 / 0.83 s): a turn solve mid-iteration gives way in under 200 ms (6.3 / 12.9 ms).
+  - `SolverService.NewDecisionCancelsQuickly` (0.19 / 0.83 s): a turn solve mid-iteration gives way in under 200 ms (6.3 / 12.9 ms). The bound is now 1000 ms (Stage 8 batch E follow-up below).
   - `SolverService.DestructorJoinsMidSolve` (0.12 / 0.73 s): under 500 ms mid-solve, under 2 s right after a submit.
   - `SolverService.ExceptionsBecomeFailed` (10 / 71 ms): a broken view gives Failed, and the next job still runs.
   - `SolverService.DISABLED_ReportEndToEndTimes`: the table above (about 3.5 minutes; full flop needs about 5.3 GB).
@@ -1530,4 +1584,7 @@ Information only, vs 5 × GtoBot (40,000 hands; Baseline −7.7 ± 8.0):
   - New `Bench.StreetFieldSetsBoardAndScriptLimits` (0 / 0 ms): `"street"` parsing, the board size per street, a turn file's optional empty `river`, rejecting a river action in a turn file, an unknown street, and a river file without a `river` script.
   - New ctest `advisor_bench_turn_smoke` (0.19 / 1.1 s): one turn spot end to end, 20 iterations on 2 threads.
 - **`SolverService.NewDecisionCancelsQuickly`** (Stage 8 batch E follow-up): the cancel-latency bound went from < 200 ms to < 1000 ms. Measured latency is 6-8 ms in Release, but it hit 216 ms under ThreadSanitizer with a bench running alongside. The looser bound avoids failures on loaded or slow machines, and a full flop iteration (about 4 s) still fails it.
+- **Stage 6 review:** no assertion changed; one test comment moved back above `DISABLED_LatencyByStreet`.
+- **Stage 8 review:** no test changed; the fixes after it are under "Test changes (fixes)" in "Stage 8 review" above (no assertion changed, three new tests).
 - **Stage 9 batch A** (`CMakeLists.txt`): new ctest `advisor_matchup_smoke`, which runs `advisor_matchup --hands 6 --matchup all --advisor-rollouts 200 --range-rollouts 200 --bot-rollouts 100` (0.7 s Release, 2.2 s Debug, both measured while the matchup runs loaded the machine). It plays every matchup and line, and fails (exit 1) on an illegal action or when the six stacks don't sum to 6 × 2000 after a hand. No existing test changed.
+- **Stage 9 batch C (final review):** no assertion changed. In `tests/solver_test.cpp` the four `if (kOptimized)` / `if (!kOptimized)` branches became `if constexpr`, since MSVC `/W4` reports a plain `if` on a constant as C4127. The tests do the same work.

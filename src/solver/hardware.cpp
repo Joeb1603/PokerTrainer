@@ -5,8 +5,12 @@
 #include <thread>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX  // Guarded: a /DNOMINMAX on the command line would make this C4005
+#endif
 #include <windows.h>
 #elif defined(__linux__)
 #include <unistd.h>

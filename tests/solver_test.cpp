@@ -845,9 +845,9 @@ TEST(SolverTiers, CountingWalkMatchesTheBuiltTree) {
 
 TEST(TurnSolver, SmallRangesConverge) {
     SolveSpot spot = small_turn_spot();
-    if (!kOptimized) spot.ranges[1] = range_of("AA-QQ, AKs, KQs, AKo, 76s");
+    if constexpr (!kOptimized) spot.ranges[1] = range_of("AA-QQ, AKs, KQs, AKo, 76s");
     PostflopSolver solver(spot, turn_tier_abstraction());
-    if (kOptimized) {
+    if constexpr (kOptimized) {
         EXPECT_GE(solver.hands(0).size(), 50u);
         EXPECT_LE(solver.hands(0).size(), 70u);
         EXPECT_GE(solver.hands(1).size(), 50u);
@@ -965,7 +965,7 @@ TEST(FlopSolver, CheckDownApproximationRuns) {
 
     // The approximate tier solves: exploitability falls, EVs stay within the chips.
     SolveSpot spot = small_flop_spot();
-    if (!kOptimized) {
+    if constexpr (!kOptimized) {
         spot.ranges[0] = range_of("99-77, A5s, KJs, JTs, 87s");
         spot.ranges[1] = range_of("AA-QQ, AKs, KQs, 76s");
     }
@@ -1039,7 +1039,7 @@ void expect_identical_solves(const PostflopSolver& a, const PostflopSolver& b) {
 
 TEST(Solver, DeterministicAcrossThreadCounts) {
     SolveSpot spot = small_turn_spot();
-    if (!kOptimized) spot.ranges[1] = range_of("AA-QQ, AKs, KQs, AKo, 76s");
+    if constexpr (!kOptimized) spot.ranges[1] = range_of("AA-QQ, AKs, KQs, AKo, 76s");
     SolverLimits one;
     SolverLimits three;
     three.threads = 3;

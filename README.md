@@ -72,7 +72,7 @@ An optional **Solver mode** checkbox runs an equilibrium solver (Discounted CFR)
 | Turn | 4 threads, 4 GB free | turn and river, plus an approximate flop (no river betting) |
 | Flop | 8 threads, 8 GB free | the full flop tree too, when it fits in memory and the budget is 120 s |
 
-Preflop and multiway pots, and spots where your opponent is all-in, keep the heuristic advice with a note saying why. **Play GTO** follows the solver only once a solve is close enough to converged; otherwise it plays the heuristic advice.
+Preflop and multiway pots, and spots where your opponent is all-in, keep the heuristic advice with a note saying why. **Play GTO** follows the solver only with the Baseline advice selected and once a solve is close enough to converged (within three times its target exploitability); otherwise it plays the heuristic advice.
 
 It's an approximate solver: simplified bet sizes, assumed ranges, and a time limit. Treat its output as a guide, not the true equilibrium.
 
@@ -108,7 +108,7 @@ This builds two programs:
 - `build\Release\poker_trainer.exe`: the desktop app, which accepts `--seed N` for a repeatable game and `--log-dir DIR` to choose where logs go
 - `build\Release\poker_cli.exe`: a headless test harness for the engine, with `--games N`, `--seed S` and `--verbose`
 
-It also builds developer tools: `advisor_bench` (scores the advisor against the solver on the spots in `tools/bench`), `solver_cli` (runs a single solve), and the generators for the preflop equity and push/fold tables.
+It also builds developer tools: `advisor_bench` (scores the advisor against the solver on the spots in `tools/bench`), `advisor_matchup` (plays the player-type advice lines against the bots), `solver_cli` (runs a single solve), and the generators for the preflop equity and push/fold tables.
 
 On Linux, install the X11 and OpenGL development packages (for example `libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev`), configure with `-DGLFW_BUILD_WAYLAND=OFF -DCMAKE_BUILD_TYPE=Release`, and run the tests under `xvfb-run` if there's no display. Windows is the supported platform; Linux is used for development and testing.
 
@@ -129,7 +129,7 @@ The game logic knows nothing about the GUI. The app talks to it only through `IG
 | `src/logging` | Hand history and session loggers |
 | `src/controller` | `IGameController`, the local game loop and the background solver service |
 | `src/app` | Dear ImGui front end |
-| `tools` | Command-line test harness, advisor bench, solver CLI and table generators |
+| `tools` | Command-line test harness, advisor bench and matchups, solver CLI and table generators |
 | `docs` | Advisor upgrade decision log |
 | `tests` | GoogleTest suite |
 

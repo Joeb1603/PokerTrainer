@@ -21,6 +21,7 @@
 //   --solver-tier TIER      Use off, river, turn or flop instead of the detected tier
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -139,6 +140,26 @@ std::optional<poker::Archetype> parse_archetype(std::string_view text) {
     return std::nullopt;
 }
 
+// "A,B" or "AxB": two decimal numbers around `separator` and nothing else. Parsed
+// with strtod rather than sscanf, which MSVC deprecates (C4996).
+std::optional<std::pair<double, double>> parse_pair(const char* text, char separator) {
+    const auto number = [](const char*& at) -> std::optional<double> {
+        if (*at == '\0' || *at == ' ' || (at[0] == '0' && (at[1] == 'x' || at[1] == 'X'))) return std::nullopt;
+        char* end = nullptr;
+        const double value = std::strtod(at, &end);
+        if (end == at || !std::isfinite(value)) return std::nullopt;
+        at = end;
+        return value;
+    };
+    const char* at = text;
+    const auto first = number(at);
+    if (!first || *at != separator) return std::nullopt;
+    ++at;
+    const auto second = number(at);
+    if (!second || *at != '\0') return std::nullopt;
+    return std::pair{*first, *second};
+}
+
 // Reads the back buffer before it is swapped, flipped to top-down rows.
 void save_screenshot(const std::filesystem::path& path, int width, int height) {
     std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3);
@@ -217,15 +238,16 @@ std::optional<Arguments> parse_arguments(int argc, char** argv) {
             if (!type) return std::nullopt;
             arguments.advice = *type;
         } else if (arg == "--hover" && i + 1 < argc) {
-            double x = 0.0;
-            double y = 0.0;
-            if (std::sscanf(argv[++i], "%lf,%lf", &x, &y) != 2) return std::nullopt;
-            arguments.hover = std::pair{x, y};
+            arguments.hover = parse_pair(argv[++i], ',');
+            if (!arguments.hover) return std::nullopt;
         } else if (arg == "--size" && i + 1 < argc) {
-            if (std::sscanf(argv[++i], "%dx%d", &arguments.width, &arguments.height) != 2 || arguments.width < 1180 ||
-                arguments.height < 760) {
+            const auto size = parse_pair(argv[++i], 'x');
+            if (!size || size->first < 1180.0 || size->second < 760.0 || size->first > 16384.0 || size->second > 16384.0 ||
+                size->first != std::floor(size->first) || size->second != std::floor(size->second)) {
                 return std::nullopt;
             }
+            arguments.width = static_cast<int>(size->first);
+            arguments.height = static_cast<int>(size->second);
         } else if (arg == "--screenshot" && i + 1 < argc) {
             arguments.screenshot = argv[++i];
         } else if (arg == "--solver") {
