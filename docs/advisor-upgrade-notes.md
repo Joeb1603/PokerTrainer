@@ -867,6 +867,42 @@ Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the
 
 **Tests:** 453 pass in Release (7.8 s) and Debug (30.3 s), 447 + 6 new; GCC Release/Debug and clang build with zero warnings; `strict.sh` is clean on `preflop_charts.cpp`, `advisor_charts.cpp`, `training_advisor.cpp` and `range_model.cpp`. Each new test takes at most 0.14 s in Release (0.35 s in Debug).
 
+### Stage 7 (UI for player-type advice and tooltips), uncommitted, on top of `886a46f`
+
+**What it adds:** an "Advice:" selector in the sidebar, the selected line in the advisor panel, tooltips, and Play GTO following the selection. UI only: no change to the engine, bots, advisor, snapshot or JSONL schema. The UI still reads only `IGameController` and `TableSnapshot` (`hint.versus`), and no seat is labelled with a type, so the Shifter stays hidden.
+
+**Sidebar**
+- New Session and the Training Advisor toggle are where they were (`kNewSession`, `kAdvisorToggle` unchanged). The rest of the toggle's row is left free for stage 8's "Solver mode" checkbox; nothing is drawn there yet.
+- Under it, "Advice:" with radio buttons in two rows of two (Baseline, Nit / Station, Maniac). One row of four does not fit 340 px at either font (about 385 px with the app's 16 px font and 341 px with the tests' 13 px one). The second column's x is computed from the widest label, so it holds at any scale. The selection is UI state (`TrainerUi::advice_focus_`, default Baseline, `set_advice_focus` for the `--advice` flag).
+- Tooltips (wrapped at 25 font sizes):
+  - "Advice:": "Advice as if every opponent played like this type. A generic type, not a read on any seat."
+  - Baseline: "Baseline: a solid regular. The default advice, and what mistakes are judged on."
+  - Nit: "Nit: plays few hands, folds too much and rarely bluffs. Steal and bluff more; give its bets and raises credit."
+  - Station: "Calling station: calls too much, rarely raises or bluffs. Value bet thinner and bigger; don't bluff."
+  - Maniac: "Maniac: bets, raises and bluffs too much. Call down lighter and let it bluff; bluff less yourself."
+
+**Advisor panel** (with an archetype selected, else Baseline as before)
+- Heading in the accent colour: "Vs Nit: BET 20 (minimum)"; its tooltip is the line's `why`. Underneath, muted, "Baseline: CHECK" when the actions differ. The `why` is also shown under the action while at least 560 px (scaled) of the sidebar is left, so the action log keeps room: shown at 1360x860, hidden at 1180x760. If the selected line is missing (`versus` empty), a muted "No Nit line here; showing Baseline." and the Baseline panel.
+- Stats: Equity is the line's (or Baseline's) `range_equity_pct`, with the tooltip "vs estimated range X% / vs random hand Y%" (Y = `equity_pct`); then Pot odds, MDF, SPR.
+- Rationale: Baseline's. With a line selected it is muted and prefixed "Baseline: ".
+- EV table from the selected line's `ev` (Baseline: `hint.ev`). Each raise row (name and value) has the tooltip "Folds F%, raises R%, you have E% when called" from the same line's `outcomes`, rounded to whole percent; rows without an outcome have none. EVs round before printing, so a small negative no longer shows "-0".
+- "Versus types": a two-column table of Nit / Station / Maniac and each best action, each row's tooltip its `why`. The selected line's row is highlighted and its action in the accent colour; clicking a row selects that line. Absent when there are no lines.
+- Disclaimer: "Heuristic EVs vs assumed ranges, with a rule for bet size. Not solver output."
+- Mistake lines: unchanged text plus " (judged vs Baseline)".
+
+**Play GTO** (console row 3): Baseline unchanged ("Play GTO: X", plays `hint.action`). With an archetype selected and its line present: "Play vs Nit: X", playing that line's `action`. Advisor hidden: "Play GTO" or "Play vs Nit", no action named, still playing the selected line. Missing line: Baseline.
+
+**Developer flags** (`main.cpp`, one line in CLAUDE.md section 9): `--advice TYPE`, `--hover X,Y` (an ImGui mouse event after the GLFW backend's, each frame), `--size WxH` (at least the 1180x760 minimum), `--screenshot PATH` (reads the back buffer with `glReadPixels` on the last frame, before the swap, and writes an RGB PNG). The PNG writer is `src/app/screenshot.{h,cpp}` in the `trainer_ui` library: stored (uncompressed) deflate blocks, CRC-32 and Adler-32 by hand, no new dependency. OpenGL works under Xvfb here (Mesa), about 2.7 s for 300 frames.
+
+**Screenshots** (seed 1, `--auto-shove --stop-on flop --exit-after-frames 300`; Hero HJ with 54o on AhKcKd, checked to):
+- `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_flop.png`: Baseline, 1360x860.
+- `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_flop_nit.png`: Nit selected ("Vs Nit: BET 20 (minimum)", "Baseline: CHECK", the `why` under it, the Nit row highlighted, "Play vs Nit: BET 20 (minimum)").
+- `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_min_nit.png`: Nit at 1180x760 (the `why` moves to the tooltip only; the action log keeps two lines with a flagged preflop mistake shown).
+- `/tmp/claude-0/-home-user-PokerTrainer/8294d61f-d1fd-5cf5-8ef1-e41501b16899/scratchpad/ui_tip_station.png`, `ui_tip_equity.png`, `ui_tip_ev.png` (same folder): the Station radio, Equity and Raise 25% tooltips; `tips_crop.png` puts their sidebars side by side.
+- Fixed after looking: the first layout put all four radios on one row with wrapping, which left Maniac alone on a second row; now a 2x2 grid. The Equity tooltip wrapped its last number onto a second line at 22 font sizes; now 25. The "-0" EV. Nothing overlaps or runs past the sidebar at either size; tooltips cover the panel below them while shown, as ImGui's do.
+
+**Tests:** 462 pass in Release (7.8 s) and Debug (30.8 s), 453 + 9 new; GCC Release/Debug and clang build with zero warnings; `strict.sh` is clean on `trainer_ui.cpp`, `main.cpp`, `screenshot.cpp`, `trainer_ui_test.cpp` and `screenshot_test.cpp` (four pre-existing sign-conversion warnings in `trainer_ui.cpp` and `trainer_ui_test.cpp` fixed with casts).
+
 ## Unverified
 
 - MSVC `/W4` builds and the Windows executable.
@@ -899,6 +935,9 @@ Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the
 - Stage 6 follow-ups: the 3.5x out-of-position standard 3-bet was chosen from the tables' stated size; the bench was checked at 3.0, 3.5, 3.6 and 3.75 only, and its sensitivity there (0.69-0.76) is larger than any principled reason to prefer one of them.
 - Stage 6 follow-ups: the per-scenario rollout split (by chance, at least 100) was chosen for latency; the hand checks' seed spread (sd 0.9 and 2.2 chips) was measured only in the two review spots.
 - Stage 6 follow-ups: the multiway push/fold sets are rounded from mixed strategies (fix 5), up to 0.40 BB per hand for the worst classes, about 1 mBB per hand dealt; not corrected.
+
+- Stage 7: the new controls were tested with injected ImGui input and the `--hover` flag only; real GLFW mouse input, Windows fonts (Segoe UI widths) and DPI scales other than 1 were not checked. The screenshots come from Mesa under Xvfb with DejaVu Sans.
+- Stage 7: the 560 px threshold for showing the `why` under the action was chosen from the two window sizes, not from user feedback.
 
 ## Test changes
 
@@ -1017,3 +1056,9 @@ Chart shares, % of all 1326 combos (bots' table before, advisor's table now; the
     - **Reason:** the blinds defend from the advisor's tables (the BB 49% against a CO open, the SB 3-bets 10.7% and flats like the BTN), so the field is three-way about half the time.
   - `VsReraises.BotsChartsUnchanged`: extended with a 169-class snapshot of the bots' ten vs-open tables and a check of which table each hero, opener and table size (6 and 2 players) reads.
   - **New tests:** `AdvisorVsOpen.SharesAreInTheirBands` (3-bet and defend shares per table in the bands above, raise and call disjoint, the SB's call empty), `AdvisorVsOpen.NestsAndIsWiderThanTheBots`, `AdvisorVsOpen.ThreeBetsArePolarizedAndPremiumsAlwaysRaise` (plus known decisions), `RangeModel.InferredFlatsRespondToRaiseSize` (flats of 2, 2.5 and 3 BB opens equal the predicted call ranges, the 2 BB flat wider and containing the standard one; the BTN's flat of a 3.5x SB 3-bet is the ratio-1 answer; `standard_preflop_raise_to` values), `Advisor.PlayersBehindWhoFoldHoldTheirFoldParts` (the AQo call within 2 chips of a reference rebuilt from public functions with 60,000 rollouts per scenario, +21.2 against +21.8, and that reference more than 2 chips above the same with folders dealt from their call ranges, +18.8), and `Advisor.DeepJamIntoAShortStackHasNoChartPrior`.
+
+- **Stage 7** (`tests/trainer_ui_test.cpp`, new `tests/screenshot_test.cpp`):
+  - No existing assertion changed. The Play GTO tests stay on Baseline (the default) and pass unchanged.
+  - `EveryScreenDrawsWithFullData`: also sets `range_equity_pct`, `equity_pct`, outcomes for every raise row and three lines (140-character `why`s), and draws each phase with each of the four selections.
+  - New constants `kAdviceBaseline` {1095, 120}, `kAdviceNit` {1182, 120}, `kAdviceStation` {1095, 143}, `kAdviceManiac` {1182, 143} and `kVersusStation` {1040, 314} (with `set_lines()`'s one-line rationale), measured by scanning hovered IDs; helpers `sidebar_item_is` and `set_lines`.
+  - **New tests:** `PlayGtoFollowsTheSelectedLine` (each radio, then Play GTO plays that line's action, Baseline again at the end), `PlayVsLabelNamesTheArchetype` (labels per line, and "Play vs Station" with the advisor hidden still plays it), `PlayGtoFallsBackToBaselineWithoutLines`, `VersusRowSelectsItsLine`, `ExistingSidebarButtonsDidNotMove` (New Session, the toggle and the four radios hit their own IDs at the constants; New Session and the toggle still act), `TooltipAppearsOnHover` (30 frames at 1/60 s over the table: no `##Tooltip_00`; over Station: active this frame), `Screenshot.ChecksumsMatchKnownValues`, `Screenshot.TinyImageHasTheExactLayout`, `Screenshot.LargeImagesSplitIntoStoredBlocks`.

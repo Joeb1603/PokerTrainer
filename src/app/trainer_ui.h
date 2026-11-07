@@ -25,13 +25,22 @@ public:
     // Call once a frame, between ImGui::NewFrame and ImGui::Render.
     void draw();
 
+    // Which line the advisor panel and Play GTO follow (the "Advice:" selector).
+    // Generic player types applied to every opponent, never a seat's identity.
+    void set_advice_focus(Archetype focus) { advice_focus_ = focus; }
+    Archetype advice_focus() const { return advice_focus_; }
+
 private:
     void draw_table(float x, float y, float w, float h);
     void draw_seat(ImDrawList* dl, const SeatSnapshot& seat, int index, const ImVec2& center, const ImVec2& table_center);
     void draw_center(ImDrawList* dl, const ImVec2& center, float table_h);
     void draw_console(float x, float y, float w, float h);
     void draw_sidebar(float x, float y, float w, float h);
+    void draw_advice_selector();
     void draw_advisor();
+    // The selected archetype line, or nullptr for Baseline (also when the hint has
+    // no lines, so the advice falls back to Baseline).
+    const AdviceLine* selected_line(const HintRecommendation& hint) const;
     void draw_action_log();
     void handle_shortcuts();
 
@@ -43,6 +52,7 @@ private:
 
     // Off keeps the advice hidden, including from the Play GTO button.
     bool show_advisor_ = true;
+    Archetype advice_focus_ = Archetype::Baseline;  // UI-only state
     int raise_to_ = 0;
     // Identifies the current decision, so the slider resets once for each one.
     std::pair<int, std::size_t> raise_key_{-1, 0};

@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 
 #include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <imgui.h>
@@ -34,6 +36,13 @@ constexpr ImVec2 kPlayGto{100.0f, kConsoleTop + 88.0f};
 constexpr ImVec2 kFoldEarly{100.0f, kConsoleTop + 27.0f};
 constexpr ImVec2 kReveal{356.0f, kConsoleTop + 27.0f};  // Right of Next Hand
 constexpr ImVec2 kAdvisorToggle{1037.0f, 97.0f};
+// The "Advice:" selector under the advisor toggle: two rows of two radio buttons.
+constexpr ImVec2 kAdviceBaseline{1095.0f, 120.0f};
+constexpr ImVec2 kAdviceNit{1182.0f, 120.0f};
+constexpr ImVec2 kAdviceStation{1095.0f, 143.0f};
+constexpr ImVec2 kAdviceManiac{1182.0f, 143.0f};
+// The "Versus types" Station row, with set_lines()'s hint (its one-line rationale).
+constexpr ImVec2 kVersusStation{1040.0f, 314.0f};
 
 std::uint8_t mask_of(std::initializer_list<ActionType> types) {
     std::uint8_t mask = 0;
@@ -88,7 +97,7 @@ protected:
 
         fake_.table.small_blind = 10;
         fake_.table.big_blind = 20;
-        for (int seat = 0; seat < kMaxSeats; ++seat) fake_.table.seats[seat].name = "Seat" + std::to_string(seat);
+        for (int seat = 0; seat < kMaxSeats; ++seat) fake_.table.seats[static_cast<std::size_t>(seat)].name = "Seat" + std::to_string(seat);
         fake_.table.seats[kHeroSeat].stack = 1000;
         set_facing_raise();
 
@@ -145,6 +154,38 @@ protected:
         frame();
         ImGuiWindow* console = ImGui::FindWindowByName("Console");
         return console != nullptr && ImGui::GetCurrentContext()->HoveredIdPreviousFrame == console->GetID(label);
+    }
+
+    // True if the sidebar item under `pos` has this ID label.
+    bool sidebar_item_is(ImVec2 pos, const char* label) {
+        frame();
+        ImGui::GetIO().AddMousePosEvent(pos.x, pos.y);
+        frame();
+        frame();
+        ImGuiWindow* sidebar = ImGui::FindWindowByName("Sidebar");
+        return sidebar != nullptr && ImGui::GetCurrentContext()->HoveredIdPreviousFrame == sidebar->GetID(label);
+    }
+
+    // A Baseline hint plus the three archetype lines, each with a different action.
+    void set_lines() {
+        set_hint({ActionType::Raise, 500});
+        HintRecommendation& hint = *fake_.table.hint;
+        hint.rationale = "short";
+        hint.ev.fold = 0.0;
+        hint.ev.check_call = 1.0;
+        hint.ev.raise_100 = 3.0;
+        const auto line = [&](Archetype type, std::string best, Action action) {
+            AdviceLine l;
+            l.versus = type;
+            l.best_action = std::move(best);
+            l.action = action;
+            l.ev = hint.ev;
+            l.why = "why";
+            return l;
+        };
+        hint.versus = {line(Archetype::Nit, "CALL", {ActionType::Call}),
+                       line(Archetype::Station, "RAISE to 300 (50% Pot)", {ActionType::Raise, 300}),
+                       line(Archetype::Maniac, "FOLD", {ActionType::Fold})};
     }
 
     void set_hint(const Action& action) {
@@ -420,12 +461,28 @@ TEST_F(UiTest, EveryScreenDrawsWithFullData) {
     hint.ev.raise_75 = 30.0;
     hint.ev.raise_100 = 35.0;
     hint.ev.all_in = -40.0;
+    hint.equity_pct = 65.6;
+    hint.range_equity_pct = 46.8;
+    const BetOutcome outcome{45.0, 6.0, 38.0, 20.0};
+    hint.outcomes = {outcome, outcome, outcome, outcome, outcome};
+    for (std::size_t i = 0; i < hint.versus.size(); ++i) {
+        AdviceLine line;
+        line.versus = static_cast<Archetype>(i + 1);
+        line.best_action = i == 0 ? hint.best_action : "CHECK";
+        line.action = {ActionType::Check};
+        line.ev = hint.ev;
+        line.range_equity_pct = 40.0 + static_cast<double>(i);
+        line.outcomes = hint.outcomes;
+        line.why.clear();
+        while (line.why.size() < 140) line.why += "word ";  // The longest a why can be
+        hint.versus[i] = line;
+    }
     t.hint = hint;
 
     const Card ace(Rank::Ace, Suit::Hearts);
     const Card two(Rank::Two, Suit::Diamonds);
     for (int seat = 0; seat < kMaxSeats; ++seat) {
-        SeatSnapshot& s = t.seats[seat];
+        SeatSnapshot& s = t.seats[static_cast<std::size_t>(seat)];
         s.position = static_cast<Position>(seat);
         s.holds_cards = seat != 1;
         s.street_bet = seat * 10;
@@ -441,7 +498,95 @@ TEST_F(UiTest, EveryScreenDrawsWithFullData) {
                                         ControllerPhase::HandComplete, ControllerPhase::SessionOver}) {
         t.phase = phase;
         t.waiting_on = "Nit";
-        for (int i = 0; i < 3; ++i) frame();
+        for (int focus = 0; focus < kArchetypeCount; ++focus) {
+            ui_->set_advice_focus(static_cast<Archetype>(focus));
+            for (int i = 0; i < 3; ++i) frame();
+        }
     }
     EXPECT_GT(ImGui::GetDrawData()->TotalVtxCount, 0);
+}
+
+
+TEST_F(UiTest, PlayGtoFollowsTheSelectedLine) {
+    set_lines();
+    click(kAdviceStation);
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Raise, 300);
+
+    fake_.submitted.clear();
+    click(kAdviceNit);
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Call);
+
+    fake_.submitted.clear();
+    click(kAdviceManiac);
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Fold);
+
+    fake_.submitted.clear();
+    click(kAdviceBaseline);
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Raise, 500);
+}
+
+TEST_F(UiTest, PlayVsLabelNamesTheArchetype) {
+    set_lines();
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: RAISE to 500 (100% Pot)"));
+    click(kAdviceNit);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play vs Nit: CALL"));
+    click(kAdviceStation);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play vs Station: RAISE to 300 (50% Pot)"));
+
+    click(kAdvisorToggle);  // Hidden advice: the label names no action, the line still plays
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play vs Station"));
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Raise, 300);
+}
+
+TEST_F(UiTest, PlayGtoFallsBackToBaselineWithoutLines) {
+    set_hint({ActionType::Raise, 500});  // No archetype lines
+    click(kAdviceManiac);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO: RAISE to 500 (100% Pot)"));
+    click(kPlayGto);
+    expect_single_action(fake_, ActionType::Raise, 500);
+}
+
+TEST_F(UiTest, VersusRowSelectsItsLine) {
+    set_lines();
+    click(kVersusStation);
+    EXPECT_TRUE(fake_.submitted.empty());
+    EXPECT_EQ(ui_->advice_focus(), Archetype::Station);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play vs Station: RAISE to 300 (50% Pot)"));
+}
+
+TEST_F(UiTest, ExistingSidebarButtonsDidNotMove) {
+    set_lines();
+    EXPECT_TRUE(sidebar_item_is(kNewSession, "New Session / Reset Freezeout"));
+    EXPECT_TRUE(sidebar_item_is(kAdvisorToggle, "Training Advisor"));
+    EXPECT_TRUE(sidebar_item_is(kAdviceBaseline, "Baseline"));
+    EXPECT_TRUE(sidebar_item_is(kAdviceNit, "Nit"));
+    EXPECT_TRUE(sidebar_item_is(kAdviceStation, "Station"));
+    EXPECT_TRUE(sidebar_item_is(kAdviceManiac, "Maniac"));
+
+    click(kNewSession);
+    EXPECT_EQ(fake_.new_session_calls, 1);
+    click(kAdvisorToggle);
+    EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO"));
+    EXPECT_TRUE(fake_.submitted.empty());
+}
+
+TEST_F(UiTest, TooltipAppearsOnHover) {
+    set_lines();
+    const auto tooltip_shown = [] {
+        ImGuiWindow* tooltip = ImGui::FindWindowByName("##Tooltip_00");
+        return tooltip != nullptr && tooltip->LastFrameActive == ImGui::GetFrameCount();
+    };
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(700.0f, 400.0f);  // Over the table: no tooltip
+    for (int i = 0; i < 30; ++i) frame();
+    EXPECT_FALSE(tooltip_shown());
+
+    io.AddMousePosEvent(kAdviceStation.x, kAdviceStation.y);
+    for (int i = 0; i < 30; ++i) frame();
+    EXPECT_TRUE(tooltip_shown());
 }

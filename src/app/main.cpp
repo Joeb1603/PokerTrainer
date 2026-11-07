@@ -11,7 +11,13 @@
 //                           pots), showdown, flop (Hero to act with a board), or bust
 //   --reveal                With --auto-shove, reveal the bots' hands at the held screen
 //   --bot-delay MS          Start with this bot delay, to hold a "waiting" screen
+//   --advice TYPE           Start the "Advice:" selector on baseline, nit, station or maniac
+//   --hover X,Y             Hold the ImGui mouse at window point X,Y, to show a tooltip
+//   --size WxH              Open the window at this size (unscaled), e.g. the 1180x760 minimum
+//   --screenshot PATH       Save the last frame as a PNG (with --exit-after-frames, or
+//                           when the window is closed)
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +27,8 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -33,6 +41,7 @@
 #include <windows.h>
 #endif
 
+#include "app/screenshot.h"
 #include "app/trainer_ui.h"
 #include "controller/local_game_controller.h"
 
@@ -99,7 +108,37 @@ struct Arguments {
     bool reveal = false;
     std::optional<double> bot_delay_ms;
     std::string stop_on;
+    poker::Archetype advice = poker::Archetype::Baseline;
+    std::optional<std::pair<double, double>> hover;
+    std::optional<std::filesystem::path> screenshot;
+    int width = 1360;
+    int height = 860;
 };
+
+std::optional<poker::Archetype> parse_archetype(std::string_view text) {
+    for (int i = 0; i < poker::kArchetypeCount; ++i) {
+        const auto type = static_cast<poker::Archetype>(i);
+        std::string name(poker::to_string(type));
+        for (char& c : name) c = static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+        if (name == text) return type;
+    }
+    return std::nullopt;
+}
+
+// Reads the back buffer before it is swapped, flipped to top-down rows.
+void save_screenshot(const std::filesystem::path& path, int width, int height) {
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+    const std::size_t row = static_cast<std::size_t>(width) * 3;
+    std::vector<std::uint8_t> flipped(pixels.size());
+    for (std::size_t y = 0; y < static_cast<std::size_t>(height); ++y) {
+        std::copy_n(pixels.begin() + static_cast<std::ptrdiff_t>((static_cast<std::size_t>(height) - 1 - y) * row), row,
+                    flipped.begin() + static_cast<std::ptrdiff_t>(y * row));
+    }
+    const std::string error = poker::write_png_rgb(path, width, height, flipped);
+    if (!error.empty()) std::fprintf(stderr, "Screenshot failed: %s\n", error.c_str());
+}
 
 // Developer autoplay, for reaching rare screens unattended. Returns nothing to do once
 // the requested screen is up, so it stays there.
@@ -159,6 +198,22 @@ std::optional<Arguments> parse_arguments(int argc, char** argv) {
             arguments.bot_delay_ms = std::strtod(argv[++i], nullptr);
         } else if (arg == "--stop-on" && i + 1 < argc) {
             arguments.stop_on = argv[++i];
+        } else if (arg == "--advice" && i + 1 < argc) {
+            const auto type = parse_archetype(argv[++i]);
+            if (!type) return std::nullopt;
+            arguments.advice = *type;
+        } else if (arg == "--hover" && i + 1 < argc) {
+            double x = 0.0;
+            double y = 0.0;
+            if (std::sscanf(argv[++i], "%lf,%lf", &x, &y) != 2) return std::nullopt;
+            arguments.hover = std::pair{x, y};
+        } else if (arg == "--size" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%dx%d", &arguments.width, &arguments.height) != 2 || arguments.width < 1180 ||
+                arguments.height < 760) {
+                return std::nullopt;
+            }
+        } else if (arg == "--screenshot" && i + 1 < argc) {
+            arguments.screenshot = argv[++i];
         } else {
             return std::nullopt;
         }
@@ -180,7 +235,8 @@ int run(const Arguments& arguments) {
     glfwGetMonitorContentScale(glfwGetPrimaryMonitor(), &scale_x, &scale_y);
     const float scale = scale_x > 0.0f ? scale_x : 1.0f;
 
-    GLFWwindow* window = glfwCreateWindow(static_cast<int>(1360 * scale), static_cast<int>(860 * scale),
+    GLFWwindow* window = glfwCreateWindow(static_cast<int>(static_cast<float>(arguments.width) * scale),
+                                          static_cast<int>(static_cast<float>(arguments.height) * scale),
                                           "Poker Trainer", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
@@ -211,16 +267,23 @@ int run(const Arguments& arguments) {
         if (arguments.bot_delay_ms) options.bot_delay_ms = *arguments.bot_delay_ms;
         poker::LocalGameController controller(options);
         poker::TrainerUi ui(controller, fonts, scale);
+        ui.set_advice_focus(arguments.advice);
 
         long frames = 0;
-        while (!glfwWindowShouldClose(window)) {
+        bool last_frame = false;
+        while (!last_frame) {
             glfwPollEvents();
+            last_frame = glfwWindowShouldClose(window) != 0 ||
+                         (arguments.exit_after_frames && frames + 1 >= *arguments.exit_after_frames);
             controller.tick(static_cast<double>(io.DeltaTime) * 1000.0);
 
             if (arguments.auto_shove) auto_play(controller, arguments);
 
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplGlfw_NewFrame();
+            if (arguments.hover) {  // After the backend's own mouse update, so this one wins
+                io.AddMousePosEvent(static_cast<float>(arguments.hover->first), static_cast<float>(arguments.hover->second));
+            }
             ImGui::NewFrame();
             ui.draw();
             ImGui::Render();
@@ -232,9 +295,9 @@ int run(const Arguments& arguments) {
             glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT);
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            if (last_frame && arguments.screenshot) save_screenshot(*arguments.screenshot, width, height);
             glfwSwapBuffers(window);
-
-            if (arguments.exit_after_frames && ++frames >= *arguments.exit_after_frames) break;
+            ++frames;
         }
     } catch (const std::exception& error) {
         report_fatal(std::string("Poker Trainer stopped: ") + error.what());
@@ -254,7 +317,7 @@ int run(const Arguments& arguments) {
 int main(int argc, char** argv) {
     const auto arguments = parse_arguments(argc, argv);
     if (!arguments) {
-        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT] [--reveal] [--bot-delay MS]");
+        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT] [--reveal] [--bot-delay MS] [--advice TYPE] [--hover X,Y] [--size WxH] [--screenshot PATH]");
         return 2;
     }
     return run(*arguments);

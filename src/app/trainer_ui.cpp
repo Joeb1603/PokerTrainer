@@ -1,6 +1,7 @@
 #include "app/trainer_ui.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -147,7 +148,7 @@ std::string pot_eligibility_text(const Pot& pot, const TableSnapshot& s) {
     std::string text;
     for (std::size_t i = 0; i < pot.eligible.size(); ++i) {
         if (i > 0) text += ", ";
-        text += s.seats[pot.eligible[i]].name;
+        text += s.seats[static_cast<std::size_t>(pot.eligible[i])].name;
     }
     return text;
 }
@@ -187,6 +188,38 @@ void begin_fixed(const char* name, float x, float y, float w, float h, ImGuiWind
     ImGui::SetNextWindowSize({w, h});
     ImGui::Begin(name, nullptr, kFixedWindow | extra);
 }
+
+// A tooltip for the last item that wraps, for sentences longer than a line.
+void wrapped_tooltip(const char* text) {
+    if (ImGui::BeginItemTooltip()) {
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 25.0f);
+        ImGui::TextUnformatted(text);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+// The "Advice:" choices: generic player types, assumed for every opponent at once.
+struct AdviceChoice {
+    Archetype type;
+    const char* label;
+    const char* tip;
+};
+
+constexpr std::array<AdviceChoice, kArchetypeCount> kAdviceChoices{{
+    {Archetype::Baseline, "Baseline", "Baseline: a solid regular. The default advice, and what mistakes are judged on."},
+    {Archetype::Nit, "Nit",
+     "Nit: plays few hands, folds too much and rarely bluffs. Steal and bluff more; give its bets and raises credit."},
+    {Archetype::Station, "Station",
+     "Calling station: calls too much, rarely raises or bluffs. Value bet thinner and bigger; don't bluff."},
+    {Archetype::Maniac, "Maniac",
+     "Maniac: bets, raises and bluffs too much. Call down lighter and let it bluff; bluff less yourself."},
+}};
+
+constexpr const char* kAdviceHelp =
+    "Advice as if every opponent played like this type. A generic type, not a read on any seat.";
+
+std::string label_of(Archetype type) { return std::string(to_string(type)); }
 
 }  // namespace
 
@@ -239,7 +272,7 @@ void TrainerUi::draw_table(float x, float y, float w, float h) {
     for (int seat = 0; seat < kMaxSeats; ++seat) {
         const float angle = kPi * 0.5f + static_cast<float>(seat) * kPi / 3.0f;
         const ImVec2 seat_center{center.x + std::cos(angle) * radius_x, center.y + std::sin(angle) * radius_y};
-        draw_seat(dl, s.seats[seat], seat, seat_center, center);
+        draw_seat(dl, s.seats[static_cast<std::size_t>(seat)], seat, seat_center, center);
     }
 
     draw_center(dl, center, table_h);
@@ -523,8 +556,12 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
         ImGui::EndDisabled();
 
         if (s.hint) {
-            const std::string gto_label = show_advisor_ ? "Play GTO: " + s.hint->best_action : "Play GTO";
-            if (ImGui::Button(gto_label.c_str(), {u(420.0f), u(30.0f)})) chosen = s.hint->action;
+            // Follows the "Advice:" selector; Baseline when no line is selected or available.
+            const AdviceLine* line = selected_line(*s.hint);
+            const std::string name = line ? "Play vs " + label_of(line->versus) : "Play GTO";
+            const std::string& best = line ? line->best_action : s.hint->best_action;
+            const std::string gto_label = show_advisor_ ? name + ": " + best : name;
+            if (ImGui::Button(gto_label.c_str(), {u(420.0f), u(30.0f)})) chosen = line ? line->action : s.hint->action;
         }
 
         if (chosen) (void)controller_.submit_hero_action(*chosen);
@@ -561,6 +598,8 @@ void TrainerUi::draw_sidebar(float x, float y, float w, float h) {
     }
     ImGui::EndDisabled();
     ImGui::Checkbox("Training Advisor", &show_advisor_);
+    // The rest of this row is kept free for the solver-mode checkbox (stage 8).
+    draw_advice_selector();
     ImGui::Separator();
 
     if (show_advisor_) draw_advisor();
@@ -568,47 +607,153 @@ void TrainerUi::draw_sidebar(float x, float y, float w, float h) {
     ImGui::End();
 }
 
+void TrainerUi::draw_advice_selector() {
+    // Two rows of two, in columns: one row of four does not fit the sidebar.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const auto radio_width = [&](const char* label) {
+        return ImGui::GetFrameHeight() + style.ItemInnerSpacing.x + ImGui::CalcTextSize(label).x;
+    };
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Advice:");
+    wrapped_tooltip(kAdviceHelp);
+    ImGui::SameLine();
+    const float first_column = ImGui::GetCursorPosX();
+    const float second_column = first_column + std::max(radio_width(kAdviceChoices[0].label), radio_width(kAdviceChoices[2].label)) +
+                                style.ItemSpacing.x;
+
+    for (std::size_t i = 0; i < kAdviceChoices.size(); ++i) {
+        const AdviceChoice& choice = kAdviceChoices[i];
+        if (i % 2 == 1) {
+            ImGui::SameLine(second_column);
+        } else if (i > 0) {
+            ImGui::SetCursorPosX(first_column);
+        }
+        if (ImGui::RadioButton(choice.label, advice_focus_ == choice.type)) advice_focus_ = choice.type;
+        wrapped_tooltip(choice.tip);
+    }
+}
+
+const AdviceLine* TrainerUi::selected_line(const HintRecommendation& hint) const {
+    if (advice_focus_ == Archetype::Baseline) return nullptr;
+    for (const std::optional<AdviceLine>& line : hint.versus) {
+        if (line && line->versus == advice_focus_) return &*line;
+    }
+    return nullptr;
+}
+
 void TrainerUi::draw_advisor() {
     const TableSnapshot& s = controller_.snapshot();
     if (s.hint) {
         const HintRecommendation& hint = *s.hint;
-        ImGui::PushFont(fonts_.bold);
-        ImGui::TextColored(kAccentText, "%s", hint.best_action.c_str());
-        ImGui::PopFont();
+        const AdviceLine* line = selected_line(hint);
 
+        // The selected line's action, with Baseline's underneath when they differ.
+        const std::string heading = line ? "Vs " + label_of(line->versus) + ": " + line->best_action : hint.best_action;
+        ImGui::PushFont(fonts_.bold);
+        ImGui::PushStyleColor(ImGuiCol_Text, kAccentText);
+        ImGui::TextWrapped("%s", heading.c_str());
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+        if (line) {
+            wrapped_tooltip(line->why.c_str());
+            if (line->best_action != hint.best_action) {
+                ImGui::TextColored(kMutedText, "Baseline: %s", hint.best_action.c_str());
+            }
+            // Also under the action, unless that would squeeze the action log too much.
+            if (ImGui::GetContentRegionAvail().y >= u(560.0f)) ImGui::TextWrapped("%s", line->why.c_str());
+        } else if (advice_focus_ != Archetype::Baseline) {
+            ImGui::TextColored(kMutedText, "No %s line here; showing Baseline.", label_of(advice_focus_).c_str());
+        }
+
+        const double range_equity = line ? line->range_equity_pct : hint.range_equity_pct;
         if (ImGui::BeginTable("##hint", 4, ImGuiTableFlags_SizingStretchSame)) {
             const auto stat = [](const char* name, double value, const char* format) {
                 ImGui::TableNextColumn();
+                ImGui::BeginGroup();
                 ImGui::TextColored(kMutedText, "%s", name);
                 ImGui::Text(format, value);
+                ImGui::EndGroup();
             };
-            stat("Equity", hint.equity_pct, "%.1f%%");
+            stat("Equity", range_equity, "%.1f%%");
+            char equity_tip[96];
+            std::snprintf(equity_tip, sizeof equity_tip, "vs estimated range %.1f%% / vs random hand %.1f%%", range_equity,
+                          hint.equity_pct);
+            wrapped_tooltip(equity_tip);
             stat("Pot odds", hint.pot_odds_pct, "%.1f%%");
             stat("MDF", hint.mdf_pct, "%.1f%%");
             stat("SPR", hint.spr, "%.1f");
             ImGui::EndTable();
         }
 
-        ImGui::TextWrapped("%s", hint.rationale.c_str());
+        // Baseline's reasoning; muted when another line leads.
+        if (line) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
+            ImGui::TextWrapped("Baseline: %s", hint.rationale.c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::TextWrapped("%s", hint.rationale.c_str());
+        }
 
-        const auto ev_row = [](const char* name, const std::optional<double>& ev) {
-            if (!ev) return;
+        const EvEstimates& ev = line ? line->ev : hint.ev;
+        const std::array<std::optional<BetOutcome>, kOutcomeCount>& outcomes = line ? line->outcomes : hint.outcomes;
+        const auto ev_row = [](const char* name, const std::optional<double>& value,
+                               const std::optional<BetOutcome>* outcome) {
+            if (!value) return;
+            char tip[96] = "";
+            if (outcome && *outcome) {
+                std::snprintf(tip, sizeof tip, "Folds %.0f%%, raises %.0f%%, you have %.0f%% when called",
+                              (*outcome)->fold_pct, (*outcome)->raise_pct, (*outcome)->equity_called_pct);
+            }
             ImGui::TableNextColumn();
             ImGui::TextColored(kMutedText, "%s", name);
+            if (tip[0] != '\0') wrapped_tooltip(tip);
             ImGui::TableNextColumn();
-            ImGui::Text("%+.0f", *ev);
+            const double rounded = std::round(*value);
+            ImGui::Text("%+.0f", rounded == 0.0 ? 0.0 : rounded);  // No "-0"
+            if (tip[0] != '\0') wrapped_tooltip(tip);
         };
         if (ImGui::BeginTable("##ev", 4, ImGuiTableFlags_SizingStretchSame)) {
-            ev_row("Fold", hint.ev.fold);
-            ev_row("Chk/Call", hint.ev.check_call);
-            ev_row("Raise 25%", hint.ev.raise_25);
-            ev_row("Raise 50%", hint.ev.raise_50);
-            ev_row("Raise 75%", hint.ev.raise_75);
-            ev_row("Raise Pot", hint.ev.raise_100);
-            ev_row("All-In", hint.ev.all_in);
+            ev_row("Fold", ev.fold, nullptr);
+            ev_row("Chk/Call", ev.check_call, nullptr);
+            ev_row("Raise 25%", ev.raise_25, &outcomes[kOutcome25]);
+            ev_row("Raise 50%", ev.raise_50, &outcomes[kOutcome50]);
+            ev_row("Raise 75%", ev.raise_75, &outcomes[kOutcome75]);
+            ev_row("Raise Pot", ev.raise_100, &outcomes[kOutcome100]);
+            ev_row("All-In", ev.all_in, &outcomes[kOutcomeAllIn]);
             ImGui::EndTable();
         }
-        ImGui::TextColored(kMutedText, "Heuristic EVs, with a rule for bet size. Not solver output.");
+
+        // The three lines at a glance; clicking one selects it.
+        const bool any_line = std::any_of(hint.versus.begin(), hint.versus.end(), [](const auto& l) { return l.has_value(); });
+        if (any_line) {
+            ImGui::TextColored(kMutedText, "Versus types");
+            if (ImGui::BeginTable("##versus", 2, ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableSetupColumn("type", ImGuiTableColumnFlags_WidthFixed);
+                ImGui::TableSetupColumn("action", ImGuiTableColumnFlags_WidthStretch);
+                for (const std::optional<AdviceLine>& versus : hint.versus) {
+                    if (!versus) continue;
+                    const bool selected = advice_focus_ == versus->versus;
+                    const std::string label = label_of(versus->versus) + "##versus";
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                        advice_focus_ = versus->versus;
+                    }
+                    wrapped_tooltip(versus->why.c_str());
+                    ImGui::TableNextColumn();
+                    if (selected) {
+                        ImGui::TextColored(kAccentText, "%s", versus->best_action.c_str());
+                    } else {
+                        ImGui::TextUnformatted(versus->best_action.c_str());
+                    }
+                }
+                ImGui::EndTable();
+            }
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
+        ImGui::TextWrapped("Heuristic EVs vs assumed ranges, with a rule for bet size. Not solver output.");
+        ImGui::PopStyleColor();
     } else {
         ImGui::TextColored(kMutedText, "Hints appear when it is your turn.");
     }
@@ -616,8 +761,9 @@ void TrainerUi::draw_advisor() {
     for (const HeroMistake& mistake : s.hand_mistakes) {
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Text, kWarnText);
-        ImGui::TextWrapped("Flagged (%s): you played %s, advised %s", std::string(to_string(mistake.street)).c_str(),
-                           mistake.taken.c_str(), mistake.recommended.c_str());
+        ImGui::TextWrapped("Flagged (%s): you played %s, advised %s (judged vs Baseline)",
+                           std::string(to_string(mistake.street)).c_str(), mistake.taken.c_str(),
+                           mistake.recommended.c_str());
         ImGui::PopStyleColor();
     }
     ImGui::Separator();
