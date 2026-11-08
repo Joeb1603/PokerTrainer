@@ -217,7 +217,7 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - Commit or push only when asked. Plans often say to commit locally and not push.
 - Work directly on `main`. Don't create feature branches or pull requests, even if a session starts on another branch: switch to `main` first and push there.
 - When asked to analyze or plan, don't implement until told to go ahead.
-- **Plans** cover every task asked for, and give each task an effort level. Usage isn't a concern, so set each level as high as will help.
+- **Plans** cover every task asked for, split large tasks into subtasks where that helps, and give each task or subtask an effort level. Usage isn't a concern, so set each level as high as will help.
   - Ask all questions while planning. Once the plan is approved, the user is hands off: finish every task without stopping to ask, unless a real blocker appears.
   - Choose how to run it: in one pass, one task at a time, or with an agent per task, whichever suits the work.
 - Check poker math with real numbers before changing it, and report anything not verified.
