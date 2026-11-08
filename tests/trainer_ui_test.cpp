@@ -833,3 +833,15 @@ TEST_F(UiTest, TooltipAppearsOnHover) {
     for (int i = 0; i < 30; ++i) frame();
     EXPECT_TRUE(tooltip_shown());
 }
+
+TEST(TrainerUiText, ActionCodesReadAsAdvice) {
+    EXPECT_EQ(action_code_text("F"), "FOLD");
+    EXPECT_EQ(action_code_text("X"), "CHECK");
+    EXPECT_EQ(action_code_text("C40"), "CALL 40");
+    EXPECT_EQ(action_code_text("B60"), "BET 60");
+    EXPECT_EQ(action_code_text("R120"), "RAISE to 120");
+    EXPECT_EQ(action_code_text("A300"), "ALL-IN 300");
+    EXPECT_EQ(action_code_text("Q5"), "Q5");
+    EXPECT_EQ(action_code_text("C"), "C");
+    EXPECT_EQ(action_code_text("R1x"), "R1x");
+}

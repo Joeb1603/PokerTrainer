@@ -244,6 +244,22 @@ std::string label_of(Archetype type) { return std::string(to_string(type)); }
 
 }  // namespace
 
+std::string action_code_text(const std::string& code) {
+    if (code == "F") return "FOLD";
+    if (code == "X") return "CHECK";
+    if (code.size() < 2 || !std::all_of(code.begin() + 1, code.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        return code;
+    }
+    const std::string amount = code.substr(1);
+    switch (code[0]) {
+        case 'C': return "CALL " + amount;
+        case 'B': return "BET " + amount;
+        case 'R': return "RAISE to " + amount;
+        case 'A': return "ALL-IN " + amount;
+        default: return code;
+    }
+}
+
 TrainerUi::TrainerUi(IGameController& controller, UiFonts fonts, float scale)
     : controller_(controller), fonts_(fonts), scale_(scale) {}
 
@@ -820,7 +836,7 @@ void TrainerUi::draw_advisor_body(bool compact) {
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Text, kWarnText);
         ImGui::TextWrapped("Flagged (%s): you played %s, advised %s (judged vs Baseline)",
-                           std::string(to_string(mistake.street)).c_str(), mistake.taken.c_str(),
+                           std::string(to_string(mistake.street)).c_str(), action_code_text(mistake.taken).c_str(),
                            mistake.recommended.c_str());
         ImGui::PopStyleColor();
     }

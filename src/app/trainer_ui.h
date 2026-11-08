@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <utility>
 
 #include "controller/game_controller.h"
@@ -10,6 +11,10 @@ struct ImDrawList;
 struct ImVec2;
 
 namespace poker {
+
+// A hand-log action code ("X", "C40", "R120") in the advice's wording ("CHECK",
+// "CALL 40", "RAISE to 120"). Unknown codes come back unchanged.
+std::string action_code_text(const std::string& code);
 
 struct UiFonts {
     ImFont* regular = nullptr;
