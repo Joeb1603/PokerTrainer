@@ -1,7 +1,13 @@
 // Generates src/strategy/generated/push_fold_data.cpp: push/fold ranges for
-// effective stacks of 3 to 15 BB, blinds 0.5/1 BB, no ante.
+// effective stacks of 3 to 15 BB, blinds 0.5/1 BB, no ante; and
+// src/strategy/generated/push_fold_ante_data.cpp: the same with dead money from
+// antes (detail::kPushFoldAnteDeadBb, in BB, for the whole table).
 //
-//   gen_push_fold [--iterations N] [--threads N] [--out PATH] [--verbose]
+//   gen_push_fold [--iterations N] [--threads N] [--out PATH] [--ante-out PATH] [--verbose]
+//
+// Antes: every ante, the player's own included, is dead money D already in the
+// pot; stacks are measured after the antes. D joins every pot: the showdown pot
+// and the blinds a jam picks up when everybody folds. Nothing else changes.
 //
 // Method: fictitious play over the 169 hand classes, one game per first-in
 // position and stack. Each player's strategy is a per-class probability. Every
@@ -65,6 +71,7 @@ struct Options {
     int threads = 0;
     bool verbose = false;  // per-game convergence
     std::string out = "src/strategy/generated/push_fold_data.cpp";
+    std::string ante_out = "src/strategy/generated/push_fold_ante_data.cpp";
 };
 
 using ClassVector = std::array<double, kClasses>;
@@ -123,7 +130,8 @@ struct Result {
 
 class Game {
 public:
-    Game(const Inputs& in, int jammer, int stack_bb) : in_(in), jammer_(jammer), stack_(stack_bb) {
+    Game(const Inputs& in, int jammer, int stack_bb, double dead_bb)
+        : in_(in), jammer_(jammer), stack_(stack_bb), dead_(dead_bb) {
         for (int c = jammer + 1; c < kPositions; ++c) callers_.push_back(c);
     }
 
@@ -146,7 +154,7 @@ public:
                 value += reach * (won * pot(c) - called * stack_);
                 reach *= 1.0 - called;
             }
-            values[i] = value + reach * (1.5 - own_blind);
+            values[i] = value + reach * (1.5 + dead_ - own_blind);
         }
         return values;
     }
@@ -245,12 +253,14 @@ public:
     }
 
 private:
-    // The pot when caller c calls: both stacks plus the blinds of everybody else.
-    double pot(int caller) const { return 2.0 * stack_ + 1.5 - blind_of(jammer_) - blind_of(caller); }
+    // The pot when caller c calls: both stacks, the blinds of everybody else and
+    // the antes.
+    double pot(int caller) const { return 2.0 * stack_ + 1.5 + dead_ - blind_of(jammer_) - blind_of(caller); }
 
     const Inputs& in_;
     int jammer_;
     double stack_;
+    double dead_;
     std::vector<int> callers_;
 };
 
@@ -295,6 +305,8 @@ bool parse_args(int argc, char** argv, Options& options) {
             if (!parse_int(value, options.threads) || options.threads < 0) return false;
         } else if (arg == "--out") {
             options.out = std::string(value);
+        } else if (arg == "--ante-out") {
+            options.ante_out = std::string(value);
         } else {
             return false;
         }
@@ -313,12 +325,46 @@ void write_words(std::ostream& out, const std::array<std::uint64_t, detail::kHan
 
 std::string_view name_of(int position) { return to_string(static_cast<Position>(position)); }
 
+// The jam and call arrays' bodies for one dead-money level, at `indent`.
+template <typename ResultOf>
+void write_tables(std::ostream& out, const std::string& indent, const ResultOf& result_of, bool jam) {
+    if (jam) {
+        for (int jammer = 0; jammer < kJammers; ++jammer) {
+            out << indent << "{  // " << name_of(jammer) << '\n';
+            for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) {
+                out << indent << "    ";
+                write_words(out, bits_of(result_of(jammer, stack).jam));
+                out << ",  // " << stack << " BB\n";
+            }
+            out << indent << "},\n";
+        }
+        return;
+    }
+    for (int jammer = 0; jammer < kJammers; ++jammer) {
+        out << indent << "{  // " << name_of(jammer) << " jams\n";
+        for (int caller = 0; caller < kPositions; ++caller) {
+            if (caller <= jammer) {
+                out << indent << "    {},  // " << name_of(caller) << ": acts before the jammer\n";
+                continue;
+            }
+            out << indent << "    {  // " << name_of(caller) << " calls\n";
+            for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) {
+                out << indent << "        ";
+                write_words(out, bits_of(result_of(jammer, stack).call[static_cast<std::size_t>(caller)]));
+                out << ",  // " << stack << " BB\n";
+            }
+            out << indent << "    },\n";
+        }
+        out << indent << "},\n";
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     Options options;
     if (!parse_args(argc, argv, options)) {
-        std::cerr << "usage: gen_push_fold [--iterations N] [--threads N] [--out PATH] [--verbose]\n";
+        std::cerr << "usage: gen_push_fold [--iterations N] [--threads N] [--out PATH] [--ante-out PATH] [--verbose]\n";
         return 2;
     }
 
@@ -326,19 +372,27 @@ int main(int argc, char** argv) {
     const std::unique_ptr<const Inputs> owned_inputs = build_inputs();
     const Inputs& inputs = *owned_inputs;
 
+    // Level 0 is no ante; level a > 0 is detail::kPushFoldAnteDeadBb[a - 1].
+    constexpr int kLevels = detail::kPushFoldAnteLevels + 1;
+    const auto dead_of = [](int level) { return level == 0 ? 0.0 : detail::kPushFoldAnteDeadBb[level - 1]; };
     struct Job {
+        int level = 0;
         int jammer = 0;
         int stack = 0;
     };
     std::vector<Job> jobs;
-    for (int jammer = 0; jammer < kJammers; ++jammer) {
-        for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) jobs.push_back({jammer, stack});
+    for (int level = 0; level < kLevels; ++level) {
+        for (int jammer = 0; jammer < kJammers; ++jammer) {
+            for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) {
+                jobs.push_back({level, jammer, stack});
+            }
+        }
     }
     std::vector<Result> results(jobs.size());
     std::atomic<std::size_t> next{0};
     const auto work = [&] {
         for (std::size_t k = next.fetch_add(1); k < jobs.size(); k = next.fetch_add(1)) {
-            results[k] = Game(inputs, jobs[k].jammer, jobs[k].stack).solve(options.iterations);
+            results[k] = Game(inputs, jobs[k].jammer, jobs[k].stack, dead_of(jobs[k].level)).solve(options.iterations);
         }
     };
     int threads = options.threads;
@@ -350,9 +404,10 @@ int main(int argc, char** argv) {
         work();
     }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    const auto result_of = [&](int jammer, int stack) -> const Result& {
-        return results[static_cast<std::size_t>(jammer * kStacks + stack - kPushFoldMinStackBb)];
+    const auto result_at = [&](int level, int jammer, int stack) -> const Result& {
+        return results[static_cast<std::size_t>((level * kJammers + jammer) * kStacks + stack - kPushFoldMinStackBb)];
     };
+    const auto result_of = [&](int jammer, int stack) -> const Result& { return result_at(0, jammer, stack); };
 
     std::ofstream out(options.out);
     if (!out) {
@@ -367,38 +422,47 @@ int main(int argc, char** argv) {
         << "namespace poker::detail {\n\n"
         << "const int kPushFoldIterations = " << options.iterations << ";\n\n"
         << "const std::uint64_t kPushFoldJam[kPushFoldJammerCount][kPushFoldStackCount][kHandSetWords] = {\n";
-    for (int jammer = 0; jammer < kJammers; ++jammer) {
-        out << "    {  // " << name_of(jammer) << '\n';
-        for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) {
-            out << "        ";
-            write_words(out, bits_of(result_of(jammer, stack).jam));
-            out << ",  // " << stack << " BB\n";
-        }
-        out << "    },\n";
-    }
+    write_tables(out, "    ", result_of, true);
     out << "};\n\n"
         << "const std::uint64_t kPushFoldCall[kPushFoldJammerCount][kPushFoldPositionCount][kPushFoldStackCount]\n"
         << "                                 [kHandSetWords] = {\n";
-    for (int jammer = 0; jammer < kJammers; ++jammer) {
-        out << "    {  // " << name_of(jammer) << " jams\n";
-        for (int caller = 0; caller < kPositions; ++caller) {
-            if (caller <= jammer) {
-                out << "        {},  // " << name_of(caller) << ": acts before the jammer\n";
-                continue;
-            }
-            out << "        {  // " << name_of(caller) << " calls\n";
-            for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) {
-                out << "            ";
-                write_words(out, bits_of(result_of(jammer, stack).call[static_cast<std::size_t>(caller)]));
-                out << ",  // " << stack << " BB\n";
-            }
-            out << "        },\n";
-        }
-        out << "    },\n";
-    }
+    write_tables(out, "    ", result_of, false);
     out << "};\n\n}  // namespace poker::detail\n";
     if (!out) {
         std::cerr << "write failed: " << options.out << '\n';
+        return 1;
+    }
+
+    std::ofstream ante(options.ante_out);
+    if (!ante) {
+        std::cerr << "cannot write " << options.ante_out << '\n';
+        return 1;
+    }
+    ante << "// Generated by tools/gen_push_fold.cpp --iterations " << options.iterations
+         << " (fictitious play, blinds 0.5/1 BB, antes as dead money). Do not edit.\n"
+         << "// As push_fold_data.cpp, for each dead-money level in kPushFoldAnteDeadBb.\n"
+         << "#include \"strategy/push_fold.h\"\n\n"
+         << "namespace poker::detail {\n\n"
+         << "const std::uint64_t kPushFoldAnteJam[kPushFoldAnteLevels][kPushFoldJammerCount][kPushFoldStackCount]\n"
+         << "                                    [kHandSetWords] = {\n";
+    for (int level = 1; level < kLevels; ++level) {
+        ante << "    {  // " << dead_of(level) << " BB dead\n";
+        write_tables(ante, "        ", [&](int jammer, int stack) -> const Result& { return result_at(level, jammer, stack); },
+                     true);
+        ante << "    },\n";
+    }
+    ante << "};\n\n"
+         << "const std::uint64_t kPushFoldAnteCall[kPushFoldAnteLevels][kPushFoldJammerCount][kPushFoldPositionCount]\n"
+         << "                                     [kPushFoldStackCount][kHandSetWords] = {\n";
+    for (int level = 1; level < kLevels; ++level) {
+        ante << "    {  // " << dead_of(level) << " BB dead\n";
+        write_tables(ante, "        ", [&](int jammer, int stack) -> const Result& { return result_at(level, jammer, stack); },
+                     false);
+        ante << "    },\n";
+    }
+    ante << "};\n\n}  // namespace poker::detail\n";
+    if (!ante) {
+        std::cerr << "write failed: " << options.ante_out << '\n';
         return 1;
     }
 
@@ -411,17 +475,20 @@ int main(int argc, char** argv) {
         worst_mixed = std::max(worst_mixed, r.nash_conv_mixed);
         worst_pure = std::max(worst_pure, r.nash_conv_pure);
     }
-    std::cerr << std::fixed << std::setprecision(1) << "jam % of combos by stack (BB):\n     ";
-    for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) std::cerr << std::setw(6) << stack;
-    std::cerr << '\n';
-    for (int jammer = 0; jammer < kJammers; ++jammer) {
-        std::cerr << std::setw(5) << name_of(jammer);
-        for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) {
-            std::cerr << std::setw(6) << percent_of(result_of(jammer, stack).jam, inputs);
-        }
+    for (int level = 0; level < kLevels; ++level) {
+        std::cerr << std::fixed << std::setprecision(1) << "jam % of combos by stack (BB), " << dead_of(level)
+                  << " BB dead:\n     ";
+        for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) std::cerr << std::setw(6) << stack;
         std::cerr << '\n';
+        for (int jammer = 0; jammer < kJammers; ++jammer) {
+            std::cerr << std::setw(5) << name_of(jammer);
+            for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) {
+                std::cerr << std::setw(6) << percent_of(result_at(level, jammer, stack).jam, inputs);
+            }
+            std::cerr << '\n';
+        }
     }
-    std::cerr << "call % of combos against a lone jam, by stack:\n";
+    std::cerr << "call % of combos against a lone jam, by stack, no ante:\n";
     for (int jammer = 0; jammer < kJammers; ++jammer) {
         for (int caller = jammer + 1; caller < kPositions; ++caller) {
             std::cerr << std::setw(4) << name_of(caller) << " v " << std::setw(3) << name_of(jammer);
@@ -435,7 +502,8 @@ int main(int argc, char** argv) {
     if (options.verbose) {
         std::cerr << std::setprecision(3) << "per game: last set change, NashConv mBB (average, published)\n";
         for (std::size_t k = 0; k < jobs.size(); ++k) {
-            std::cerr << std::setw(4) << name_of(jobs[k].jammer) << std::setw(4) << jobs[k].stack << " BB"
+            std::cerr << std::setw(4) << dead_of(jobs[k].level) << std::setw(5) << name_of(jobs[k].jammer)
+                      << std::setw(4) << jobs[k].stack << " BB"
                       << std::setw(6) << results[k].last_change << std::setw(9) << 1000.0 * results[k].nash_conv_mixed
                       << std::setw(9) << 1000.0 * results[k].nash_conv_pure << '\n';
         }
@@ -443,7 +511,7 @@ int main(int argc, char** argv) {
     std::cerr << std::setprecision(3) << "convergence: last published-set change at iteration " << last_change
               << " of " << options.iterations << "; worst NashConv " << 1000.0 * worst_mixed
               << " mBB (average strategies), " << 1000.0 * worst_pure << " mBB (published sets)\n"
-              << "wrote " << options.out << ": " << jobs.size() << " games in " << std::setprecision(2) << seconds
+              << "wrote " << options.out << " and " << options.ante_out << ": " << jobs.size() << " games in " << std::setprecision(2) << seconds
               << " s on " << threads << " threads\n";
     return 0;
 }

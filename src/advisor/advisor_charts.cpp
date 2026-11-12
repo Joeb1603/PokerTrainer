@@ -117,7 +117,8 @@ PushFoldAnswer push_fold_answer(const PlayerView& view, HandClass hand, int play
     }
     const int stack_bb =
         std::clamp(static_cast<int>(std::lround(effective_bb)), kPushFoldMinStackBb, kPushFoldMaxStackBb);
-    out.response = push_fold_response(hand, position, stack_bb, shover, players);
+    const double dead_bb = static_cast<double>(view.dead_money()) / view.big_blind;
+    out.response = push_fold_response(hand, position, stack_bb, shover, players, dead_bb);
     return out;
 }
 

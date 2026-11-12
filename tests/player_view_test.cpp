@@ -131,13 +131,14 @@ constexpr std::array<const char*, 5> kBoard{"2c", "7d", "9h", "Js", "3c"};
 TEST(PlayerView, PublicSeatFieldsAreExactlyTheKnownPublicOnes) {
     // A structured binding stops compiling if anyone adds a field, forcing a
     // fresh look at whether the new data is public.
-    PublicSeat seat{1, 2, 3, SeatStatus::Folded, Position::CO};
-    const auto [stack, street_bet, total_bet, status, position] = seat;
+    PublicSeat seat{1, 2, 3, SeatStatus::Folded, Position::CO, 4};
+    const auto [stack, street_bet, total_bet, status, position, ante_posted] = seat;
     EXPECT_EQ(stack, 1);
     EXPECT_EQ(street_bet, 2);
     EXPECT_EQ(total_bet, 3);
     EXPECT_EQ(status, SeatStatus::Folded);
     EXPECT_EQ(position, Position::CO);
+    EXPECT_EQ(ante_posted, 4);  // Antes are posted in public
 }
 
 TEST(PlayerView, RejectsSeatOutOfRange) {

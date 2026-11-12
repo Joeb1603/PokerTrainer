@@ -400,6 +400,7 @@ struct PreflopSpot {
     // The latest raise commits the raiser (all in, or at least 40% of its starting
     // stack), with this effective stack in big blinds: the push/fold override below.
     std::optional<double> all_in_bb;
+    double dead_bb = 0.0;  // Antes in the pot, in big blinds: picks the push/fold tables
 };
 
 // The standard street total for the next preflop raise after `raises` raise

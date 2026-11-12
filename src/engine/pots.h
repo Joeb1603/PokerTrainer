@@ -19,8 +19,10 @@ struct PotBreakdown {
 // not folded. Chips only one player put in were never called, so they come back
 // as a refund instead of forming a pot. Layers with no live contributor merge
 // into the pot below them, since folded chips stay in play for whoever is left.
+// `dead_money` (a big-blind ante) belongs to no seat's contribution: it joins the
+// main pot and is never refunded.
 PotBreakdown calculate_pots(const std::array<int, kMaxSeats>& contributed,
-                            const std::array<bool, kMaxSeats>& live);
+                            const std::array<bool, kMaxSeats>& live, int dead_money = 0);
 
 // The pot as it stands mid-hand, for display. pots plus uncalled always equals total.
 struct LivePots {
@@ -32,8 +34,8 @@ struct LivePots {
 // Unlike calculate_pots, a difference in bets alone does not split the pot, because
 // players with chips behind can still match it. Pots split only at the amount a
 // player is all-in for. `eligible` counts seats that can still win that pot, including
-// those who have yet to call.
+// those who have yet to call. `dead_money` joins the main pot, as in calculate_pots.
 LivePots calculate_live_pots(const std::array<int, kMaxSeats>& contributed,
-                             const std::array<SeatStatus, kMaxSeats>& statuses);
+                             const std::array<SeatStatus, kMaxSeats>& statuses, int dead_money = 0);
 
 }  // namespace poker

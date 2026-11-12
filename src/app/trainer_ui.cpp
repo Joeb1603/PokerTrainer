@@ -247,6 +247,43 @@ constexpr const char* kAdviceHelp =
 
 std::string label_of(Archetype type) { return std::string(to_string(type)); }
 
+// "1st", "2nd", "3rd", "4th"...
+std::string place_text(int place) {
+    const char* suffix = place == 1 ? "st" : place == 2 ? "nd" : place == 3 ? "rd" : "th";
+    return "finished " + std::to_string(place) + suffix;
+}
+
+std::string blinds_text(const BlindLevel& level) {
+    return std::to_string(level.small_blind) + "/" + std::to_string(level.big_blind);
+}
+
+std::string ante_text(const BlindLevel& level) {
+    return level.ante_type == AnteType::BigBlind ? "Big blind ante " + std::to_string(level.ante)
+                                                 : "Ante " + std::to_string(level.ante) + " each";
+}
+
+// The tournament's next level and when it comes, e.g. "Next 30/60 + ante in 4 hands".
+// Short enough for the felt's corner at any level: the ante's size is on its own line
+// once it applies.
+std::string next_level_text(const TournamentPanel& t) {
+    if (!t.next) return "Final level";
+    std::string when;
+    if (t.unit == LevelUnit::Hands) {
+        when = t.hands_until_next == 0 ? "next hand"
+                                       : "in " + std::to_string(t.hands_until_next) +
+                                             (t.hands_until_next == 1 ? " hand" : " hands");
+    } else if (t.seconds_until_next <= 0.0) {
+        when = "next hand";
+    } else {
+        const int seconds = static_cast<int>(std::ceil(t.seconds_until_next));
+        char clock[16];
+        std::snprintf(clock, sizeof clock, "%d:%02d", seconds / 60, seconds % 60);
+        when = std::string("in ") + clock;
+    }
+    const bool ante = t.next->has_ante() && (!t.current.has_ante() || t.next->ante != t.current.ante);
+    return "Next " + blinds_text(*t.next) + (ante ? " + ante " : " ") + when;
+}
+
 }  // namespace
 
 std::string action_code_text(const std::string& code) {
@@ -279,10 +316,27 @@ void TrainerUi::draw() {
     draw_table(0.0f, 0.0f, table_w, display.y - console_h);
     draw_console(0.0f, display.y - console_h, table_w, console_h);
     draw_sidebar(table_w, 0.0f, sidebar_w, display.y);
+    draw_setup();
+}
+
+void TrainerUi::open_setup(bool can_cancel) {
+    setup_panel_.open(controller_.game_setup(), controller_.random_personalities(), can_cancel);
+}
+
+void TrainerUi::draw_setup() {
+    if (!setup_panel_.is_open()) return;
+    if (setup_panel_.draw(fonts_.bold, scale_) != SetupPanel::Result::Start) return;
+    if (setup_panel_.random_personalities() != controller_.random_personalities()) {
+        controller_.set_random_personalities(setup_panel_.random_personalities());
+    }
+    if (controller_.set_game_setup(setup_panel_.setup())) {
+        ++setups_started_;
+        controller_.new_session();
+    }
 }
 
 void TrainerUi::handle_shortcuts() {
-    if (ImGui::GetIO().WantTextInput) return;
+    if (ImGui::GetIO().WantTextInput || setup_panel_.is_open()) return;
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false) && controller_.snapshot().phase == ControllerPhase::HandComplete) {
         (void)controller_.next_hand();
     }
@@ -318,6 +372,7 @@ void TrainerUi::draw_table(float x, float y, float w, float h) {
     }
 
     draw_center(dl, center, table_h);
+    if (s.tournament) draw_level_line(x + u(10.0f), y + u(8.0f));
 
     ImGui::End();
     ImGui::PopStyleColor();
@@ -491,16 +546,24 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
 
     if (s.phase == ControllerPhase::SessionOver) {
         push_button_color(0.33f);
-        if (ImGui::Button("Start New Game", {u(240.0f), row_h})) controller_.new_session();
+        if (ImGui::Button("Start New Game", {u(240.0f), row_h})) open_setup();
         ImGui::PopStyleColor(3);
         reveal_button();
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
         ImGui::PushFont(fonts_.bold);
-        ImGui::Text("%s", s.session.hero_busted ? "You busted" : "You won the freezeout");
+        const bool tournament = s.session.mode == GameMode::Tournament;
+        std::string verdict = s.session.hero_busted ? "You busted" : tournament ? "You won the tournament" : "You won the freezeout";
+        if (tournament && s.session.hero_busted && s.session.hero_place) verdict += ": " + place_text(*s.session.hero_place);
+        ImGui::TextUnformatted(verdict.c_str());
         ImGui::PopFont();
-        ImGui::Text("Hands %d   |   Net %+d chips   |   Flagged mistakes %d (about %.0f chips of estimated EV)",
-                    s.session.hands_played, s.session.hero_net, s.session.mistakes, s.session.ev_lost);
+        std::string stats = "Hands " + std::to_string(s.session.hands_played);
+        if (tournament) stats += "   |   Level " + std::to_string(s.session.level_reached);
+        char tail[160];
+        std::snprintf(tail, sizeof tail, "   |   Net %+d chips   |   Flagged mistakes %d (about %.0f chips of estimated EV)",
+                      s.session.hero_net, s.session.mistakes, s.session.ev_lost);
+        stats += tail;
+        ImGui::TextUnformatted(stats.c_str());
         if (!s.session.lineup.empty()) {
             // Random personalities: the styles are revealed once the freezeout is over.
             std::string lineup = "Lineup: ";
@@ -644,10 +707,15 @@ void TrainerUi::draw_sidebar(float x, float y, float w, float h) {
     ImGui::Text("Hand %d", s.hand_number);
     ImGui::PopFont();
     ImGui::SameLine();
-    ImGui::TextColored(kMutedText, "Blinds %d/%d", s.small_blind, s.big_blind);
+    if (s.ante > 0) {
+        ImGui::TextColored(kMutedText, "Blinds %d/%d, ante %d", s.small_blind, s.big_blind, s.ante);
+    } else {
+        ImGui::TextColored(kMutedText, "Blinds %d/%d", s.small_blind, s.big_blind);
+    }
     ImGui::TextColored(kMutedText, "Session %s", s.session.session_id.c_str());
 
-    if (ImGui::Button("New Session / Reset Freezeout", {-1.0f, 0.0f})) controller_.new_session();
+    if (ImGui::Button("New Session", {-1.0f, 0.0f})) open_setup();
+    wrapped_tooltip("Ends this game and opens the New Game screen: freezeout or tournament, blinds and stacks.");
 
     bool instant = controller_.instant_play();
     if (ImGui::Checkbox("Instant bots", &instant)) controller_.set_instant_play(instant);
@@ -999,6 +1067,32 @@ void TrainerUi::draw_solver() {
     ImGui::PushStyleColor(ImGuiCol_Text, kMutedText);
     ImGui::TextWrapped("Approximate solver: simplified bet sizes, assumed ranges.");
     ImGui::PopStyleColor();
+}
+
+void TrainerUi::draw_level_line(float x, float y) {
+    // In the felt's free top-left corner, clear of seat 3 even at the smallest window.
+    const TableSnapshot& s = controller_.snapshot();
+    const TournamentPanel& t = *s.tournament;
+    const float line = ImGui::GetFontSize() * 1.35f;
+    const std::string level = "Level " + std::to_string(t.level) + ": " + blinds_text(t.current);
+    float at = y;
+    ImGui::SetCursorScreenPos({x, at});
+    ImGui::PushFont(fonts_.bold);
+    ImGui::TextUnformatted(level.c_str());
+    ImGui::PopFont();
+    if (t.current.has_ante()) {
+        at += line;
+        ImGui::SetCursorScreenPos({x, at});
+        ImGui::TextUnformatted(ante_text(t.current).c_str());
+    }
+    at += line;
+    ImGui::SetCursorScreenPos({x, at});
+    ImGui::TextColored(kMutedText, "%s", next_level_text(t).c_str());
+    if (t.unit == LevelUnit::Minutes && t.next) {
+        ImGui::SetCursorScreenPos({x, at + line + ImGui::GetFontSize() * 0.1f});
+        if (ImGui::SmallButton(t.paused ? "Resume clock" : "Pause clock")) controller_.set_clock_paused(!t.paused);
+        wrapped_tooltip("The level clock runs while a hand is played or finished, your thinking time included.");
+    }
 }
 
 void TrainerUi::draw_action_log() {

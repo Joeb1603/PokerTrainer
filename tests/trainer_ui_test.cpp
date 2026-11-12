@@ -51,6 +51,8 @@ constexpr ImVec2 kAdviceManiac{1182.0f, 143.0f};
 constexpr ImVec2 kRandomPersonalities{1060.0f, 166.0f};
 // The "Versus types" Station row, with set_lines()'s hint (its one-line rationale).
 constexpr ImVec2 kVersusStation{1040.0f, 337.0f};
+// The tournament clock's Pause button, third line of the felt's top-left corner.
+constexpr ImVec2 kPauseClock{40.0f, 68.0f};
 
 std::uint8_t mask_of(std::initializer_list<ActionType> types) {
     std::uint8_t mask = 0;
@@ -99,7 +101,17 @@ public:
         table.random_personalities = enabled;
     }
     bool random_personalities() const override { return table.random_personalities; }
+    bool set_game_setup(const GameSetup& setup) override {
+        setups.push_back(setup);
+        setup_ = setup;
+        return true;
+    }
+    const GameSetup& game_setup() const override { return setup_; }
+    void set_clock_paused(bool paused) override { pause_requests.push_back(paused); }
 
+    std::vector<GameSetup> setups;
+    std::vector<bool> pause_requests;
+    GameSetup setup_;
     bool solver_on = false;
     int solver_budget = 8000;
     std::vector<bool> random_requests;
@@ -201,6 +213,39 @@ protected:
             }
         }
         return false;
+    }
+
+    // Clicks a control of the New Game screen by name (SetupPanel::rects).
+    void click_setup(const std::string& name) {
+        frame();  // Lays the screen out
+        frame();
+        const auto& rects = ui_->setup_panel().rects();
+        const auto it = rects.find(name);
+        ASSERT_NE(it, rects.end()) << name;
+        click({it->second.cx(), it->second.cy()});
+    }
+
+    // Types into the New Game field `name`: click (which selects its text), type, Enter.
+    void type_into_setup(const std::string& name, const std::string& text) {
+        click_setup(name);
+        ImGuiIO& io = ImGui::GetIO();
+        for (const char c : text) io.AddInputCharacter(static_cast<unsigned>(c));
+        frame();
+        io.AddKeyEvent(ImGuiKey_Enter, true);
+        frame();
+        io.AddKeyEvent(ImGuiKey_Enter, false);
+        frame();
+        frame();
+    }
+
+    // True if the table item under `pos` has this ID label.
+    bool table_item_is(ImVec2 pos, const char* label) {
+        frame();
+        ImGui::GetIO().AddMousePosEvent(pos.x, pos.y);
+        frame();
+        frame();
+        ImGuiWindow* table = ImGui::FindWindowByName("Table");
+        return table != nullptr && ImGui::GetCurrentContext()->HoveredIdPreviousFrame == table->GetID(label);
     }
 
     // Every piece of text one frame draws, clipped or not (ImGui's logging).
@@ -430,11 +475,26 @@ TEST_F(UiTest, SessionOverOffersANewGameAndIgnoresSpace) {
     EXPECT_EQ(fake_.next_hand_calls, 0);
 
     click(kNextHand);  // The same spot holds Start New Game here
+    EXPECT_TRUE(ui_->setup_open());  // The New Game screen comes first
+    EXPECT_EQ(fake_.new_session_calls, 0);
+    click_setup("Start");
+    EXPECT_FALSE(ui_->setup_open());
+    ASSERT_EQ(fake_.setups.size(), 1u);
+    EXPECT_EQ(fake_.setups[0], default_freezeout());
     EXPECT_EQ(fake_.new_session_calls, 1);
 }
 
-TEST_F(UiTest, ResetButtonStartsANewSessionMidHand) {
+TEST_F(UiTest, NewSessionOpensTheNewGameScreenAndCancelKeepsPlaying) {
     click(kNewSession);
+    EXPECT_TRUE(ui_->setup_open());
+    EXPECT_EQ(fake_.new_session_calls, 0);
+    click_setup("Cancel");
+    EXPECT_FALSE(ui_->setup_open());
+    EXPECT_EQ(fake_.new_session_calls, 0);
+    EXPECT_TRUE(fake_.setups.empty());
+
+    click(kNewSession);
+    click_setup("Start");
     EXPECT_EQ(fake_.new_session_calls, 1);
     EXPECT_TRUE(fake_.submitted.empty());
 }
@@ -666,7 +726,7 @@ TEST_F(UiTest, VersusRowSelectsItsLine) {
 
 TEST_F(UiTest, ExistingSidebarButtonsDidNotMove) {
     set_lines();
-    EXPECT_TRUE(sidebar_item_is(kNewSession, "New Session / Reset Freezeout"));
+    EXPECT_TRUE(sidebar_item_is(kNewSession, "New Session"));
     EXPECT_TRUE(sidebar_item_is(kAdvisorToggle, "Training Advisor"));
     EXPECT_TRUE(sidebar_item_is(kAdviceBaseline, "Baseline"));
     EXPECT_TRUE(sidebar_item_is(kAdviceNit, "Nit"));
@@ -678,7 +738,7 @@ TEST_F(UiTest, ExistingSidebarButtonsDidNotMove) {
     for (const SolverState state : {SolverState::Running, SolverState::Done}) {
         set_solver(state);
         EXPECT_TRUE(sidebar_item_is(kSolverToggle, "Solver mode"));
-        EXPECT_TRUE(sidebar_item_is(kNewSession, "New Session / Reset Freezeout"));
+        EXPECT_TRUE(sidebar_item_is(kNewSession, "New Session"));
         EXPECT_TRUE(sidebar_item_is(kAdvisorToggle, "Training Advisor"));
         EXPECT_TRUE(sidebar_item_is(kAdviceBaseline, "Baseline"));
         EXPECT_TRUE(sidebar_item_is(kAdviceManiac, "Maniac"));
@@ -687,6 +747,7 @@ TEST_F(UiTest, ExistingSidebarButtonsDidNotMove) {
     fake_.table.solver = {};
 
     click(kNewSession);
+    click_setup("Start");
     EXPECT_EQ(fake_.new_session_calls, 1);
     click(kAdvisorToggle);
     EXPECT_TRUE(console_button_is(kPlayGto, "Play GTO"));
@@ -887,4 +948,135 @@ TEST_F(UiTest, TheLineupIsShownOnlyWhenTheSessionIsOver) {
               std::string::npos)
         << text;
     EXPECT_TRUE(console_button_is(kNextHand, "Start New Game"));  // The buttons stay put
+}
+
+// --- New Game screen and tournament display ---------------------------------------
+
+TEST_F(UiTest, NewGameScreenBuildsATournament) {
+    click(kNewSession);
+    click_setup("Tournament");
+    const GameSetup& draft = ui_->setup_panel().setup();
+    EXPECT_EQ(draft.mode, GameMode::Tournament);
+    EXPECT_EQ(draft.levels.size(), 19u);  // Standard from 20
+
+    type_into_setup("Big blind", "50");
+    EXPECT_EQ(ui_->setup_panel().setup().big_blind, 50);
+    EXPECT_EQ(ui_->setup_panel().setup().levels.front().big_blind, 50);
+    EXPECT_EQ(ui_->setup_panel().setup().levels[1].big_blind, 75);
+
+    click_setup("Apply");  // Multiply by the default 1.5
+    EXPECT_EQ(ui_->setup_panel().setup().levels.front().big_blind, 75);
+    EXPECT_EQ(ui_->setup_panel().setup().big_blind, 75);
+
+    // 50, 75, 100... times 1.5 is 75, 125, 150...
+    EXPECT_EQ(ui_->setup_panel().setup().levels[1].big_blind, 125);
+    type_into_setup("Level 2 BB", "140");
+    EXPECT_EQ(ui_->setup_panel().setup().levels[1].big_blind, 140);
+    type_into_setup("Levels last", "6");
+    type_into_setup("Starting stack", "40");
+
+    click_setup("Start");
+    ASSERT_EQ(fake_.setups.size(), 1u);
+    const GameSetup& started = fake_.setups[0];
+    EXPECT_EQ(started.mode, GameMode::Tournament);
+    EXPECT_EQ(started.level_length, 6);
+    EXPECT_EQ(started.starting_bb, 40);
+    ASSERT_EQ(started.levels.size(), 19u);  // Edited, so kept
+    EXPECT_EQ(started.levels[1].big_blind, 140);
+    EXPECT_EQ(fake_.new_session_calls, 1);
+}
+
+TEST_F(UiTest, NewGameScreenKeepsTheBigBlindAndLevelOneTogether) {
+    click(kNewSession);
+    click_setup("Tournament");
+    click_setup("Freezeout");
+    type_into_setup("Big blind", "100");
+    click_setup("Tournament");  // Level 1 follows the big blind set under Freezeout
+    EXPECT_EQ(ui_->setup_panel().setup().levels.front().big_blind, 100);
+
+    click_setup("Level 1 remove");
+    EXPECT_EQ(ui_->setup_panel().setup().big_blind, ui_->setup_panel().setup().levels.front().big_blind);
+    EXPECT_EQ(ui_->setup_panel().setup().big_blind, 150);
+}
+
+TEST_F(UiTest, NewGameScreenRefusesAnInvalidSetup) {
+    click(kNewSession);
+    type_into_setup("Big blind", "1");
+    EXPECT_FALSE(ui_->setup_panel().problem().empty());
+    click_setup("Start");
+    EXPECT_TRUE(ui_->setup_open());
+    EXPECT_TRUE(fake_.setups.empty());
+    EXPECT_EQ(fake_.new_session_calls, 0);
+
+    type_into_setup("Big blind", "40");
+    EXPECT_TRUE(ui_->setup_panel().problem().empty());
+    click_setup("Start");
+    ASSERT_EQ(fake_.setups.size(), 1u);
+    EXPECT_EQ(fake_.setups[0].big_blind, 40);
+    EXPECT_TRUE(fake_.setups[0].levels.empty());
+}
+
+TEST_F(UiTest, NewGameScreenSetsRandomPersonalities) {
+    click(kNewSession);
+    click_setup("Random personalities");
+    click_setup("Start");
+    EXPECT_EQ(fake_.random_requests, (std::vector<bool>{true}));
+    EXPECT_EQ(fake_.new_session_calls, 1);
+}
+
+TEST_F(UiTest, NothingBehindTheNewGameScreenReacts) {
+    fake_.table.phase = ControllerPhase::HandComplete;
+    click(kNewSession);
+    press_space();
+    EXPECT_EQ(fake_.next_hand_calls, 0);
+    click(kNextHand);
+    EXPECT_EQ(fake_.next_hand_calls, 0);
+    EXPECT_TRUE(ui_->setup_open());
+}
+
+TEST_F(UiTest, TournamentLevelLineAndClock) {
+    TournamentPanel t;
+    t.level = 3;
+    t.current = {20, 40, 40, AnteType::BigBlind};
+    t.next = BlindLevel{30, 60, 60, AnteType::BigBlind};
+    t.unit = LevelUnit::Hands;
+    t.hands_until_next = 4;
+    fake_.table.tournament = t;
+    fake_.table.mode = GameMode::Tournament;
+    std::string text = drawn_text();
+    EXPECT_NE(text.find("Level 3: 20/40"), std::string::npos) << text;
+    EXPECT_NE(text.find("Big blind ante 40"), std::string::npos) << text;
+    EXPECT_NE(text.find("Next 30/60 + ante in 4 hands"), std::string::npos) << text;
+
+    fake_.table.tournament->unit = LevelUnit::Minutes;
+    fake_.table.tournament->seconds_until_next = 150.2;
+    text = drawn_text();
+    EXPECT_NE(text.find("in 2:31"), std::string::npos) << text;
+    EXPECT_TRUE(table_item_is(kPauseClock, "Pause clock"));
+    click(kPauseClock);
+    EXPECT_EQ(fake_.pause_requests, (std::vector<bool>{true}));
+
+    fake_.table.tournament->next.reset();
+    EXPECT_NE(drawn_text().find("Final level"), std::string::npos);
+
+    // No ante yet, and the next level brings one.
+    fake_.table.tournament->current = {10, 20, 0, AnteType::None};
+    fake_.table.tournament->next = BlindLevel{15, 30, 4, AnteType::PerPlayer};
+    fake_.table.tournament->unit = LevelUnit::Hands;
+    fake_.table.tournament->hands_until_next = 0;
+    text = drawn_text();
+    EXPECT_EQ(text.find("Ante"), std::string::npos) << text;
+    EXPECT_NE(text.find("Next 15/30 + ante next hand"), std::string::npos) << text;
+}
+
+TEST_F(UiTest, TournamentResultShowsThePlaceAndLevel) {
+    fake_.table.phase = ControllerPhase::SessionOver;
+    fake_.table.legal = {};
+    fake_.table.session.mode = GameMode::Tournament;
+    fake_.table.session.hero_busted = true;
+    fake_.table.session.hero_place = 3;
+    fake_.table.session.level_reached = 7;
+    const std::string text = drawn_text();
+    EXPECT_NE(text.find("You busted: finished 3rd"), std::string::npos) << text;
+    EXPECT_NE(text.find("Level 7"), std::string::npos) << text;
 }

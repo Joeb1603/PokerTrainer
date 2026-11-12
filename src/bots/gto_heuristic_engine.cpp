@@ -259,6 +259,7 @@ PotMath pot_math(const PlayerView& view) {
 
     const int my_total_after_call = me.total_bet + math.to_call;
     for (const PublicSeat& s : view.seats) math.contestable += std::min(s.total_bet, my_total_after_call);
+    math.contestable += view.dead_money();  // Antes: in every pot this seat can win
 
     if (math.to_call > 0) {
         math.pot_odds = static_cast<double>(math.to_call) / (math.contestable + math.to_call);
@@ -325,6 +326,9 @@ std::vector<PotLayer> pot_layers(const PlayerView& view) {
         if (layer.amount > 0) layers.push_back(layer);
         previous = level;
     }
+    // Antes are dead money in the main pot. (A player all in from the ante alone
+    // contests only the antes; that small side layer is not modelled.)
+    if (!layers.empty()) layers.front().amount += view.dead_money();
     return layers;
 }
 

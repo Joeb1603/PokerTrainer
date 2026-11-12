@@ -42,10 +42,20 @@ std::optional<HeroMistake> assess_hero_decision(const PlayerView& view, const Hi
 // suffix, so sessions started within the same second stay distinct across runs.
 std::string make_session_id();
 
+// A tournament's session-line extras.
+struct TournamentLog {
+    std::optional<int> place;  // Hero's finishing place, once the tournament is over
+    std::string unit;          // "hands" or "min"
+    int level_length = 0;
+    std::vector<BlindLevel> levels;
+};
+
 struct HandLogContext {
     std::string session_id;  // Joins hand lines to their session summary line
     int small_blind = 0;
     int big_blind = 0;
+    std::optional<int> level;                // Tournament level, 1-based (the latest, for a session)
+    std::optional<TournamentLog> tournament; // Session line only
     // e.g. "Hero", "Nit", "Shift:GTO"; with random personalities, "Name:Style", such as
     // "Marta:LAG", "Marta:Shift:GTO" or "Marta:Tilt:On"
     std::array<std::string, kMaxSeats> seat_labels;
@@ -56,15 +66,18 @@ struct HandLogContext {
 // One finished hand as a single line of JSON with no trailing newline:
 //
 //   session_id       The session this hand belongs to; h restarts in each session
-//   h, sb, bb, btn   Hand number, configured blinds, button seat index
+//   h, sb, bb, btn   Hand number, the hand's blinds, button seat index
+//   lvl              Tournament level, 1-based; tournaments only
+//   ante, at         Ante size and type ("each" or "bb"), only for a hand with antes
 //   post             Blinds actually posted, {sb:{s,amt}, bb:{s,amt}}; a short stack
-//                    can post less than sb or bb, and heads-up the BTN posts sb
+//                    can post less than sb or bb, and heads-up the BTN posts sb. With
+//                    antes, also ante:[{s,amt}], one per seat that paid one
 //   seats            Players dealt in: {s, p, pos, st, c}. s is the seat index, p the
-//                    label, st the stack before blinds. c is present for anyone who
+//                    label, st the stack before antes and blinds. c is present for anyone who
 //                    saw a flop, and always for Hero so mistakes can be inspected
 //   pre,flop,turn,riv  {b, pot, a}, present once the street is reached. b is the new
 //                    board cards (absent preflop), pot the chips entering the street
-//                    (blinds preflop), and a the voluntary actions "POS:ActionAmount"
+//                    (blinds and antes preflop), and a the voluntary actions "POS:ActionAmount"
 //   win              {p, amt, hand}; hand only if the pot went to showdown
 //   ref              {s, amt}, only if an uncalled bet was returned; not part of win
 //   hero_mistakes    {st, did, rec, eq, odds, mdf, ev_loss, why}, one per decision
@@ -113,6 +126,13 @@ private:
 //               the seat busted on, only if it did
 //   hero        {s, net, bust, mistakes, ev_loss, by_street:{pre,flop,turn,riv}},
 //               only if there is a Hero; by_street counts mistakes per street
+//
+// Tournaments add (sb and bb are then the first level's):
+//   mode        "T"
+//   lvl         The level of the last hand played
+//   place       Hero's finishing place, 1 to 6, once the tournament is over
+//   sched       {unit:"hands"|"min", len, lv:[[sb,bb,ante],...], at:"each"|"bb"};
+//               at only if some level has an ante
 class SessionLogger {
 public:
     // Seats start from `starting_stacks`, typically read from the engine before the

@@ -1,12 +1,20 @@
 // poker_trainer: the Dear ImGui desktop front end.
 //
 //   poker_trainer [--seed N] [--log-dir DIR] [--random-personalities on|off] [--settings PATH]
+//                 [--mode freezeout|tournament] [--big-blind N] [--stack-bb N]
+//                 [--level-hands N | --level-minutes N] [--preset standard|turbo|hyper]
+//                 [--antes none|player|bb] [--skip-setup | --show-setup]
 //
-// --random-personalities sets the option for this run without saving it; the
-// checkbox saves it to the settings file (poker_trainer_settings.json, beside logs/,
-// unless --settings names another).
+// The New Game screen opens first, filled in from the settings file
+// (poker_trainer_settings.json, beside logs/, unless --settings names another);
+// Start saves what the screen shows there. The game flags and
+// --random-personalities fill in the screen, or with --skip-setup start that game;
+// on their own they never save anything. In a game, the settings change only when
+// the player changes one: the game on the New Game screen, or the checkbox.
 //
-// Developer checks, for running it unattended:
+// Developer checks, for running it unattended (each but --show-setup skips the New
+// Game screen unless --show-setup is given too):
+//   --show-setup            Open the New Game screen even with the flags below
 //   --exit-after-frames N   Quit after N frames
 //   --auto-shove            Hero moves all-in at every decision, with bots instant and
 //                           hands and sessions advancing by themselves
@@ -33,6 +41,7 @@
 #include <exception>
 #include <filesystem>
 #include <optional>
+#include <stdexcept>
 #include <random>
 #include <string>
 #include <string_view>
@@ -52,6 +61,7 @@
 
 #include "app/app_settings.h"
 #include "app/screenshot.h"
+#include "app/setup_panel.h"
 #include "app/trainer_ui.h"
 #include "controller/local_game_controller.h"
 
@@ -128,7 +138,38 @@ struct Arguments {
     std::optional<poker::SolverTier> solver_tier;
     std::optional<bool> random_personalities;
     std::filesystem::path settings = poker::kDefaultSettingsFile;
+    // The game flags; each overrides the saved setup for this run.
+    std::optional<poker::GameMode> mode;
+    std::optional<int> big_blind;
+    std::optional<int> stack_bb;
+    std::optional<std::pair<poker::LevelUnit, int>> level;
+    std::optional<poker::BlindPreset> preset;
+    std::optional<poker::AnteType> antes;
+    bool skip_setup = false;
+    bool show_setup = false;
 };
+
+// The saved setup with the game flags applied. A flag that shapes the levels
+// rebuilds them from the preset.
+poker::GameSetup setup_from_flags(poker::GameSetup setup, const Arguments& arguments) {
+    if (arguments.mode) setup.mode = *arguments.mode;
+    if (arguments.big_blind) setup.big_blind = *arguments.big_blind;
+    if (arguments.stack_bb) setup.starting_bb = *arguments.stack_bb;
+    if (arguments.level) {
+        setup.unit = arguments.level->first;
+        setup.level_length = arguments.level->second;
+    }
+    if (arguments.preset) setup.preset = *arguments.preset;
+    if (arguments.antes) setup.ante_type = *arguments.antes;
+    if (arguments.big_blind || arguments.preset || arguments.antes) setup.levels.clear();
+    return setup;
+}
+
+bool shows_setup_at_launch(const Arguments& arguments) {
+    if (arguments.show_setup) return true;
+    return !arguments.skip_setup && !arguments.exit_after_frames && !arguments.auto_shove && arguments.stop_on.empty() &&
+           !arguments.screenshot;
+}
 
 std::optional<poker::SolverTier> parse_tier(std::string_view text) {
     if (text == "off") return poker::SolverTier::Unavailable;
@@ -282,6 +323,29 @@ std::optional<Arguments> parse_arguments(int argc, char** argv) {
             arguments.random_personalities = value == "on";
         } else if (arg == "--settings" && i + 1 < argc) {
             arguments.settings = argv[++i];
+        } else if (arg == "--mode" && i + 1 < argc) {
+            arguments.mode = poker::parse_game_mode(argv[++i]);
+            if (!arguments.mode) return std::nullopt;
+        } else if ((arg == "--big-blind" || arg == "--stack-bb" || arg == "--level-hands" || arg == "--level-minutes") &&
+                   i + 1 < argc) {
+            char* end = nullptr;
+            const long value = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value < 1 || value > 1'000'000) return std::nullopt;
+            const int n = static_cast<int>(value);
+            if (arg == "--big-blind") arguments.big_blind = n;
+            if (arg == "--stack-bb") arguments.stack_bb = n;
+            if (arg == "--level-hands") arguments.level = std::pair{poker::LevelUnit::Hands, n};
+            if (arg == "--level-minutes") arguments.level = std::pair{poker::LevelUnit::Minutes, n};
+        } else if (arg == "--preset" && i + 1 < argc) {
+            arguments.preset = poker::parse_blind_preset(argv[++i]);
+            if (!arguments.preset) return std::nullopt;
+        } else if (arg == "--antes" && i + 1 < argc) {
+            arguments.antes = poker::parse_ante_type(argv[++i]);
+            if (!arguments.antes) return std::nullopt;
+        } else if (arg == "--skip-setup") {
+            arguments.skip_setup = true;
+        } else if (arg == "--show-setup") {
+            arguments.show_setup = true;
         } else {
             return std::nullopt;
         }
@@ -326,61 +390,104 @@ int run(const Arguments& arguments) {
     ImGui_ImplOpenGL3_Init("#version 130");
 
     int exit_code = 0;
+    long frames = 0;
+    bool last_frame = false;
+    // One frame: input, then `draw` between NewFrame and Render, then present.
+    const auto frame = [&](const auto& draw) {
+        glfwPollEvents();
+        last_frame = glfwWindowShouldClose(window) != 0 ||
+                     (arguments.exit_after_frames && frames + 1 >= *arguments.exit_after_frames);
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        if (arguments.hover) {  // After the backend's own mouse update, so this one wins
+            io.AddMousePosEvent(static_cast<float>(arguments.hover->first), static_cast<float>(arguments.hover->second));
+        }
+        ImGui::NewFrame();
+        draw();
+        ImGui::Render();
+
+        int width = 0;
+        int height = 0;
+        glfwGetFramebufferSize(window, &width, &height);
+        glViewport(0, 0, width, height);
+        glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        if (last_frame && arguments.screenshot) save_screenshot(*arguments.screenshot, width, height);
+        glfwSwapBuffers(window);
+        ++frames;
+    };
+    // Saves the fields given, keeping the file's other values.
+    const auto save_settings = [&](const std::optional<poker::GameSetup>& setup, std::optional<bool> random) {
+        poker::AppSettings changed = poker::load_app_settings(arguments.settings);
+        if (setup) changed.game_setup = *setup;
+        if (random) changed.random_personalities = *random;
+        if (!poker::save_app_settings(arguments.settings, changed)) {
+            std::fprintf(stderr, "Could not save %s\n", arguments.settings.string().c_str());
+        }
+    };
+
     try {
-        poker::ControllerOptions options;
-        options.seed = arguments.seeded ? arguments.seed : (static_cast<std::uint64_t>(std::random_device{}()) << 32) ^
-                                                               std::random_device{}();
-        options.log_dir = arguments.log_dir;
-        options.instant_play = arguments.auto_shove;
-        if (arguments.bot_delay_ms) options.bot_delay_ms = *arguments.bot_delay_ms;
-        options.solver_enabled = arguments.solver;
-        if (arguments.solver_budget_ms) options.solver_budget_ms = *arguments.solver_budget_ms;
-        options.solver_tier_override = arguments.solver_tier;
         const poker::AppSettings settings = poker::load_app_settings(arguments.settings);
-        options.random_personalities = arguments.random_personalities.value_or(settings.random_personalities);
-        // Saved only when the checkbox changes it, so the flag alone never saves.
-        bool saved_random = options.random_personalities;
-        poker::LocalGameController controller(options);
-        poker::TrainerUi ui(controller, fonts, scale);
-        ui.set_advice_focus(arguments.advice);
+        poker::GameSetup setup = setup_from_flags(settings.game_setup, arguments);
+        bool random = arguments.random_personalities.value_or(settings.random_personalities);
+        // A bad flag value is shown on the New Game screen; without it, it stops here.
+        const bool show_setup = shows_setup_at_launch(arguments);
+        if (const auto problem = poker::validate(setup); problem && !show_setup) throw std::invalid_argument(*problem);
 
-        long frames = 0;
-        bool last_frame = false;
-        while (!last_frame) {
-            glfwPollEvents();
-            last_frame = glfwWindowShouldClose(window) != 0 ||
-                         (arguments.exit_after_frames && frames + 1 >= *arguments.exit_after_frames);
-            controller.tick(static_cast<double>(io.DeltaTime) * 1000.0);
+        // The New Game screen, before any hand is dealt: closing the window here quits
+        // without starting a session.
+        bool start = true;
+        if (show_setup) {
+            poker::SetupPanel panel;
+            panel.open(setup, random, false);
+            poker::SetupPanel::Result result = poker::SetupPanel::Result::None;
+            while (!last_frame && panel.is_open()) {
+                frame([&] { result = panel.draw(fonts.bold, scale); });
+            }
+            start = result == poker::SetupPanel::Result::Start;
+            if (start) {
+                setup = panel.setup();
+                random = panel.random_personalities();
+                save_settings(setup, random);  // What the player chose to start
+            }
+        }
+        if (start) {
+            poker::ControllerOptions options;
+            options.seed = arguments.seeded ? arguments.seed : (static_cast<std::uint64_t>(std::random_device{}()) << 32) ^
+                                                                   std::random_device{}();
+            options.log_dir = arguments.log_dir;
+            options.instant_play = arguments.auto_shove;
+            if (arguments.bot_delay_ms) options.bot_delay_ms = *arguments.bot_delay_ms;
+            options.solver_enabled = arguments.solver;
+            if (arguments.solver_budget_ms) options.solver_budget_ms = *arguments.solver_budget_ms;
+            options.solver_tier_override = arguments.solver_tier;
+            options.setup = setup;
+            options.random_personalities = random;
+            // Each is saved only when the player changes it (Start on the New Game
+            // screen, or the checkbox), so the flags alone never save.
+            bool last_random = random;
+            int last_started = 0;
+            poker::LocalGameController controller(options);
+            poker::TrainerUi ui(controller, fonts, scale);
+            ui.set_advice_focus(arguments.advice);
 
-            if (arguments.auto_shove) auto_play(controller, arguments);
-            if (controller.random_personalities() != saved_random) {
-                saved_random = controller.random_personalities();
-                poker::AppSettings changed = poker::load_app_settings(arguments.settings);
-                changed.random_personalities = saved_random;
-                if (!poker::save_app_settings(arguments.settings, changed)) {
-                    std::fprintf(stderr, "Could not save %s\n", arguments.settings.string().c_str());
+            while (!last_frame) {
+                // The New Game screen stops the game clock and the bots behind it.
+                if (!ui.setup_open()) {
+                    controller.tick(static_cast<double>(io.DeltaTime) * 1000.0);
+                    if (arguments.auto_shove) auto_play(controller, arguments);
                 }
+                const bool started = ui.setups_started() != last_started;
+                const bool random_changed = controller.random_personalities() != last_random;
+                if (started || random_changed) {
+                    last_started = ui.setups_started();
+                    last_random = controller.random_personalities();
+                    // Start saves the whole screen; the checkbox alone, only itself.
+                    save_settings(started ? std::optional(controller.game_setup()) : std::nullopt, last_random);
+                }
+                frame([&] { ui.draw(); });
             }
-
-            ImGui_ImplOpenGL3_NewFrame();
-            ImGui_ImplGlfw_NewFrame();
-            if (arguments.hover) {  // After the backend's own mouse update, so this one wins
-                io.AddMousePosEvent(static_cast<float>(arguments.hover->first), static_cast<float>(arguments.hover->second));
-            }
-            ImGui::NewFrame();
-            ui.draw();
-            ImGui::Render();
-
-            int width = 0;
-            int height = 0;
-            glfwGetFramebufferSize(window, &width, &height);
-            glViewport(0, 0, width, height);
-            glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-            if (last_frame && arguments.screenshot) save_screenshot(*arguments.screenshot, width, height);
-            glfwSwapBuffers(window);
-            ++frames;
         }
     } catch (const std::exception& error) {
         report_fatal(std::string("Poker Trainer stopped: ") + error.what());
@@ -400,7 +507,7 @@ int run(const Arguments& arguments) {
 int main(int argc, char** argv) {
     const auto arguments = parse_arguments(argc, argv);
     if (!arguments) {
-        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT] [--reveal] [--bot-delay MS] [--advice TYPE] [--hover X,Y] [--size WxH] [--screenshot PATH] [--solver] [--solver-budget MS] [--solver-tier off|river|turn|flop] [--random-personalities on|off] [--settings PATH]");
+        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--random-personalities on|off] [--settings PATH] [--mode freezeout|tournament] [--big-blind N] [--stack-bb N] [--level-hands N | --level-minutes N] [--preset standard|turbo|hyper] [--antes none|player|bb] [--skip-setup | --show-setup] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT] [--reveal] [--bot-delay MS] [--advice TYPE] [--hover X,Y] [--size WxH] [--screenshot PATH] [--solver] [--solver-budget MS] [--solver-tier off|river|turn|flop]");
         return 2;
     }
     return run(*arguments);

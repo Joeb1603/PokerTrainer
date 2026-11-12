@@ -4,6 +4,7 @@
 #include <string>
 #include <utility>
 
+#include "app/setup_panel.h"
 #include "controller/game_controller.h"
 
 struct ImFont;
@@ -35,6 +36,15 @@ public:
     void set_advice_focus(Archetype focus) { advice_focus_ = focus; }
     Archetype advice_focus() const { return advice_focus_; }
 
+    // The "New Game" screen. New Session and Start New Game open it; its Start sets the
+    // game setup (and random personalities) and starts a new session. While it is
+    // open, nothing behind it reacts, and the caller should pause the game clock.
+    void open_setup(bool can_cancel = true);
+    bool setup_open() const { return setup_panel_.is_open(); }
+    // Counts presses of Start on the New Game screen, so the app can save the choice.
+    int setups_started() const { return setups_started_; }
+    const SetupPanel& setup_panel() const { return setup_panel_; }
+
 private:
     void draw_table(float x, float y, float w, float h);
     void draw_seat(ImDrawList* dl, const SeatSnapshot& seat, int index, const ImVec2& center, const ImVec2& table_center);
@@ -59,6 +69,8 @@ private:
     // Baseline ranges). Otherwise nullptr, and the heuristic line is played.
     const SolverAdvice* solver_advice() const;
     void draw_action_log();
+    void draw_level_line(float x, float y);
+    void draw_setup();
     void handle_shortcuts();
 
     float u(float value) const { return value * scale_; }
@@ -74,6 +86,8 @@ private:
     // Identifies the current decision, so the slider resets once for each one.
     std::pair<int, std::size_t> raise_key_{-1, 0};
     std::size_t log_lines_seen_ = 0;
+    SetupPanel setup_panel_;
+    int setups_started_ = 0;
 };
 
 }  // namespace poker

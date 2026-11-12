@@ -7,7 +7,7 @@
 namespace poker {
 
 PotBreakdown calculate_pots(const std::array<int, kMaxSeats>& contributed,
-                            const std::array<bool, kMaxSeats>& live) {
+                            const std::array<bool, kMaxSeats>& live, int dead_money) {
     std::vector<int> levels;
     for (const int amount : contributed) {
         if (amount > 0) levels.push_back(amount);
@@ -48,11 +48,24 @@ PotBreakdown calculate_pots(const std::array<int, kMaxSeats>& contributed,
             carried = 0;
         }
     }
+
+    if (dead_money > 0 || carried > 0) {
+        if (result.pots.empty()) {
+            // Only uncalled chips were bet, so the dead money is a pot of its own.
+            std::vector<int> eligible;
+            for (int seat = 0; seat < kMaxSeats; ++seat) {
+                if (live[seat]) eligible.push_back(seat);
+            }
+            result.pots.push_back(Pot{dead_money + carried, std::move(eligible)});
+        } else {
+            result.pots.front().amount += dead_money;
+        }
+    }
     return result;
 }
 
 LivePots calculate_live_pots(const std::array<int, kMaxSeats>& contributed,
-                             const std::array<SeatStatus, kMaxSeats>& statuses) {
+                             const std::array<SeatStatus, kMaxSeats>& statuses, int dead_money) {
     LivePots result;
     const auto is_live = [&statuses](int seat) {
         return statuses[seat] == SeatStatus::Active || statuses[seat] == SeatStatus::AllIn;
@@ -103,6 +116,19 @@ LivePots calculate_live_pots(const std::array<int, kMaxSeats>& contributed,
             result.pots.back().amount += amount;
         } else {
             result.pots.push_back(Pot{amount, std::move(eligible)});
+        }
+    }
+
+    if (dead_money > 0) {
+        result.total += dead_money;
+        if (result.pots.empty()) {
+            std::vector<int> eligible;
+            for (int seat = 0; seat < kMaxSeats; ++seat) {
+                if (is_live(seat)) eligible.push_back(seat);
+            }
+            result.pots.push_back(Pot{dead_money, std::move(eligible)});
+        } else {
+            result.pots.front().amount += dead_money;
         }
     }
     return result;

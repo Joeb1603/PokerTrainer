@@ -15,6 +15,8 @@ struct GameConfig {
     int starting_stack = 2000;
     int small_blind = 10;
     int big_blind = 20;
+    int ante = 0;
+    AnteType ante_type = AnteType::None;
     std::uint64_t seed = 0;
 
     // The session ends when this seat busts. Without a hero, play continues
@@ -48,6 +50,11 @@ struct ScriptedDeal {
 // - An all-in below a full raise does not reopen betting for players who have
 //   already acted, unless short all-ins add up to a full raise (TDA Rule 47).
 // - Once at most one player can still act, remaining streets deal out automatically.
+// - Blinds and ante come from the level set for the hand (set_level between hands).
+//   Antes are dead money outside total_bet: per-player antes are posted before the
+//   blinds and layer into side pots like any chips; a big-blind ante is posted after
+//   the blind, from what it leaves, and goes to the main pot. Neither changes the
+//   bet to call, the minimum raise or the uncalled refund.
 class GameEngine {
 public:
     // Throws std::invalid_argument for an unusable config.
@@ -55,6 +62,17 @@ public:
 
     // Resets stacks and seats for a fresh freezeout. The RNG keeps advancing.
     void new_game();
+
+    // The same with a new config (stacks, blinds, ante, hero, first button). The
+    // seed is ignored: the RNG keeps advancing, so a new game never replays the
+    // deals of the first. Throws std::invalid_argument for an unusable config, and
+    // then changes nothing.
+    void new_game(GameConfig config);
+
+    // Blinds and ante from the next hand on. Throws std::logic_error unless the
+    // phase is BetweenHands, and std::invalid_argument for an unusable level.
+    void set_level(const BlindLevel& level);
+    const BlindLevel& next_level() const { return level_; }
 
     // Moves the button, deals and posts blinds. Throws std::logic_error unless
     // the phase is BetweenHands, and std::invalid_argument for a bad script.
@@ -84,11 +102,15 @@ private:
     int count_with_status(SeatStatus status) const;
     bool betting_round_complete() const;
     void commit_chips(int seat, int street_total);
+    void post_ante(int seat, int amount);
+    std::array<int, kMaxSeats> pot_contributions() const;
+    int main_pot_dead_money() const;  // A big-blind ante; per-player antes layer instead
     void settle(int from_seat);
     void deal_street_cards();
     void finish_hand(bool showdown);
 
     GameConfig config_;
+    BlindLevel level_;  // For the next hand
     std::mt19937_64 rng_;
     GameState state_;
     std::array<Card, 5> planned_board_{};

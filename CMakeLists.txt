@@ -67,6 +67,7 @@ add_library(poker_core STATIC
     src/core/card.cpp
     src/core/deck.cpp
     src/controller/bot_names.cpp
+    src/controller/blind_schedule.cpp
     src/controller/local_game_controller.cpp
     src/controller/solver_service.cpp
     src/core/hand_evaluator.cpp
@@ -88,6 +89,7 @@ add_library(poker_core STATIC
     src/solver/spot_from_view.cpp
     src/solver/worker_pool.cpp
     src/strategy/generated/push_fold_data.cpp
+    src/strategy/generated/push_fold_ante_data.cpp
     src/strategy/preflop_charts.cpp
     src/strategy/push_fold.cpp
 )
@@ -121,7 +123,7 @@ add_executable(gen_preflop_tables tools/gen_preflop_tables.cpp)
 target_link_libraries(gen_preflop_tables PRIVATE poker_core)
 target_compile_options(gen_preflop_tables PRIVATE ${POKER_WARNINGS})
 
-# Regenerates src/strategy/generated/push_fold_data.cpp; run from the repo root.
+# Regenerates src/strategy/generated/push_fold_data.cpp and push_fold_ante_data.cpp; run from the repo root.
 add_executable(gen_push_fold tools/gen_push_fold.cpp)
 target_link_libraries(gen_push_fold PRIVATE poker_core)
 target_compile_options(gen_push_fold PRIVATE ${POKER_WARNINGS})
@@ -161,7 +163,8 @@ if(POKER_BUILD_APP)
     target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 
     # Separate from main.cpp so tests can drive the UI without a window.
-    add_library(trainer_ui STATIC src/app/trainer_ui.cpp src/app/screenshot.cpp src/app/app_settings.cpp)
+    add_library(trainer_ui STATIC src/app/trainer_ui.cpp src/app/setup_panel.cpp src/app/screenshot.cpp
+                src/app/app_settings.cpp)
     target_include_directories(trainer_ui PUBLIC src)
     target_link_libraries(trainer_ui PUBLIC poker_core imgui_lib PRIVATE nlohmann_json::nlohmann_json)
     target_compile_options(trainer_ui PRIVATE ${POKER_WARNINGS})
@@ -210,6 +213,7 @@ if(POKER_BUILD_TESTS)
         tests/training_advisor_test.cpp
         tests/hand_logger_test.cpp
         tests/game_controller_test.cpp
+        tests/blind_schedule_test.cpp
         tests/solver_service_test.cpp
     )
     target_link_libraries(core_tests PRIVATE poker_core GTest::gtest_main nlohmann_json::nlohmann_json)

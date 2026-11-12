@@ -58,8 +58,11 @@ GameEngine heads_up_to_flop(const std::array<Card, 2>& seat0, const std::array<C
     return engine;
 }
 
-GameEngine six_max(int seat, const std::array<Card, 2>& cards, std::uint64_t seed = 5, int stack = 2000) {
+GameEngine six_max(int seat, const std::array<Card, 2>& cards, std::uint64_t seed = 5, int stack = 2000,
+                   AnteType ante_type = AnteType::None, int ante = 0) {
     GameConfig config;
+    config.ante_type = ante_type;
+    config.ante = ante;
     config.first_button = 0;
     config.hero_seat = std::nullopt;
     config.seed = seed;
@@ -1408,6 +1411,30 @@ TEST(Advisor, ShortStackFirstInIsPushOrFold) {
     GameEngine deeper = six_max(0, hole("Ac", "Kd"), 5, 320);
     for (int i = 0; i < 3; ++i) ASSERT_TRUE(deeper.apply_action({ActionType::Fold, 0}));
     EXPECT_FALSE(advisor_chart(deeper.player_view(0)).push_fold);
+}
+
+TEST(Advisor, ShortStackFirstInWithAntesUsesTheAnteTables) {
+    // A big-blind ante of one big blind: 1 BB of dead money, and wider jams.
+    const TrainingAdvisor advisor(63, kFastOptions);
+    for (const int seat : {3, 0}) {
+        int jams = 0;
+        for (const HandClass hand : hand_classes_by_strength()) {
+            GameEngine engine = six_max(seat, cards_for(hand), 5, 200, AnteType::BigBlind, 20);
+            while (engine.state().to_act != seat) ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));
+            const PlayerView view = engine.player_view(seat);
+            ASSERT_EQ(view.dead_money(), 20);
+            const HintRecommendation hint = advisor.analyze(view);
+            const bool table_jams =
+                push_fold_response(hand, *view.position, 10, std::nullopt, kMaxSeats, 1.0) == PreflopResponse::Raise;
+            EXPECT_EQ(hint.action.type, table_jams ? ActionType::AllIn : ActionType::Fold)
+                << seat << " " << hand.to_string() << ": " << hint.best_action;
+            jams += hint.action.type == ActionType::AllIn ? hand.combos() : 0;
+        }
+        const Position position = *six_max(seat, hole("Ac", "Ad")).player_view(seat).position;
+        const double with_antes = push_fold_jam_range(position, 10, kMaxSeats, 1.0)->percent();
+        EXPECT_NEAR(100.0 * jams / kTotalCombos, with_antes, 1e-9);
+        EXPECT_GT(with_antes, push_fold_jam_range(position, 10)->percent());
+    }
 }
 
 TEST(Advisor, ShortStackCallsAJamPerTable) {

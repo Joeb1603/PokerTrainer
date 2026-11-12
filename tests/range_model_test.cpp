@@ -48,8 +48,11 @@ using Holes = std::array<std::optional<std::array<Card, 2>>, kMaxSeats>;
 
 // Every dealt player without given cards gets spare ones, avoiding the given cards.
 GameEngine table(Holes holes, const std::array<Card, 5>& board,
-                 std::array<int, kMaxSeats> stacks = {2000, 2000, 2000, 2000, 2000, 2000}) {
+                 std::array<int, kMaxSeats> stacks = {2000, 2000, 2000, 2000, 2000, 2000},
+                 AnteType ante_type = AnteType::None, int ante = 0) {
     GameConfig config;
+    config.ante_type = ante_type;
+    config.ante = ante;
     config.first_button = kBtn;
     config.hero_seat = std::nullopt;
     config.stacks = stacks;
@@ -252,6 +255,26 @@ TEST(RangeModel, BbDefendVsBtnIsChartCallPlusTraps) {
     }
     expected.remove_cards(dead_for(view));
     expect_same(*infer_ranges(view, Archetype::Baseline)[kBb], expected);
+}
+
+TEST(RangeModel, AntesDoNotLookLikeBets) {
+    // Antes sit outside total_bet, so the blinds are still read as the blinds and a
+    // preflop line is read exactly as without antes.
+    for (const AnteType type : {AnteType::PerPlayer, AnteType::BigBlind}) {
+        Holes holes{};
+        holes[kBtn] = hole("8c", "8d");
+        constexpr std::array<int, kMaxSeats> kStacks{2000, 2000, 2000, 2000, 2000, 2000};
+        GameEngine plain = table(holes, kDryBoard, kStacks);
+        GameEngine with_antes = table(holes, kDryBoard, kStacks, type, type == AnteType::BigBlind ? 20 : 3);
+        play(plain, {F, F, F, R(50)});
+        play(with_antes, {F, F, F, R(50)});
+        const auto a = infer_ranges(plain.player_view(kBtn), Archetype::Baseline);
+        const auto b = infer_ranges(with_antes.player_view(kBtn), Archetype::Baseline);
+        for (int i = 0; i < kMaxSeats; ++i) {
+            ASSERT_EQ(a[i].has_value(), b[i].has_value());
+            if (a[i]) expect_same(*a[i], *b[i]);
+        }
+    }
 }
 
 TEST(RangeModel, NitNarrowerStationWiderThanBaseline) {

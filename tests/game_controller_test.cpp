@@ -1431,3 +1431,248 @@ TEST_F(Controller, TheOptionWaitsForTheNextSessionAndTurningItOffRestoresTheClas
     c.new_session();  // Off to off keeps the classic bots
     EXPECT_EQ(names(), classic);
 }
+
+// --- Game setup: freezeout sizes and tournaments --------------------------------
+
+namespace {
+
+Action check_or_fold(const TableSnapshot& s) {
+    return {s.legal.allows(ActionType::Check) ? ActionType::Check : ActionType::Fold};
+}
+
+GameSetup fast_tournament(LevelUnit unit, int length, AnteType antes = AnteType::BigBlind) {
+    GameSetup setup = default_tournament();
+    setup.unit = unit;
+    setup.level_length = length;
+    setup.ante_type = antes;
+    setup.ante_from_level = 2;
+    return setup;
+}
+
+}  // namespace
+
+TEST_F(Controller, FreezeoutUsesTheChosenBlindAndStack) {
+    ControllerOptions o = options();
+    o.setup.big_blind = 50;
+    o.setup.starting_bb = 40;
+    {
+        LocalGameController c(o);
+        const TableSnapshot& s = c.snapshot();
+        EXPECT_EQ(s.mode, GameMode::Freezeout);
+        EXPECT_FALSE(s.tournament);
+        EXPECT_EQ(s.small_blind, 25);
+        EXPECT_EQ(s.big_blind, 50);
+        int chips = 0;
+        for (const SeatSnapshot& seat : s.seats) chips += seat.stack + seat.street_bet;
+        EXPECT_EQ(chips, 6 * 2000);
+        play_hand_out(c, check_or_fold);
+    }
+    const auto lines = read_json_lines(hands());
+    ASSERT_FALSE(lines.empty());
+    EXPECT_EQ(lines[0]["sb"], 25);
+    EXPECT_EQ(lines[0]["bb"], 50);
+    EXPECT_FALSE(lines[0].contains("lvl"));
+    EXPECT_FALSE(lines[0].contains("ante"));
+    const auto summary = read_json_lines(sessions());
+    ASSERT_EQ(summary.size(), 1u);
+    EXPECT_FALSE(summary[0].contains("mode"));
+    EXPECT_EQ(summary[0]["bb"], 50);
+}
+
+TEST_F(Controller, AnInvalidSetupIsRefused) {
+    ControllerOptions o = options();
+    o.setup.big_blind = 1;
+    EXPECT_THROW(LocalGameController{o}, std::invalid_argument);
+
+    LocalGameController c(options());
+    GameSetup bad = default_tournament();
+    bad.level_length = 0;
+    EXPECT_FALSE(c.set_game_setup(bad));
+    EXPECT_EQ(c.game_setup(), default_freezeout());
+    EXPECT_FALSE(c.snapshot().setup_pending);
+}
+
+TEST_F(Controller, TheSetupWaitsForTheNextSession) {
+    LocalGameController c(options());
+    ASSERT_TRUE(c.set_game_setup(default_tournament()));
+    EXPECT_TRUE(c.snapshot().setup_pending);
+    EXPECT_EQ(c.snapshot().mode, GameMode::Freezeout);
+    EXPECT_EQ(c.game_setup().mode, GameMode::Tournament);
+
+    c.new_session();
+    const TableSnapshot& s = c.snapshot();
+    EXPECT_FALSE(s.setup_pending);
+    EXPECT_EQ(s.mode, GameMode::Tournament);
+    ASSERT_TRUE(s.tournament);
+    EXPECT_EQ(s.tournament->level, 1);
+    EXPECT_EQ(s.tournament->next->big_blind, 30);
+    int chips = 0;
+    for (const SeatSnapshot& seat : s.seats) chips += seat.stack + seat.street_bet;
+    EXPECT_EQ(chips, 6 * 1000);  // 50 BB of 20
+}
+
+TEST_F(Controller, ANewSetupDoesNotReplayTheLastSessionsCards) {
+    const auto first_hero_cards = [&](bool change_setup) {
+        LocalGameController c(options(9));
+        const auto session_one = c.snapshot().seats[kHeroSeat].visible_hole;
+        if (change_setup) {
+            EXPECT_TRUE(c.set_game_setup(default_tournament()));
+        }
+        c.new_session();
+        return std::pair{session_one, c.snapshot().seats[kHeroSeat].visible_hole};
+    };
+    const auto same = first_hero_cards(false);
+    const auto changed = first_hero_cards(true);
+    EXPECT_EQ(same.first, changed.first);
+    EXPECT_EQ(same.second, changed.second);  // The deck stream runs on as it always has
+    EXPECT_NE(changed.first, changed.second);
+}
+
+TEST_F(Controller, TournamentBlindsRiseEveryNHandsWithAntes) {
+    ControllerOptions o = options(5);
+    o.setup = fast_tournament(LevelUnit::Hands, 2);
+    std::vector<int> big_blinds;
+    std::vector<bool> changed;
+    {
+        LocalGameController c(o);
+        for (int hand = 0; hand < 7 && c.snapshot().phase != ControllerPhase::SessionOver; ++hand) {
+            if (hand > 0) {
+                ASSERT_TRUE(c.next_hand());
+            }
+            const TableSnapshot& s = c.snapshot();
+            ASSERT_TRUE(s.tournament);
+            big_blinds.push_back(s.big_blind);
+            changed.push_back(s.tournament->level_changed);
+            EXPECT_EQ(s.tournament->level, hand / 2 + 1);
+            if (s.big_blind > 20) {
+                EXPECT_EQ(s.ante, s.big_blind);
+                EXPECT_EQ(s.ante_type, AnteType::BigBlind);
+            }
+            const bool announces = std::any_of(s.action_log.begin(), s.action_log.end(), [](const std::string& line) {
+                return line.rfind("Blinds up: level", 0) == 0;
+            });
+            EXPECT_EQ(announces, s.tournament->level_changed);
+            play_hand_out(c, check_or_fold);
+        }
+    }
+    ASSERT_EQ(big_blinds.size(), 7u);
+    EXPECT_EQ(big_blinds, (std::vector<int>{20, 20, 30, 30, 40, 40, 60}));
+    EXPECT_EQ(changed, (std::vector<bool>{false, false, true, false, true, false, true}));
+
+    const auto lines = read_json_lines(hands());
+    ASSERT_EQ(lines.size(), 7u);
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        EXPECT_EQ(lines[i]["bb"], big_blinds[i]);
+        EXPECT_EQ(lines[i]["lvl"], static_cast<int>(i / 2 + 1));
+        EXPECT_EQ(lines[i].contains("ante"), i >= 2);
+        int stacks = 0;
+        for (const json& seat : lines[i]["seats"]) stacks += seat["st"].get<int>();
+        EXPECT_EQ(stacks, 6000) << "hand " << i + 1;  // Before antes and blinds, every chip
+    }
+    EXPECT_EQ(lines[2]["at"], "bb");
+    EXPECT_EQ(lines[2]["post"]["ante"].size(), 1u);
+    EXPECT_EQ(lines[2]["pre"]["pot"], 15 + 30 + 30);
+
+    const auto summary = read_json_lines(sessions());
+    ASSERT_EQ(summary.size(), 1u);
+    EXPECT_EQ(summary[0]["mode"], "T");
+    EXPECT_EQ(summary[0]["lvl"], 4);
+    EXPECT_EQ(summary[0]["bb"], 20);
+    EXPECT_EQ(summary[0]["sched"]["unit"], "hands");
+    EXPECT_EQ(summary[0]["sched"]["len"], 2);
+    EXPECT_EQ(summary[0]["sched"]["at"], "bb");
+    EXPECT_EQ(summary[0]["sched"]["lv"][1], json::array({15, 30, 30}));
+    EXPECT_FALSE(summary[0].contains("place"));  // Not over yet
+}
+
+TEST_F(Controller, MinutesLevelsMoveUpAtTheNextHandAndPauseStopsTheClock) {
+    ControllerOptions o = options(6);
+    o.setup = fast_tournament(LevelUnit::Minutes, 1, AnteType::PerPlayer);
+    LocalGameController c(o);
+    play_hand_out(c, check_or_fold);
+    ASSERT_NE(c.snapshot().phase, ControllerPhase::SessionOver);
+
+    c.set_clock_paused(true);
+    EXPECT_TRUE(c.snapshot().tournament->paused);
+    for (int i = 0; i < 90; ++i) c.tick(1000.0);
+    EXPECT_NEAR(c.snapshot().tournament->seconds_until_next, 60.0, 1e-9);
+    c.set_clock_paused(false);
+
+    for (int i = 0; i < 59; ++i) c.tick(1000.0);
+    EXPECT_NEAR(c.snapshot().tournament->seconds_until_next, 1.0, 1e-9);
+    c.tick(5000.0);  // A stalled frame counts one second
+    EXPECT_LE(c.snapshot().tournament->seconds_until_next, 0.0);
+    EXPECT_EQ(c.snapshot().big_blind, 20);  // The finished hand keeps its blinds
+
+    ASSERT_TRUE(c.next_hand());
+    EXPECT_EQ(c.snapshot().big_blind, 30);
+    EXPECT_EQ(c.snapshot().tournament->level, 2);
+    EXPECT_EQ(c.snapshot().ante_type, AnteType::PerPlayer);
+    EXPECT_EQ(c.snapshot().ante, 4);  // 30 / 8, tidied
+    EXPECT_NE(std::find(c.snapshot().action_log.begin(), c.snapshot().action_log.end(),
+                        "Everyone posts an ante of 4"),
+              c.snapshot().action_log.end());
+}
+
+TEST_F(Controller, AShortAntesAllInIsLogged) {
+    // A per-player ante bigger than some stacks: those seats are all in on the ante.
+    ControllerOptions o = options(8);
+    o.setup = fast_tournament(LevelUnit::Hands, 50, AnteType::PerPlayer);
+    o.setup.ante_from_level = 1;
+    o.setup.levels = {{10, 20, 30, AnteType::PerPlayer}};
+    o.setup.starting_bb = 10;
+    LocalGameController c(o);
+    bool short_seen = false;
+    for (int hand = 0; hand < 60 && !short_seen && c.snapshot().phase != ControllerPhase::SessionOver; ++hand) {
+        if (hand > 0) {
+            ASSERT_TRUE(c.next_hand());
+        }
+        for (const std::string& line : c.snapshot().action_log) {
+            if (line.find("posts an ante of") != std::string::npos && line.find("(all-in)") != std::string::npos) {
+                short_seen = true;
+            }
+        }
+        play_hand_out(c, check_or_fold);  // Hero's stack shrinks by the antes until one is short
+    }
+    EXPECT_TRUE(short_seen);
+}
+
+TEST_F(Controller, HeroFinishingPlaceIsReportedAndLogged) {
+    std::set<int> places;
+    for (std::uint64_t seed = 1; seed <= 6; ++seed) {
+        ControllerOptions o = options(seed);
+        o.log_dir = dir_ / std::to_string(seed);
+        o.setup = fast_tournament(LevelUnit::Hands, 3);
+        o.setup.starting_bb = 10;
+        std::optional<int> place;
+        int alive = 0;
+        {
+            LocalGameController c(o);
+            for (int hand = 0; hand < 300 && c.snapshot().phase != ControllerPhase::SessionOver; ++hand) {
+                if (hand > 0) {
+                    ASSERT_TRUE(c.next_hand());
+                }
+                EXPECT_FALSE(c.snapshot().session.hero_place);
+                play_hand_out(c, shove);
+            }
+            const TableSnapshot& s = c.snapshot();
+            ASSERT_EQ(s.phase, ControllerPhase::SessionOver);
+            place = s.session.hero_place;
+            ASSERT_TRUE(place);
+            for (int seat = 1; seat < kMaxSeats; ++seat) alive += s.seats[seat].status != SeatStatus::Busted ? 1 : 0;
+            if (s.session.hero_busted) {
+                EXPECT_GE(*place, 1 + alive);
+                EXPECT_LE(*place, 6);
+            } else {
+                EXPECT_EQ(*place, 1);
+            }
+            EXPECT_GE(s.session.level_reached, 1);
+        }
+        places.insert(*place);
+        const auto summary = read_json_lines(o.log_dir / "session_summary.jsonl");
+        ASSERT_EQ(summary.size(), 1u);
+        EXPECT_EQ(summary[0]["place"], *place);
+        EXPECT_EQ(summary[0]["done"], true);
+    }
+    EXPECT_GE(places.size(), 2u);
+}

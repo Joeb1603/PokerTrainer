@@ -1380,6 +1380,42 @@ TEST(PotMathTest, ShortCallOnlyPlaysForWhatItCanWin) {
     EXPECT_DOUBLE_EQ(math.pot_odds, 180.0 / 400.0);
 }
 
+TEST(PotMathTest, AntesAreDeadMoneyInPotOddsAndTheMainLayer) {
+    for (const AnteType type : {AnteType::PerPlayer, AnteType::BigBlind}) {
+        GameConfig config;
+        config.first_button = 0;
+        config.hero_seat = std::nullopt;
+        config.stacks = std::array<int, kMaxSeats>{1000, 200, 0, 0, 0, 0};
+        config.ante = type == AnteType::PerPlayer ? 5 : 20;
+        config.ante_type = type;
+        GameEngine engine(config);
+        ScriptedDeal deal;
+        deal.holes[0] = hole("Ks", "9h");
+        deal.holes[1] = hole("Ac", "Ad");
+        deal.board = board_of("Kd", "8s", "3c", "2h", "Jd");
+        engine.start_hand(deal);
+        ASSERT_TRUE(engine.apply_action({ActionType::AllIn, 0}));
+        const PlayerView view = engine.player_view(1);
+        const PotMath math = pot_math(view);
+        const std::vector<PotLayer> layers = pot_layers(view);
+        ASSERT_EQ(layers.size(), 1u);
+        if (type == AnteType::PerPlayer) {
+            // Both post 5 and the BB has 175 left. Calling wins 195 of the shove, the
+            // BB's own 20 blind and both antes (225), for 175: a 400 pot.
+            EXPECT_EQ(math.to_call, 175);
+            EXPECT_EQ(math.contestable, 225);
+            EXPECT_DOUBLE_EQ(math.pot_odds, 175.0 / 400.0);
+            EXPECT_EQ(layers[0].amount, 400);
+        } else {
+            // The BB posts 20 and a 20 ante, leaving 160: a 380 pot for a 160 call.
+            EXPECT_EQ(math.to_call, 160);
+            EXPECT_EQ(math.contestable, 220);
+            EXPECT_DOUBLE_EQ(math.pot_odds, 160.0 / 380.0);
+            EXPECT_EQ(layers[0].amount, 380);
+        }
+    }
+}
+
 TEST(PotMathTest, AnUnopenedPotHasNoMdf) {
     GameEngine engine = six_max(3, hole("7c", "2d"));
     const PotMath math = pot_math(engine.player_view(3));

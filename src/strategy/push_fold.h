@@ -8,7 +8,8 @@
 
 namespace poker {
 
-// Push/fold tables for short effective stacks, blinds 0.5/1 BB and no ante,
+// Push/fold tables for short effective stacks, blinds 0.5/1 BB, with no ante or
+// with dead money from antes (kPushFoldAnteDeadBb),
 // solved by tools/gen_push_fold.cpp with fictitious play over the 169 classes
 // (all-in equities from range/preflop_matrix.h, card removal between the jammer
 // and each caller from combo counts). The advisor and range model use them; the
@@ -21,6 +22,11 @@ namespace poker {
 // so heads-up (players == 2) the button, which posts the small blind, uses the
 // SB tables. A short-handed table drops the early positions, so a position keeps
 // the same number of players behind and the same tables.
+//
+// `dead_bb` is the antes in the pot, in big blinds, for the whole table (the
+// player's own included); stacks are then measured after the antes. The tables
+// are solved at a few dead-money levels, and the largest level not above dead_bb
+// is used, so a game with antes gets ranges at least as tight as its true ones.
 inline constexpr int kPushFoldMinStackBb = 3;
 inline constexpr int kPushFoldMaxStackBb = 15;
 
@@ -29,13 +35,15 @@ inline constexpr int kPushFoldMaxStackBb = 15;
 // outside [kPushFoldMinStackBb, kPushFoldMaxStackBb], for the BB first in, and for
 // a hero who does not act after the shover.
 std::optional<PreflopResponse> push_fold_response(HandClass hand, Position hero, int stack_bb,
-                                                  std::optional<Position> shover, int players = kMaxSeats);
+                                                  std::optional<Position> shover, int players = kMaxSeats,
+                                                  double dead_bb = 0.0);
 
 // The jam range first in from `jammer`, or the call range of `caller` against a
 // lone jam from `jammer`, with the same nullopt cases as push_fold_response.
-std::optional<HandRange> push_fold_jam_range(Position jammer, int stack_bb, int players = kMaxSeats);
+std::optional<HandRange> push_fold_jam_range(Position jammer, int stack_bb, int players = kMaxSeats,
+                                             double dead_bb = 0.0);
 std::optional<HandRange> push_fold_call_range(Position caller, Position jammer, int stack_bb,
-                                              int players = kMaxSeats);
+                                              int players = kMaxSeats, double dead_bb = 0.0);
 
 // Fictitious-play iterations behind the tables.
 int push_fold_iterations();
@@ -46,6 +54,8 @@ inline constexpr int kPushFoldStackCount = kPushFoldMaxStackBb - kPushFoldMinSta
 inline constexpr int kPushFoldJammerCount = 5;  // UTG, HJ, CO, BTN, SB
 inline constexpr int kPushFoldPositionCount = 6;
 inline constexpr int kHandSetWords = 3;  // 169 bits
+inline constexpr int kPushFoldAnteLevels = 3;
+inline constexpr double kPushFoldAnteDeadBb[kPushFoldAnteLevels] = {0.5, 1.0, 1.5};
 
 // Bit k (word k / 64, bit k % 64) is set for the class whose HandClass::index()
 // is k. Indexed by Position, then stack_bb - kPushFoldMinStackBb; a call entry
@@ -55,6 +65,11 @@ extern const std::uint64_t kPushFoldJam[kPushFoldJammerCount][kPushFoldStackCoun
 extern const std::uint64_t kPushFoldCall[kPushFoldJammerCount][kPushFoldPositionCount][kPushFoldStackCount]
                                         [kHandSetWords];
 extern const int kPushFoldIterations;
+// The same for each level of kPushFoldAnteDeadBb, in push_fold_ante_data.cpp.
+extern const std::uint64_t kPushFoldAnteJam[kPushFoldAnteLevels][kPushFoldJammerCount][kPushFoldStackCount]
+                                           [kHandSetWords];
+extern const std::uint64_t kPushFoldAnteCall[kPushFoldAnteLevels][kPushFoldJammerCount][kPushFoldPositionCount]
+                                            [kPushFoldStackCount][kHandSetWords];
 
 }  // namespace detail
 }  // namespace poker

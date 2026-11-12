@@ -3,7 +3,7 @@
 //
 //   advisor_matchup [--hands N] [--matchup nit|station|maniac|gto|all]
 //                   [--advisor-rollouts N] [--range-rollouts N] [--bot-rollouts N]
-//                   [--threads N] [--seed S] [--csv PATH]
+//                   [--threads N] [--seed S] [--csv PATH] [--stack-bb N] [--antes none|player|bb]
 //
 // Seat 0 is an AdvisorBot: it calls TrainingAdvisor::analyze on its PlayerView and
 // plays either the Baseline action (the hint's own) or one archetype line's action
@@ -29,8 +29,12 @@
 // (default 500, the game uses 5000), so their equity estimates are noisier; that
 // keeps the run time reasonable and is the same for every line.
 //
+// --stack-bb and --antes play short, tournament-like hands instead: every stack
+// starts at N BB, and a big-blind ante of 1 BB or a per-player ante of BB/8 (3 at
+// 10/20, as the game's own rule rounds it) is posted. Results stay in bb/100 of the 20-chip big blind.
+//
 // Each hand is checked: every action must be legal and the six stacks must still
-// hold 6 x 100 BB afterwards. Exit status: 0 on success, 1 when a check fails, 2 on
+// hold 6 x the starting stack afterwards. Exit status: 0 on success, 1 when a check fails, 2 on
 // a usage or file error.
 
 #include <array>
@@ -50,6 +54,7 @@
 
 #include "advisor/training_advisor.h"
 #include "bots/bots.h"
+#include "controller/blind_schedule.h"
 #include "engine/game_engine.h"
 #include "range_text.h"
 
@@ -60,7 +65,7 @@ namespace {
 constexpr std::string_view kUsage =
     "Usage: advisor_matchup [--hands N] [--matchup nit|station|maniac|gto|all]\n"
     "                       [--advisor-rollouts N] [--range-rollouts N] [--bot-rollouts N]\n"
-    "                       [--threads N] [--seed S] [--csv PATH]\n"
+    "                       [--threads N] [--seed S] [--csv PATH] [--stack-bb N] [--antes none|player|bb]\n"
     "  --hands             hands per matchup, each played once per line (default 3000)\n"
     "  --matchup           which table to play (default all)\n"
     "  --advisor-rollouts  advisor random-hand rollouts (default 1000)\n"
@@ -68,7 +73,9 @@ constexpr std::string_view kUsage =
     "  --bot-rollouts      bot Monte Carlo rollouts (default 500; the game uses 5000)\n"
     "  --threads           advisor threads (default 1, for several processes at once)\n"
     "  --seed              base seed (default 1)\n"
-    "  --csv               write one row per hand and line\n";
+    "  --csv               write one row per hand and line\n"
+    "  --stack-bb          starting stacks in big blinds (default 100)\n"
+    "  --antes             none (default), player (BB/8 each) or bb (a 1 BB big-blind ante)\n";
 
 enum class Opponent : std::uint8_t { Nit, Loose, Maniac, Gto };
 
@@ -98,6 +105,8 @@ struct Options {
     int threads = 1;
     std::uint64_t seed = 1;
     std::optional<std::string> csv;
+    int stack_bb = 100;
+    AnteType antes = AnteType::None;
 };
 
 [[noreturn]] void usage_error(const std::string& message) {
@@ -142,6 +151,18 @@ Options parse_options(int argc, char** argv) {
             options.seed = static_cast<std::uint64_t>(int_flag(arg, value, 0));
         } else if (arg == "--csv") {
             options.csv = std::string(value);
+        } else if (arg == "--stack-bb") {
+            options.stack_bb = int_flag(arg, value, 2);
+        } else if (arg == "--antes") {
+            if (value == "none") {
+                options.antes = AnteType::None;
+            } else if (value == "player") {
+                options.antes = AnteType::PerPlayer;
+            } else if (value == "bb") {
+                options.antes = AnteType::BigBlind;
+            } else {
+                usage_error("--antes needs none, player or bb");
+            }
         } else {
             usage_error("unknown flag: " + std::string(arg));
         }
@@ -227,10 +248,16 @@ struct HandResult {
 
 constexpr int kHero = 0;
 
-// One hand from fresh 100 BB stacks. Returns nothing when a check fails.
+// One hand from fresh stacks (100 BB unless --stack-bb). Returns nothing when a check fails.
 std::optional<HandResult> play_hand(const Matchup& matchup, std::optional<Archetype> line, int hand_index,
                                     std::uint64_t hand_seed, const Options& options) {
     GameConfig config;
+    config.starting_stack = options.stack_bb * config.big_blind;
+    // The game's own ante rule (blind_schedule.h): 1 BB, or BB/8 per player.
+    const BlindLevel level =
+        with_antes({BlindLevel{config.small_blind, config.big_blind, 0, AnteType::None}}, options.antes, 1).front();
+    config.ante_type = level.ante_type;
+    config.ante = level.ante;
     config.seed = splitmix64(hand_seed ^ 0x01);
     config.hero_seat = kHero;
     config.first_button = hand_index % kMaxSeats;

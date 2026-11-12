@@ -244,3 +244,46 @@ TEST(PushFold, ResponsesAndNulloptCases) {
     EXPECT_FALSE(push_fold_response(hc("AA"), Position::SB, 10, Position::BB).has_value());
     EXPECT_FALSE(push_fold_response(hc("AA"), Position::BTN, 10, Position::BB, 2).has_value());
 }
+
+TEST(PushFoldAntes, DeadMoneyPicksTheLargestLevelNotAbove) {
+    const auto pct = [](double dead) { return push_fold_jam_range(Position::BTN, 10, kMaxSeats, dead)->percent(); };
+    EXPECT_DOUBLE_EQ(pct(0.0), push_fold_jam_range(Position::BTN, 10)->percent());
+    EXPECT_DOUBLE_EQ(pct(0.49), pct(0.0));
+    EXPECT_DOUBLE_EQ(pct(0.5), pct(0.99));
+    EXPECT_DOUBLE_EQ(pct(1.0), pct(1.49));
+    EXPECT_DOUBLE_EQ(pct(1.5), pct(4.0));
+    EXPECT_LT(pct(0.0), pct(0.5));
+    EXPECT_LT(pct(0.5), pct(1.0));
+    EXPECT_LT(pct(1.0), pct(1.5));
+}
+
+TEST(PushFoldAntes, MoreDeadMoneyWidensJamsAndCalls) {
+    // Each table against the one below it: wider on average, and never much tighter
+    // (fictitious play's rounding moves a few borderline classes).
+    for (int level = 0; level < detail::kPushFoldAnteLevels; ++level) {
+        const double lower = level == 0 ? 0.0 : detail::kPushFoldAnteDeadBb[level - 1];
+        const double upper = detail::kPushFoldAnteDeadBb[level];
+        double jam_gain = 0.0;
+        double call_gain = 0.0;
+        for (int jammer = 0; jammer < detail::kPushFoldJammerCount; ++jammer) {
+            const auto from = static_cast<Position>(jammer);
+            for (int stack = kPushFoldMinStackBb; stack <= kPushFoldMaxStackBb; ++stack) {
+                const double a = push_fold_jam_range(from, stack, kMaxSeats, lower)->percent();
+                const double b = push_fold_jam_range(from, stack, kMaxSeats, upper)->percent();
+                EXPECT_GE(b, a - 2.0) << to_string(from) << " " << stack << " BB at " << upper;
+                jam_gain += b - a;
+                const double c = push_fold_call_range(Position::BB, from, stack, kMaxSeats, lower)->percent();
+                const double d = push_fold_call_range(Position::BB, from, stack, kMaxSeats, upper)->percent();
+                EXPECT_GE(d, c - 2.0) << "BB v " << to_string(from) << " " << stack << " BB at " << upper;
+                call_gain += d - c;
+            }
+        }
+        EXPECT_GT(jam_gain, 0.0);
+        EXPECT_GT(call_gain, 0.0);
+    }
+}
+
+TEST(PushFoldAntes, HeadsUpButtonUsesTheSmallBlindAnteTable) {
+    EXPECT_EQ(push_fold_jam_range(Position::BTN, 8, 2, 1.0)->percent(),
+              push_fold_jam_range(Position::SB, 8, kMaxSeats, 1.0)->percent());
+}

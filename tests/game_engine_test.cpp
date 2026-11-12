@@ -808,3 +808,307 @@ TEST(GameEngine, ChipsAreConservedAcrossRandomizedSession) {
         ASSERT_EQ(stack_total(e), 12000);
     }
 }
+
+// --- Blind levels and antes ----------------------------------------------------
+
+namespace {
+
+GameConfig with_level(GameConfig config, int sb, int bb, int ante, AnteType type) {
+    config.small_blind = sb;
+    config.big_blind = bb;
+    config.ante = ante;
+    config.ante_type = type;
+    return config;
+}
+
+// Checks whoever is to act until the hand ends.
+void check_down(GameEngine& e) {
+    while (e.state().phase == GamePhase::Betting) {
+        ASSERT_TRUE(e.apply_action({ActionType::Check}));
+    }
+}
+
+int chips_in_play(const GameEngine& e) {
+    int total = 0;
+    for (const Seat& s : e.state().seats) total += s.stack + s.total_bet + s.ante_posted;
+    return total;
+}
+
+std::array<std::array<Card, 2>, kMaxSeats> holes_of(const GameEngine& e) {
+    std::array<std::array<Card, 2>, kMaxSeats> holes{};
+    for (int seat = 0; seat < kMaxSeats; ++seat) {
+        if (e.state().seats[seat].hole) holes[seat] = *e.state().seats[seat].hole;
+    }
+    return holes;
+}
+
+}  // namespace
+
+TEST(GameEngineLevels, RejectsBadLevels) {
+    GameEngine e(config_with(kThreeHanded));
+    EXPECT_THROW(e.set_level({0, 20, 0, AnteType::None}), std::invalid_argument);
+    EXPECT_THROW(e.set_level({30, 20, 0, AnteType::None}), std::invalid_argument);
+    EXPECT_THROW(e.set_level({10, 20, -1, AnteType::PerPlayer}), std::invalid_argument);
+    EXPECT_THROW(GameEngine(with_level(config_with(kThreeHanded), 10, 20, -5, AnteType::BigBlind)),
+                 std::invalid_argument);
+}
+
+TEST(GameEngineLevels, NewLevelAppliesFromTheNextHandOnly) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    EXPECT_THROW(e.set_level({25, 50, 0, AnteType::None}), std::logic_error);
+    fold(e, 0);
+    fold(e, 1);
+
+    e.set_level({25, 50, 0, AnteType::None});
+    EXPECT_EQ(e.state().level.big_blind, 20);  // The finished hand keeps its blinds
+    e.start_hand();
+    const GameState& s = e.state();
+    EXPECT_EQ(s.level.small_blind, 25);
+    EXPECT_EQ(s.level.big_blind, 50);
+    EXPECT_EQ(s.small_blind_posted, 25);
+    EXPECT_EQ(s.big_blind_posted, 50);
+    EXPECT_EQ(s.current_bet, 50);
+    EXPECT_EQ(e.legal_actions().min_raise_to, 100);
+    EXPECT_EQ(e.player_view(0).big_blind, 50);
+    EXPECT_EQ(e.player_view(0).small_blind, 25);
+}
+
+TEST(GameEngineLevels, MinimumBetPostflopIsTheHandsBigBlind) {
+    GameEngine e(config_with(kThreeHanded));
+    e.set_level({50, 100, 0, AnteType::None});
+    e.start_hand();
+    call(e, 0);
+    call(e, 1);
+    check(e, 2);
+    EXPECT_EQ(e.legal_actions().min_raise_to, 100);
+}
+
+TEST(GameEngineLevels, NewGameWithConfigKeepsTheRandomStream) {
+    GameConfig config = config_with(kThreeHanded);
+    config.seed = 99;
+    config.first_button.reset();
+
+    GameEngine changed(config);
+    changed.start_hand();
+    changed.new_game(with_level(config, 50, 100, 10, AnteType::PerPlayer));
+    changed.start_hand();
+
+    GameEngine same(config);
+    same.start_hand();
+    same.new_game();
+    same.start_hand();
+
+    EXPECT_EQ(holes_of(changed), holes_of(same));
+    EXPECT_EQ(changed.state().button, same.state().button);
+    EXPECT_EQ(changed.state().level.big_blind, 100);
+
+    GameEngine fresh(config);
+    fresh.start_hand();
+    EXPECT_NE(holes_of(fresh), holes_of(changed));  // No replay of the first deal
+}
+
+TEST(GameEngineLevels, NewGameWithABadConfigChangesNothing) {
+    GameEngine e(config_with(kThreeHanded));
+    GameConfig bad = config_with(kThreeHanded);
+    bad.big_blind = 0;
+    EXPECT_THROW(e.new_game(bad), std::invalid_argument);
+    EXPECT_EQ(e.next_level().big_blind, 20);
+    EXPECT_NO_THROW(e.start_hand());
+}
+
+TEST(GameEngineAntes, PerPlayerAntesWalkKeepsAntesAndRefundsOnlyTheBlindDifference) {
+    GameEngine e(with_level(config_with(kThreeHanded), 10, 20, 5, AnteType::PerPlayer));
+    e.start_hand();
+    const GameState& s = e.state();
+    EXPECT_EQ(s.seats[0].stack, 995);
+    EXPECT_EQ(s.seats[1].stack, 985);
+    EXPECT_EQ(s.seats[2].stack, 975);
+    EXPECT_EQ(s.seats[1].ante_posted, 5);
+    EXPECT_EQ(s.seats[1].total_bet, 10);  // Antes are not bets
+    EXPECT_EQ(s.total_pot(), 45);
+    EXPECT_EQ(s.street_start_pot[0], 45);
+    EXPECT_EQ(s.current_bet, 20);
+    EXPECT_EQ(e.legal_actions().call_amount, 20);
+    EXPECT_EQ(e.legal_actions().min_raise_to, 40);
+
+    fold(e, 0);
+    fold(e, 1);
+    ASSERT_TRUE(s.last_result);
+    ASSERT_EQ(s.last_result->payouts.size(), 1u);
+    EXPECT_EQ(s.last_result->payouts[0].amount, 35);  // 3 antes + both blinds' 10
+    ASSERT_TRUE(s.last_result->refund);
+    EXPECT_EQ(s.last_result->refund->amount, 10);
+    EXPECT_EQ(s.seats[2].stack, 1020);
+    EXPECT_EQ(stack_total(e), 3000);
+}
+
+TEST(GameEngineAntes, BigBlindAnteIsDeadMoneyAfterTheBlind) {
+    GameEngine e(with_level(config_with(kThreeHanded), 10, 20, 20, AnteType::BigBlind));
+    e.start_hand();
+    const GameState& s = e.state();
+    EXPECT_EQ(s.seats[0].ante_posted, 0);
+    EXPECT_EQ(s.seats[2].ante_posted, 20);
+    EXPECT_EQ(s.seats[2].total_bet, 20);
+    EXPECT_EQ(s.seats[2].stack, 960);
+    EXPECT_EQ(s.total_pot(), 50);
+    const LivePots live = e.live_pots();
+    EXPECT_EQ(live.total, 50);
+    EXPECT_EQ(live.uncalled, 10);
+    ASSERT_EQ(live.pots.size(), 1u);
+    EXPECT_EQ(live.pots[0].amount, 40);
+
+    fold(e, 0);
+    fold(e, 1);
+    // The ante is never "uncalled": the BB gets it back only by winning the pot.
+    EXPECT_EQ(s.last_result->payouts[0].amount, 40);
+    EXPECT_EQ(s.last_result->refund->amount, 10);
+    EXPECT_EQ(s.seats[2].stack, 1010);
+    EXPECT_EQ(stack_total(e), 3000);
+}
+
+TEST(GameEngineAntes, ShortBigBlindPostsTheBlindBeforeTheAnte) {
+    GameEngine e(with_level(config_with({1000, 1000, 25, 0, 0, 0}), 10, 20, 20, AnteType::BigBlind));
+    e.start_hand(strength_order_deal({1, 2, 0, 3, 4, 5}));
+    const GameState& s = e.state();
+    EXPECT_EQ(s.big_blind_posted, 20);
+    EXPECT_EQ(s.seats[2].ante_posted, 5);
+    EXPECT_EQ(s.seats[2].status, SeatStatus::AllIn);
+    EXPECT_EQ(s.current_bet, 20);
+
+    call(e, 0);
+    fold(e, 1);
+    ASSERT_EQ(s.phase, GamePhase::BetweenHands);
+    ASSERT_TRUE(s.last_result->showdown);
+    // Main pot: 10 + 10 + 10 from the SB's blind, the rest of both 20s, plus 5 dead.
+    ASSERT_EQ(s.last_result->pots.size(), 1u);
+    EXPECT_EQ(s.last_result->pots[0].amount, 55);
+    EXPECT_EQ(s.seats[2].stack, 55);
+    EXPECT_EQ(stack_total(e), 2025);
+}
+
+TEST(GameEngineAntes, PlayerAllInForLessThanTheAnteGetsASidePotOfTheRightSize) {
+    GameEngine e(with_level(config_with({1000, 1000, 1000, 3, 0, 0}), 10, 20, 5, AnteType::PerPlayer));
+    e.start_hand(strength_order_deal({1, 2, 3, 0, 4, 5}));
+    const GameState& s = e.state();
+    EXPECT_EQ(s.seats[3].ante_posted, 3);
+    EXPECT_EQ(s.seats[3].status, SeatStatus::AllIn);
+    EXPECT_EQ(s.to_act, 0);  // UTG is all in from the ante
+
+    call(e, 0);
+    call(e, 1);
+    check(e, 2);
+    check_down(e);
+    ASSERT_TRUE(s.last_result->showdown);
+    ASSERT_EQ(s.last_result->pots.size(), 2u);
+    EXPECT_EQ(s.last_result->pots[0].amount, 12);  // 3 from each of four players
+    EXPECT_EQ(s.last_result->pots[1].amount, 66);  // 22 more from each of three
+    EXPECT_EQ(s.seats[3].stack, 12);
+    EXPECT_EQ(s.seats[0].stack, 1041);
+    EXPECT_EQ(stack_total(e), 3003);
+}
+
+TEST(GameEngineAntes, SmallBlindAllInFromTheAntePostsNothing) {
+    GameEngine e(with_level(config_with({1000, 4, 1000, 0, 0, 0}), 10, 20, 5, AnteType::PerPlayer));
+    e.start_hand(strength_order_deal({1, 0, 2, 3, 4, 5}));
+    const GameState& s = e.state();
+    EXPECT_EQ(s.small_blind_seat, 1);
+    EXPECT_EQ(s.small_blind_posted, 0);
+    EXPECT_EQ(s.seats[1].ante_posted, 4);
+    call(e, 0);
+    check(e, 2);
+    check_down(e);
+    // Seat 1 wins 4 from each of the three; the rest goes to the best of seats 0 and 2.
+    EXPECT_EQ(s.seats[1].stack, 12);
+    EXPECT_EQ(stack_total(e), 2004);
+}
+
+TEST(GameEngineAntes, HeadsUpWithEitherAnte) {
+    {
+        GameEngine e(with_level(config_with({1000, 1000, 0, 0, 0, 0}), 10, 20, 5, AnteType::PerPlayer));
+        e.start_hand();
+        EXPECT_EQ(e.state().small_blind_seat, 0);
+        EXPECT_EQ(e.state().total_pot(), 40);
+        fold(e, 0);
+        EXPECT_EQ(e.state().seats[1].stack, 1015);
+        EXPECT_EQ(e.state().seats[0].stack, 985);
+    }
+    {
+        GameEngine e(with_level(config_with({1000, 1000, 0, 0, 0, 0}), 10, 20, 20, AnteType::BigBlind));
+        e.start_hand();
+        EXPECT_EQ(e.state().total_pot(), 50);
+        fold(e, 0);
+        EXPECT_EQ(e.state().seats[1].stack, 1010);
+        EXPECT_EQ(e.state().seats[0].stack, 990);
+    }
+}
+
+TEST(GameEngineAntes, AntesSitOutsideBetsInTheView) {
+    GameEngine e(with_level(config_with(kThreeHanded), 10, 20, 5, AnteType::PerPlayer));
+    e.start_hand();
+    const PlayerView view = e.player_view(0);
+    EXPECT_EQ(view.ante, 5);
+    EXPECT_EQ(view.ante_type, AnteType::PerPlayer);
+    EXPECT_EQ(view.total_pot, 45);
+    EXPECT_EQ(view.dead_money(), 15);
+    EXPECT_EQ(view.seats[2].total_bet, 20);
+    EXPECT_EQ(view.seats[2].ante_posted, 5);
+
+    // Mid-hand, a summary counts chips already in the middle as the owner's.
+    const SessionSummary summary = e.session_summary();
+    EXPECT_EQ(summary.final_stacks[0], 1000);
+    EXPECT_EQ(summary.final_stacks[2], 1000);
+}
+
+TEST(GameEngineAntes, NoAnteMeansNoDeadMoney) {
+    GameEngine e(config_with(kThreeHanded));
+    e.start_hand();
+    EXPECT_EQ(e.player_view(0).dead_money(), 0);
+    EXPECT_EQ(e.player_view(0).ante_type, AnteType::None);
+    EXPECT_EQ(e.state().total_antes(), 0);
+}
+
+TEST(GameEngineAntes, ChipsAreConservedThroughEveryActionWithRisingLevelsAndAntes) {
+    for (const AnteType type : {AnteType::PerPlayer, AnteType::BigBlind}) {
+        GameConfig config;
+        config.seed = 21;
+        config.hero_seat = std::nullopt;
+        config.starting_stack = 600;
+        GameEngine e(config);
+        std::mt19937_64 rng(13);
+
+        int hand = 0;
+        int level_hand = 0;
+        for (; hand < 400; ++hand, ++level_hand) {
+            if (e.state().phase == GamePhase::SessionOver) {
+                e.new_game();
+                level_hand = 0;
+            }
+            const int bb = 20 + 20 * (level_hand / 15);
+            e.set_level({bb / 2, bb, type == AnteType::BigBlind ? bb : bb / 8, type});
+            e.start_hand();  // Can run out at once when blinds and antes put players all in
+            if (e.state().phase == GamePhase::Betting) {
+                ASSERT_EQ(chips_in_play(e), 3600);
+            }
+            while (e.state().phase == GamePhase::Betting) {
+                const LegalActions legal = e.legal_actions();
+                Action action{ActionType::Fold};
+                if (legal.allows(ActionType::AllIn) && rng() % 6 == 0) action = {ActionType::AllIn};
+                else if (legal.allows(ActionType::Raise) && rng() % 4 == 0) action = {ActionType::Raise, legal.min_raise_to};
+                else if (legal.allows(ActionType::Bet) && rng() % 4 == 0) action = {ActionType::Bet, legal.min_raise_to};
+                else if (legal.allows(ActionType::Check)) action = {ActionType::Check};
+                else if (legal.allows(ActionType::Call) && rng() % 3 != 0) action = {ActionType::Call};
+                ASSERT_TRUE(e.apply_action(action));
+                if (e.state().phase != GamePhase::Betting) break;  // Paid out; bets stay recorded
+                ASSERT_EQ(chips_in_play(e), 3600) << to_string(type) << " hand " << hand;
+                const LivePots live = e.live_pots();
+                int shown = live.uncalled;
+                for (const Pot& pot : live.pots) shown += pot.amount;
+                ASSERT_EQ(shown, live.total);
+                ASSERT_EQ(live.total, e.state().total_pot());
+            }
+            ASSERT_EQ(stack_total(e), 3600) << to_string(type) << " hand " << hand;
+        }
+        EXPECT_EQ(hand, 400);
+    }
+}

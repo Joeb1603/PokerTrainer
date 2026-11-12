@@ -12,6 +12,7 @@
 #include "advisor/training_advisor.h"
 #include "bots/bot_strategy.h"
 #include "bots/bots.h"
+#include "controller/blind_schedule.h"
 #include "controller/game_controller.h"
 #include "controller/solver_service.h"
 #include "engine/game_engine.h"
@@ -24,9 +25,9 @@ struct ControllerOptions {
     std::filesystem::path log_dir = "logs";
     double bot_delay_ms = 400.0;
     bool instant_play = false;
-    int starting_stack = 2000;
-    int small_blind = 10;
-    int big_blind = 20;
+    // The first session's game; later ones follow set_game_setup. The default is the
+    // classic freezeout: 10/20 and 2000 chips.
+    GameSetup setup = default_freezeout();
     int bot_rollouts = kDefaultRollouts;
     int advisor_rollouts = kDefaultRollouts;
 
@@ -46,7 +47,7 @@ struct ControllerOptions {
     bool random_personalities = false;
 };
 
-// Runs a local freezeout: Hero in seat 0 against Nit, Loose, GTO, WildGTO and Shifter
+// Runs a local freezeout or tournament: Hero in seat 0 against Nit, Loose, GTO, WildGTO and Shifter
 // in seats 1 to 5, or, with random personalities, five bots drawn from the wider pool.
 // Bots act on the caller's thread, which is fine at about 2 ms a decision. Each hand is
 // logged as it ends; a session summary is written when the freezeout ends, on
@@ -77,6 +78,9 @@ public:
     int solver_budget_ms() const override { return solver_budget_ms_; }
     void set_random_personalities(bool enabled) override;
     bool random_personalities() const override { return random_pending_; }
+    [[nodiscard]] bool set_game_setup(const GameSetup& setup) override;
+    const GameSetup& game_setup() const override { return pending_setup_; }
+    void set_clock_paused(bool paused) override;
 
 private:
     // Builds the five bots: the classic lineup, or a random one from lineup_rng_.
@@ -88,6 +92,9 @@ private:
     void on_hand_finished();
     void write_session_summary() noexcept;
     HandLogContext log_context(bool per_hand_labels) const;
+    bool tournament() const { return active_setup_.mode == GameMode::Tournament; }
+    void reset_clock();
+    std::optional<int> hero_place(const SessionSummary& summary) const;
     void rebuild_snapshot();
     std::vector<std::string> build_action_log() const;
     void note_log_failure(const std::exception& error) noexcept;
@@ -106,6 +113,10 @@ private:
     bool random_pending_ = false;  // The option as set; applies at the next session
     bool random_active_ = false;   // This session's bots were drawn at random
     std::array<int, kMaxSeats> starting_stacks_{};
+    GameSetup active_setup_;   // This session's game
+    GameSetup pending_setup_;  // The next session's
+    TournamentClock clock_;
+    std::array<int, kMaxSeats> hand_start_stacks_{};  // Before the latest hand's blinds and antes
 
     std::optional<HandLogger> hand_logger_;
     std::optional<SessionLogger> session_logger_;

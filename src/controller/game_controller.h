@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "advisor/training_advisor.h"
+#include "controller/blind_schedule.h"
 #include "controller/solver_service.h"
 #include "core/card.h"
 #include "engine/pots.h"
@@ -61,6 +62,25 @@ struct SessionStats {
     // and the style it played, e.g. "Marta: LAG". The Shifter is shown as "Shifter",
     // never the profile it played in any one hand. Empty otherwise.
     std::vector<std::string> lineup;
+
+    GameMode mode = GameMode::Freezeout;
+    int level_reached = 1;           // Tournament level of the latest hand, 1-based
+    // Hero's finishing place, 1 to 6, once the session is over (1: won). Players
+    // busted on the same hand place by the chips they started it with.
+    std::optional<int> hero_place;
+};
+
+// A tournament's clock as the front end shows it. Nothing here is hidden.
+struct TournamentPanel {
+    int level = 1;  // 1-based, of the hand in play or just finished
+    BlindLevel current;
+    std::optional<BlindLevel> next;  // Absent on the last level, which lasts for ever
+    LevelUnit unit = LevelUnit::Hands;
+    int level_length = 0;
+    int hands_until_next = 0;       // Hands: hands still to start first (0 = the next one)
+    double seconds_until_next = 0;  // Minutes: at or below 0, the next hand moves up
+    bool paused = false;
+    bool level_changed = false;     // This hand began a new level
 };
 
 // Solver mode, as the front end shows it. The advice is for Hero's own cards only,
@@ -78,8 +98,13 @@ struct TableSnapshot {
     ControllerPhase phase = ControllerPhase::BotToAct;
     int hand_number = 0;
     Street street = Street::Preflop;
-    int small_blind = 0;
+    int small_blind = 0;  // Of the hand in play, or the latest one
     int big_blind = 0;
+    int ante = 0;
+    AnteType ante_type = AnteType::None;
+    GameMode mode = GameMode::Freezeout;
+    std::optional<TournamentPanel> tournament;  // Tournament mode only
+    bool setup_pending = false;  // A different game setup applies from the next session
     std::array<SeatSnapshot, kMaxSeats> seats;
     std::vector<Card> board;
     std::optional<std::string> waiting_on;
@@ -149,8 +174,16 @@ public:
     // Returns false during a hand.
     [[nodiscard]] virtual bool reveal_bot_hands() = 0;
 
-    // Ends the current freezeout, even mid-hand, and starts a new one.
+    // Ends the current game, even mid-hand, and starts a new one with the game setup.
     virtual void new_session() = 0;
+
+    // The game the next new_session() plays: mode, blinds, stacks and, for a
+    // tournament, its levels. Returns false, changing nothing, if validate() rejects it.
+    [[nodiscard]] virtual bool set_game_setup(const GameSetup& setup) = 0;
+    virtual const GameSetup& game_setup() const = 0;  // As set, which may not have applied yet
+
+    // Stops a tournament's clock in minutes mode; the hands count goes on.
+    virtual void set_clock_paused(bool paused) = 0;
 
     virtual void set_bot_delay_ms(double delay_ms) = 0;
     virtual double bot_delay_ms() const = 0;

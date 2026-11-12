@@ -125,6 +125,45 @@ TEST(HandLog, ExactLineForAFullHand) {
     EXPECT_EQ(serialize_hand(e.state(), context()), expected);
 }
 
+TEST(HandLog, ExactLineWithPerPlayerAntesAndALevel) {
+    GameConfig config = config_with(kThreeHanded);
+    config.ante = 5;
+    config.ante_type = AnteType::PerPlayer;
+    GameEngine e(config);
+    e.start_hand(three_handed_deal());
+    act(e, ActionType::Fold);  // BTN
+    act(e, ActionType::Fold);  // SB
+
+    HandLogContext c = context();
+    c.level = 3;
+    EXPECT_EQ(serialize_hand(e.state(), c),
+              R"({"session_id":"S1","h":1,"sb":10,"bb":20,"lvl":3,"ante":5,"at":"each","btn":0,)"
+              R"("post":{"sb":{"s":1,"amt":10},"bb":{"s":2,"amt":20},)"
+              R"("ante":[{"s":0,"amt":5},{"s":1,"amt":5},{"s":2,"amt":5}]},)"
+              R"("seats":[{"s":0,"p":"Hero","pos":"BTN","st":1000,"c":"AsAd"},{"s":1,"p":"Nit","pos":"SB","st":1000},)"
+              R"({"s":2,"p":"Shift:GTO","pos":"BB","st":1000}],)"
+              R"("pre":{"pot":45,"a":["BTN:F","SB:F"]},"win":[{"p":"Shift:GTO","amt":35}],)"
+              R"("ref":{"s":2,"amt":10},"hero_mistakes":[]})");
+}
+
+TEST(HandLog, ExactLineWithABigBlindAnte) {
+    GameConfig config = config_with(kThreeHanded);
+    config.ante = 20;
+    config.ante_type = AnteType::BigBlind;
+    GameEngine e(config);
+    e.start_hand(three_handed_deal());
+    act(e, ActionType::Fold);
+    act(e, ActionType::Fold);
+
+    EXPECT_EQ(serialize_hand(e.state(), context()),
+              R"({"session_id":"S1","h":1,"sb":10,"bb":20,"ante":20,"at":"bb","btn":0,)"
+              R"("post":{"sb":{"s":1,"amt":10},"bb":{"s":2,"amt":20},"ante":[{"s":2,"amt":20}]},)"
+              R"("seats":[{"s":0,"p":"Hero","pos":"BTN","st":1000,"c":"AsAd"},{"s":1,"p":"Nit","pos":"SB","st":1000},)"
+              R"({"s":2,"p":"Shift:GTO","pos":"BB","st":1000}],)"
+              R"("pre":{"pot":50,"a":["BTN:F","SB:F"]},"win":[{"p":"Shift:GTO","amt":40}],)"
+              R"("ref":{"s":2,"amt":10},"hero_mistakes":[]})");
+}
+
 TEST(HandLog, RejectsAHandThatHasNotFinished) {
     GameEngine e(config_with(kThreeHanded));
     EXPECT_THROW(serialize_hand(e.state(), context()), std::logic_error);
@@ -661,6 +700,31 @@ TEST_F(LoggerFiles, SessionSummaryExactLine) {
               R"({"s":2,"p":"Shift:GTO","st":1000,"end":1200}],)"
               R"("hero":{"s":0,"net":-100,"bust":true,"mistakes":3,"ev_loss":18.3,)"
               R"("by_street":{"pre":2,"flop":0,"turn":0,"riv":1}}})");
+}
+
+TEST_F(LoggerFiles, TournamentSessionExactLine) {
+    const fs::path path = dir_ / "s.jsonl";
+    SessionLogger logger({1000, 1000, 0, 0, 0, 0}, path);
+    SessionSummary summary;
+    summary.hands_played = 12;
+    summary.final_stacks = {0, 2000, 0, 0, 0, 0};
+    summary.busted_on_hand[0] = 12;
+    summary.hero_busted = true;
+    summary.winner = 1;
+
+    HandLogContext c = context();
+    c.level = 4;
+    c.tournament = TournamentLog{2, "min", 5, {{10, 20, 0, AnteType::None}, {15, 30, 30, AnteType::BigBlind}}};
+    logger.write_session(summary, c, "t");
+    const auto lines = read_lines(path);
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_EQ(lines[0],
+              R"({"session_id":"S1","ts":"t","sb":10,"bb":20,"mode":"T","lvl":4,"place":2,)"
+              R"("sched":{"unit":"min","len":5,"lv":[[10,20,0],[15,30,30]],"at":"bb"},)"
+              R"("hands":12,"done":true,"winner":"Nit",)"
+              R"("seats":[{"s":0,"p":"Hero","st":1000,"end":0,"bust":12},{"s":1,"p":"Nit","st":1000,"end":2000}],)"
+              R"("hero":{"s":0,"net":-1000,"bust":true,"mistakes":0,"ev_loss":0.0,)"
+              R"("by_street":{"pre":0,"flop":0,"turn":0,"riv":0}}})");
 }
 
 TEST_F(LoggerFiles, SessionReportsWinnerAndNoHeroBlockWithoutAHero) {

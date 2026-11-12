@@ -32,6 +32,28 @@ constexpr std::string_view to_string(ActionType type) {
     return names[static_cast<std::size_t>(type)];
 }
 
+// Antes are dead money: they never count toward the bet to call, a raise or an
+// uncalled refund. PerPlayer: every dealt-in seat posts `ante` before the blinds.
+// BigBlind: the big blind posts one ante for the table after its blind (TDA order),
+// from whatever its blind leaves.
+enum class AnteType : std::uint8_t { None, PerPlayer, BigBlind };
+
+constexpr std::string_view to_string(AnteType type) {
+    constexpr std::array<std::string_view, 3> names{"None", "PerPlayer", "BigBlind"};
+    return names[static_cast<std::size_t>(type)];
+}
+
+// The forced bets of one hand.
+struct BlindLevel {
+    int small_blind = 10;
+    int big_blind = 20;
+    int ante = 0;
+    AnteType ante_type = AnteType::None;
+
+    bool has_ante() const { return ante > 0 && ante_type != AnteType::None; }
+    friend bool operator==(const BlindLevel&, const BlindLevel&) = default;
+};
+
 // A player's decision. `amount` is used only by Bet and Raise, and is the total
 // the player's street bet becomes ("raise to"), not the chips added.
 struct Action {

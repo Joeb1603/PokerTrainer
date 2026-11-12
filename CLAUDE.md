@@ -34,6 +34,8 @@ Design the architecture with strict separation between the Core Game/Bot Engine 
 
 \- \*\*Full NLHE Rules:\*\* Accurate dealer button rotation, heads-up blind rules when down to 2 players, minimum legal raise sizing, all-in short-stack protection, and multi-way side-pot calculation and distribution.
 
+- *Note (game modes):* the freezeout above is still the default, now with its big blind and starting stack (in BB) chosen on a "New Game" screen. A second mode, Tournament, keeps the six seats and no rebuys but raises the blinds every N hands or minutes, from a preset schedule (Standard, Turbo, Hyper) that can be multiplied or edited level by level, with optional antes (per player or a big-blind ante); see section 8.
+
 
 
 \## 4. Bot Architecture \& 5 Personalities
@@ -90,6 +92,8 @@ Implement `HandLogger` writing one single-line JSON object per completed hand to
 
 &#x20; - `hero\_mistakes`: array of streets where Hero's chosen action deviated significantly from the GTO Hint recommendation.
 
+- *Note (game modes):* `sb` and `bb` are now each hand's own blinds. Tournaments add `lvl`, hands with antes add `ante`, `at` and `post.ante`, and the session line adds `mode`, `lvl`, `place` and `sched`; a freezeout without antes writes exactly the old lines. See `hand_logger.h`.
+
 
 
 \## 7. Phased Implementation Plan (Execute Step-by-Step)
@@ -125,6 +129,15 @@ Random personalities (after `v1.2.0`, not yet released) is done. With the option
 - **App:** `poker_trainer_settings.json` beside `logs/` remembers the option (`src/app/app_settings`).
 - **Pins:** `Golden.ClassicBotsDecideAsBefore` and `Controller.OffModeLogsUnchanged` hash the classic bots' decisions and the default table's logs; `TableReport.DISABLED_PoolStats` prints VPIP, PFR and aggression per style.
 
+Game modes (after `v1.2.0`, not yet released) is done. With the default setup (Freezeout, 10/20, 100 BB, no antes) the table and its logs are byte-identical. What it added:
+- **Engine:** `BlindLevel` and `AnteType` (`table_types.h`); `GameState::level` holds each hand's blinds and ante; `set_level()` between hands; `new_game(GameConfig)` swaps stacks and blinds but keeps the RNG running. Antes are dead money outside `total_bet` (`Seat::ante_posted`, `PublicSeat::ante_posted`, `PlayerView::dead_money()`): per-player antes layer into side pots, a big-blind ante goes to the main pot (`calculate_pots(..., dead_money)`); neither changes the bet to call, the minimum raise or the uncalled refund.
+- **Schedule** (`src/controller/blind_schedule`): `GameSetup`, presets as BB multiples rounded by `tidy_chips`, `with_antes`, `scale_schedule`, `validate`, and `TournamentClock` (levels by hands or by `tick()` time, changing only when a hand starts; Pause; each tick counts at most 1 s).
+- **Controller:** `ControllerOptions::setup` replaces `starting_stack`/`small_blind`/`big_blind`; `set_game_setup` applies at the next `new_session()`, like random personalities. The snapshot has the hand's blinds and ante, `mode`, `tournament` (`TournamentPanel`) and `setup_pending`; `SessionStats` has `mode`, `level_reached` and `hero_place`.
+- **Player side:** pot odds and pot layers count the dead money (`pot_math`, `pot_layers`); push/fold has ante tables at 0.5, 1 and 1.5 BB of dead money (`push_fold_ante_data.cpp`, chosen as the largest not above the pot's), used by the advisor and range model. The bots' charts and the advisor's opening charts are unchanged.
+- **UI:** a "New Game" screen (`src/app/setup_panel`) at launch and from New Session and Start New Game; the level, ante and next level in the felt's top-left corner, with Pause clock in minutes mode; the finishing place and level on the session-over console.
+- **App:** the settings file also keeps `game_setup`, saved when Start is pressed; game flags in section 9.
+- **Tools:** `advisor_matchup --stack-bb N --antes none|player|bb` plays short, ante hands.
+
 ## 9. Build and Test
 
 Uses the "Visual Studio 18 2026" generator, x64, in `build/`:
@@ -156,6 +169,7 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - Windowless UI tests are in `tests/trainer_ui_test.cpp`. They inject ImGui input at fixed coordinates, so layout changes mean updating those constants.
 - `main.cpp` has developer flags for reaching rare screens: `--seed`, `--log-dir`, `--exit-after-frames`, `--auto-shove`, `--stop-on live-side-pot|side-pot|showdown|flop|bust|folded`, `--reveal`, `--bot-delay MS`, `--solver`, `--solver-budget MS`, `--solver-tier off|river|turn|flop`. `folded` has Hero fold a hand that goes on, then pauses the bots.
 - User-facing flags: `--random-personalities on|off` (sets the option for one run without saving it) and `--settings PATH` (the settings file; default `poker_trainer_settings.json` in the working folder). Pass `--settings` when running the app from a tool, so a run never writes into the repo.
+- Game flags, for one run without saving: `--mode freezeout|tournament`, `--big-blind N`, `--stack-bb N`, `--level-hands N` or `--level-minutes N`, `--preset standard|turbo|hyper`, `--antes none|player|bb`. The New Game screen opens first unless `--skip-setup`, `--exit-after-frames`, `--auto-shove`, `--stop-on` or `--screenshot` is given; `--show-setup` opens it anyway (for screenshots of it). Closing the window on it quits without starting a session. A flag value that `validate()` rejects is shown there as the problem, or stops the app when the screen is skipped. The settings file changes only when the player presses Start (the whole screen) or toggles the sidebar checkbox (that option alone).
 - More developer flags for reviewing the UI: `--advice baseline|nit|station|maniac` (initial "Advice:" choice), `--hover X,Y` (holds the ImGui mouse there, for tooltips), `--size WxH` (window size, at least 1180x760), and `--screenshot PATH` (saves the last frame as a PNG, with `--exit-after-frames` or on close; works under `xvfb-run` on Linux).
 - To screenshot the app when other windows may cover it, capture the window itself with Win32 `PrintWindow` (flag 2). `CopyFromScreen` captures whatever is on top.
 - In PowerShell, double quotes inside a `git commit -m` here-string break the argument. Write the message to a file and use `git commit -F`.
@@ -168,6 +182,7 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - **Solver service:** it gets only a `PlayerView` and builds both ranges from it with the range model (every villain read as Baseline). Its advice covers Hero's own combo only.
 - **Player types are generic:** Baseline, Nit, Station and Maniac are applied to all opponents alike. No per-seat type, label or bot identity may reach the advisor, the solver or the UI, so `PlayerView` stays unchanged and the Shifter stays hidden.
 - **Random personalities:** bot names come from the controller and say nothing about style. A bot's style reaches only the hand log and, once the session is over, `SessionStats::lineup` (a deliberate exception the user asked for: the reveal at the end). The Shifter shows there as "Shifter", never its sub-profile. Nothing about the lineup reaches the advisor or the solver.
+- **Game setup:** the New Game screen (`SetupPanel`) edits only a `GameSetup`; `TrainerUi` applies it through `IGameController::set_game_setup` and `new_session()`. The tournament clock lives in the controller; the app passes no time to `tick()` while the screen is open.
 - **Front end:** `TrainerUi` sees only `IGameController` and `TableSnapshot`. The snapshot has hidden information removed already, and new UI data should be added to it. The UI must not reach into engine state.
 - **Shifter and Tilter:** the Shifter's active profile appears only in the hand log, as `Shift:<SubProfile>`, never in the snapshot or UI; so does the Tilter's state, as `Tilt:On` or `Tilt:Off`.
 - **Logging:** a change to the UI or advice must not change the JSONL schema unless that's the request. `describe_hand` keeps log text stable; `describe_made_hand` gives UI names.
@@ -197,6 +212,9 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - **Reveal Bot Hands:** a display option for finished hands only. It doesn't change logs, `shown_hand` or payouts. Hero's own folded cards don't wait for it: they stay on the table, dimmed (`revealed_after_fold`), for the rest of the hand.
 - **Random personalities off is the classic table, byte-identical:** the classic bots are seeded `seed + 1000 + seat` and kept across `new_session()`, as before; only a random lineup (or leaving one) rebuilds them. New knobs draw from the generator only when above 0, through raw bits (`unit_roll`, `uniform_below` in `core/random.h`). `Golden.ClassicBotsDecideAsBefore` and `Controller.OffModeLogsUnchanged` pin this.
 - **The lineup has its own stream** (`seed ^ kLineupStream`): five kinds, five names, then one seed per bot, in that order.
+- **The default game is the classic table, byte-identical:** Freezeout, 10/20, 100 BB, no antes. New log fields appear only in tournaments or hands with antes. The engine is never rebuilt: `new_game(GameConfig)` keeps its RNG, so a new setup never replays earlier deals.
+- **Antes are dead money outside `total_bet`:** player code that needs them uses `ante_posted` or `PlayerView::dead_money()`. The posting order is per-player antes, then the blinds, then a big-blind ante from what the big blind has left (TDA). The blind seats are chosen before any ante, so heads-up detection is unchanged.
+- **Levels change only when a hand starts**, computed from hands started or time played, so a pause can skip levels; the last level lasts for ever.
 
 ## 12. Known Limits
 
@@ -204,13 +222,20 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - All-in runouts deal the remaining board at once, not street by street.
 - Fold Early has effectively no cancel window, because bots finish acting within a frame of arming it.
 - The sizing distribution is measured only for heads-up spots with no bet to face.
-- New Session has no confirmation, and quitting mid-hand can make the summary's `hands` count one higher than the logged hands.
+- New Session opens the New Game screen, whose Cancel keeps the game going; Start ends the game even mid-hand. Quitting mid-hand can make the summary's `hands` count one higher than the logged hands.
 - **Random personalities:** the archetypes' numbers are judgement, checked only for being distinct (`TableReport.DISABLED_PoolStats`), not tuned or benchmarked against the solver. The Tilter measures its loss between hands it acts in, so a walk in the big blind folds into the next comparison. The golden hashes are pinned for libstdc++ only (the classic bots draw through library-defined distributions), so on MSVC the tests print the hash and skip. Saving the setting from a real checkbox click has been checked only through the injected-input UI test and the settings tests, not end to end.
 - **Windows:** the release workflow builds the upgrade with MSVC `/W4` with zero warnings in project code, and passes all 495 tests in Release and Debug on `windows-latest`.
   - Those tests also call `GlobalMemoryStatusEx`, in `Hardware.DetectReturnsSomethingSane`.
   - Not yet checked: running the app on a real Windows PC, Windows fonts and DPI scales other than 1 for the new UI, and the solver tiers on real Windows hardware.
   - The benchmarks, timings and screenshots all come from a 4-core Linux container (Mesa under Xvfb).
 - Sanitizers have run only on Linux with GCC: ThreadSanitizer, and AddressSanitizer with UBSan, over the whole core test suite and a threaded turn-bench solve, with nothing reported. MSVC builds, clang's sanitizers and a Debug ASan build have not been run.
+
+**Game modes**
+- The presets and their ante rule (a big-blind ante of 1 BB, or BB/8 per player, from level 4) are judgement, not taken from any published structure.
+- Antes reach the advisor and range model only through pot odds, pot layers and the push/fold ante tables. The advisor's opening and 3-bet charts, standard open sizes and the bots' charts assume no ante. A player all in from the ante alone contests only the antes; that layer is not modelled in pot odds.
+- The push/fold ante tables are solved at 0.5, 1 and 1.5 BB of dead money (stacks after antes) and the largest not above the pot's is used, so ranges are slightly too tight between levels. They were not checked against published ante charts.
+- The minutes clock counts Hero's thinking time and finished-hand time; it stops only when paused, on the New Game screen and once the game is over. The Tilter counts antes paid as losses, and its loss threshold is in the current big blinds.
+- Hero's place when several players bust on the same hand uses the chips each started that hand with; a tie goes to Hero.
 
 **Range model and advice**
 - Player types are generic archetypes applied to every opponent, not reads on any seat. Reading each seat's type from its stats is future work. The type lines were not checked against a solver; `tools/advisor_matchup` measures them only against the bots.

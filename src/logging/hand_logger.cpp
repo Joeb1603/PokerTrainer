@@ -37,6 +37,8 @@ std::string action_code(ActionType type, bool all_in, int chips_added, int stree
 
 std::string cards_text(const std::array<Card, 2>& cards) { return cards[0].to_string() + cards[1].to_string(); }
 
+std::string ante_code(AnteType type) { return type == AnteType::BigBlind ? "bb" : "each"; }
+
 std::ofstream open_for_append(const std::filesystem::path& path) {
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     // Binary, so lines end in \n on every platform.
@@ -172,9 +174,23 @@ std::string serialize_hand(const GameState& state, const HandLogContext& context
     root["h"] = state.hand_number;
     root["sb"] = context.small_blind;
     root["bb"] = context.big_blind;
+    if (context.level) root["lvl"] = *context.level;
+    const bool antes = state.total_antes() > 0;
+    if (antes) {
+        root["ante"] = state.level.ante;
+        root["at"] = ante_code(state.level.ante_type);
+    }
     root["btn"] = state.button;
     root["post"] = Json{{"sb", Json{{"s", state.small_blind_seat}, {"amt", state.small_blind_posted}}},
                         {"bb", Json{{"s", state.big_blind_seat}, {"amt", state.big_blind_posted}}}};
+    if (antes) {
+        Json posted = Json::array();
+        for (int seat = 0; seat < kMaxSeats; ++seat) {
+            const int amount = state.seats[seat].ante_posted;
+            if (amount > 0) posted.push_back(Json{{"s", seat}, {"amt", amount}});
+        }
+        root["post"]["ante"] = std::move(posted);
+    }
 
     std::array<int, kMaxSeats> received{};
     for (const Payout& payout : result.payouts) received[payout.seat] += payout.amount;
@@ -194,7 +210,7 @@ std::string serialize_hand(const GameState& state, const HandLogContext& context
         Json entry{{"s", seat},
                    {"p", context.seat_labels[seat]},
                    {"pos", std::string(to_string(*state.position_of(seat)))},
-                   {"st", s.stack + s.total_bet - received[seat]}};
+                   {"st", s.stack + s.total_bet + s.ante_posted - received[seat]}};
         if ((flop_seen && !folded_preflop(seat)) || context.hero_seat == seat) entry["c"] = cards_text(*s.hole);
         seats.push_back(std::move(entry));
     }
@@ -278,6 +294,20 @@ void SessionLogger::write_session(const SessionSummary& summary, const HandLogCo
     root["ts"] = *timestamp;
     root["sb"] = context.small_blind;
     root["bb"] = context.big_blind;
+    if (context.tournament) {
+        root["mode"] = "T";
+        if (context.level) root["lvl"] = *context.level;
+        if (context.tournament->place) root["place"] = *context.tournament->place;
+        Json levels = Json::array();
+        std::optional<AnteType> ante_type;
+        for (const BlindLevel& level : context.tournament->levels) {
+            levels.push_back(Json::array({level.small_blind, level.big_blind, level.has_ante() ? level.ante : 0}));
+            if (level.has_ante() && !ante_type) ante_type = level.ante_type;
+        }
+        Json sched{{"unit", context.tournament->unit}, {"len", context.tournament->level_length}, {"lv", std::move(levels)}};
+        if (ante_type) sched["at"] = ante_code(*ante_type);
+        root["sched"] = std::move(sched);
+    }
     root["hands"] = summary.hands_played;
     root["done"] = summary.hero_busted || summary.winner.has_value();
     if (summary.winner) root["winner"] = context.seat_labels[*summary.winner];

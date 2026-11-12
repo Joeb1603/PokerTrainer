@@ -71,3 +71,56 @@ TEST_F(AppSettingsTest, SavingOverACorruptFileStartsAfresh) {
 TEST_F(AppSettingsTest, AnUnwritablePlaceFailsWithoutThrowing) {
     EXPECT_FALSE(save_app_settings(dir_ / "no_such_folder" / "settings.json", AppSettings{.random_personalities = true}));
 }
+
+TEST_F(AppSettingsTest, TheGameSetupDefaultsToTheClassicFreezeout) {
+    EXPECT_EQ(load_app_settings(file()).game_setup, default_freezeout());
+    write(R"({"random_personalities": true})");  // A file from before game setups
+    const AppSettings old = load_app_settings(file());
+    EXPECT_TRUE(old.random_personalities);
+    EXPECT_EQ(old.game_setup, default_freezeout());
+}
+
+TEST_F(AppSettingsTest, AGameSetupRoundTrips) {
+    GameSetup tournament = default_tournament();
+    tournament.unit = LevelUnit::Minutes;
+    tournament.level_length = 7;
+    tournament.preset = BlindPreset::Turbo;
+    tournament.ante_type = AnteType::PerPlayer;
+    tournament.ante_from_level = 3;
+    tournament.starting_bb = 75;
+    ASSERT_TRUE(save_app_settings(file(), AppSettings{.random_personalities = false, .game_setup = tournament}));
+    EXPECT_EQ(load_app_settings(file()).game_setup, tournament);
+
+    // Edited levels are kept as written, with the setup's ante type.
+    tournament.levels = {{10, 20, 0, AnteType::None}, {25, 50, 5, AnteType::PerPlayer}};
+    ASSERT_TRUE(save_app_settings(file(), AppSettings{.game_setup = tournament}));
+    EXPECT_EQ(load_app_settings(file()).game_setup, tournament);
+
+    std::ifstream in(file());
+    const nlohmann::json saved = nlohmann::json::parse(in);
+    EXPECT_EQ(saved["game_setup"]["mode"], "Tournament");
+    EXPECT_EQ(saved["game_setup"]["ante"], "PerPlayer");
+    EXPECT_EQ(saved["game_setup"]["levels"][1], nlohmann::json::array({25, 50, 5}));
+}
+
+TEST_F(AppSettingsTest, ABadGameSetupGivesTheDefaultAndKeepsTheRest) {
+    const char* bad[] = {
+        R"({"random_personalities": true, "game_setup": "tournament"})",
+        R"({"random_personalities": true, "game_setup": {"mode": "tournament"}})",
+        R"({"random_personalities": true, "game_setup": {"mode": "cash", "big_blind": 20, "starting_bb": 100, "unit": "hands",
+            "level_length": 10, "preset": "standard", "ante": "none", "ante_from_level": 4}})",
+        R"({"random_personalities": true, "game_setup": {"mode": "freezeout", "big_blind": 1, "starting_bb": 100,
+            "unit": "hands", "level_length": 10, "preset": "standard", "ante": "none", "ante_from_level": 4}})",
+        R"({"random_personalities": true, "game_setup": {"mode": "tournament", "big_blind": 20, "starting_bb": 100,
+            "unit": "hands", "level_length": 10, "preset": "standard", "ante": "bb", "ante_from_level": 4,
+            "levels": [[10, 20, 0], [5, 10, 0]]}})",
+        R"({"random_personalities": true, "game_setup": {"mode": "tournament", "big_blind": 20.5, "starting_bb": 100,
+            "unit": "hands", "level_length": 10, "preset": "standard", "ante": "bb", "ante_from_level": 4}})",
+    };
+    for (const char* text : bad) {
+        write(text);
+        const AppSettings settings = load_app_settings(file());
+        EXPECT_EQ(settings.game_setup, default_freezeout()) << text;
+        EXPECT_TRUE(settings.random_personalities) << text;
+    }
+}

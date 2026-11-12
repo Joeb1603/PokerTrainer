@@ -517,18 +517,18 @@ std::optional<ShortStack> short_stack(double depth_bb) {
 // What calls a jam from `jammer`: the caller's own table, or for a caller who
 // acted before the jammer, the BB's against it (the BB's against the SB when the
 // jammer is the BB).
-HandRange call_chart_vs_jam(Position caller, Position jammer, int stack_bb, int players) {
-    if (auto own = push_fold_call_range(caller, jammer, stack_bb, players)) return *own;
-    if (auto bb = push_fold_call_range(Position::BB, jammer, stack_bb, players)) return *bb;
-    return push_fold_call_range(Position::BB, Position::SB, stack_bb, players).value_or(HandRange{});
+HandRange call_chart_vs_jam(Position caller, Position jammer, int stack_bb, int players, double dead_bb) {
+    if (auto own = push_fold_call_range(caller, jammer, stack_bb, players, dead_bb)) return *own;
+    if (auto bb = push_fold_call_range(Position::BB, jammer, stack_bb, players, dead_bb)) return *bb;
+    return push_fold_call_range(Position::BB, Position::SB, stack_bb, players, dead_bb).value_or(HandRange{});
 }
 
 // A committing raise from `pos`: first in (no raiser), the jam table (the SB's for
 // a BB raising over limps); over a raise, what would call a jam from the raiser.
-HandRange jam_chart(Position pos, std::optional<Position> raiser, int stack_bb, int players) {
-    if (raiser) return call_chart_vs_jam(pos, *raiser, stack_bb, players);
-    if (auto own = push_fold_jam_range(pos, stack_bb, players)) return *own;
-    return push_fold_jam_range(Position::SB, stack_bb, players).value_or(HandRange{});
+HandRange jam_chart(Position pos, std::optional<Position> raiser, int stack_bb, int players, double dead_bb) {
+    if (raiser) return call_chart_vs_jam(pos, *raiser, stack_bb, players, dead_bb);
+    if (auto own = push_fold_jam_range(pos, stack_bb, players, dead_bb)) return *own;
+    return push_fold_jam_range(Position::SB, stack_bb, players, dead_bb).value_or(HandRange{});
 }
 
 // (1 - t) x the push/fold range + t x the commit range, as a likelihood.
@@ -811,6 +811,9 @@ private:
     Position raiser() const { return position_of(std::max(0, level_seat(raises_))); }
     bool reraised(int seat) const { return raises_ >= 2 && level_seat(raises_ - 1) == seat; }
 
+    // Antes in the pot, in big blinds.
+    double dead_bb() const { return view_.big_blind > 0 ? big_blinds(view_.dead_money()) : 0.0; }
+
     // The effective depth in big blinds of `chips` committed by `seat`: capped by the
     // deepest starting stack among the other players still in.
     double depth_bb(int seat, int chips) const {
@@ -834,7 +837,7 @@ private:
                 const int committed = a.all_in ? a.street_total : t.start_stack;
                 if (const auto depth = short_stack(depth_bb(a.seat, committed))) {
                     const std::optional<Position> over = raises_ > 0 ? std::optional<Position>(raiser()) : std::nullopt;
-                    const HandRange jam = jam_chart(pos, over, depth->table_bb, players_);
+                    const HandRange jam = jam_chart(pos, over, depth->table_bb, players_, dead_bb());
                     const double width = raises_ > 0 ? p_.three_bet_width : p_.open_width;
                     return blend_ranges(resized(jam, width, p_), commit, depth->commit_share);
                 }
@@ -865,7 +868,8 @@ private:
         if (last_aggression_all_in_ && street_aggressor_ >= 0) {
             const int committed = std::min(last_aggression_total_, t.start_stack);
             if (const auto depth = short_stack(depth_bb(street_aggressor_, committed))) {
-                const HandRange calls = call_chart_vs_jam(pos, position_of(street_aggressor_), depth->table_bb, players_);
+                const HandRange calls =
+                    call_chart_vs_jam(pos, position_of(street_aggressor_), depth->table_bb, players_, dead_bb());
                 return blend_ranges(resized(calls, p_.flat_width, p_), resized(extra.commit, p_.call_3bet_width, p_),
                                     depth->commit_share);
             }
@@ -1184,7 +1188,8 @@ Response predict_preflop_response(const WeightedRange& villain_range_so_far, con
     if (spot.all_in_bb) {
         if (const auto depth = short_stack(*spot.all_in_bb)) {
             // Calls of a short jam; from 15 BB on, blended into the chart answer.
-            const HandRange calls = call_chart_vs_jam(spot.villain, spot.raiser, depth->table_bb, spot.players);
+            const HandRange calls =
+                call_chart_vs_jam(spot.villain, spot.raiser, depth->table_bb, spot.players, spot.dead_bb);
             const WeightedRange short_calls = WeightedRange::from_hand_range(resized(calls, params.flat_width, params));
             const auto t = static_cast<float>(depth->commit_share);
             for (int combo = 0; combo < kComboCount; ++combo) {

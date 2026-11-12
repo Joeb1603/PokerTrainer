@@ -379,6 +379,7 @@ RaiseValue raise_value(const PlayerView& view, const RaiseInputs& in, int to) {
             spot.villain_raised_last = levels_after >= 2 && in.pre.level_seat(levels_after - 1) == i;
             if (commits && view.big_blind > 0) {
                 spot.all_in_bb = static_cast<double>(std::min(hero_start, s.stack + s.total_bet)) / view.big_blind;
+                spot.dead_bb = static_cast<double>(view.dead_money()) / view.big_blind;
             }
             answer = predict_preflop_response(*range, spot, *in.params);
         } else {
@@ -598,6 +599,7 @@ std::optional<CallValue> call_value(const PlayerView& view, const PotMath& math,
                 preflop.villain_raised_last = spot.below_last_level == p.index;
                 if (spot.commits && view.big_blind > 0) {
                     preflop.all_in_bb = static_cast<double>(std::min(spot.committed, s.stack + s.total_bet)) / view.big_blind;
+                    preflop.dead_bb = static_cast<double>(view.dead_money()) / view.big_blind;
                 }
                 response = predict_preflop_response(*range, preflop, params);
             } else if (strength) {

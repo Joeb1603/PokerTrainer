@@ -174,3 +174,40 @@ TEST(LivePots, MatchesFinalPotsOnceAllBetsAreMade) {
     }
     EXPECT_EQ(live.uncalled, final_pots.refund->amount);
 }
+
+TEST(Pots, DeadMoneyJoinsTheMainPotAndIsNeverRefunded) {
+    const auto result = calculate_pots({0, 10, 20, 0, 0, 0}, {false, false, true, false, false, false}, 20);
+    ASSERT_EQ(result.pots.size(), 1u);
+    EXPECT_EQ(result.pots[0].amount, 40);
+    ASSERT_TRUE(result.refund);
+    EXPECT_EQ(result.refund->amount, 10);
+}
+
+TEST(Pots, DeadMoneyGoesToTheMainPotNotASidePot) {
+    const auto result = calculate_pots({50, 100, 100, 0, 0, 0}, kAllLive, 30);
+    ASSERT_EQ(result.pots.size(), 2u);
+    EXPECT_EQ(result.pots[0].amount, 180);
+    EXPECT_EQ(result.pots[0].eligible, (std::vector<int>{0, 1, 2}));
+    EXPECT_EQ(result.pots[1].amount, 100);
+}
+
+TEST(Pots, DeadMoneyMakesAPotWhenOnlyUncalledChipsWereBet) {
+    const auto result = calculate_pots({0, 0, 20, 0, 0, 0}, {false, false, true, false, false, false}, 15);
+    ASSERT_EQ(result.pots.size(), 1u);
+    EXPECT_EQ(result.pots[0].amount, 15);
+    EXPECT_EQ(result.pots[0].eligible, (std::vector<int>{2}));
+    EXPECT_EQ(result.refund->amount, 20);
+}
+
+TEST(LivePots, DeadMoneyIsInTheTotalAndTheMainPot) {
+    const auto live = calculate_live_pots({0, 10, 20, 0, 0, 0}, {A, A, A, A, A, A}, 20);
+    EXPECT_EQ(live.total, 50);
+    ASSERT_EQ(live.pots.size(), 1u);
+    EXPECT_EQ(live.pots[0].amount, 40);
+    EXPECT_EQ(live.uncalled, 10);
+
+    const auto split = calculate_live_pots({100, 300, 300, 0, 0, 0}, {I, A, A, F, F, F}, 20);
+    EXPECT_EQ(split.pots[0].amount, 320);
+    EXPECT_EQ(split.pots[1].amount, 400);
+    EXPECT_EQ(split.total, 720);
+}

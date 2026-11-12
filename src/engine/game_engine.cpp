@@ -16,10 +16,19 @@ std::uint8_t bit(ActionType type) {
     return static_cast<std::uint8_t>(1u << static_cast<unsigned>(type));
 }
 
-void validate_config(const GameConfig& config) {
-    if (config.small_blind <= 0 || config.big_blind < config.small_blind) {
-        throw std::invalid_argument("GameConfig: need 0 < small_blind <= big_blind");
+void validate_level(const BlindLevel& level) {
+    if (level.small_blind <= 0 || level.big_blind < level.small_blind) {
+        throw std::invalid_argument("BlindLevel: need 0 < small_blind <= big_blind");
     }
+    if (level.ante < 0) throw std::invalid_argument("BlindLevel: negative ante");
+}
+
+BlindLevel level_of(const GameConfig& config) {
+    return BlindLevel{config.small_blind, config.big_blind, config.ante, config.ante_type};
+}
+
+void validate_config(const GameConfig& config) {
+    validate_level(level_of(config));
     if (config.hero_seat && (*config.hero_seat < 0 || *config.hero_seat >= kMaxSeats)) {
         throw std::invalid_argument("GameConfig: hero_seat out of range");
     }
@@ -92,7 +101,23 @@ std::optional<Position> GameState::position_of(int seat) const {
 
 GameEngine::GameEngine(GameConfig config) : config_(std::move(config)), rng_(config_.seed) {
     validate_config(config_);
+    level_ = level_of(config_);
     new_game();
+}
+
+void GameEngine::new_game(GameConfig config) {
+    validate_config(config);
+    config_ = std::move(config);
+    level_ = level_of(config_);
+    new_game();
+}
+
+void GameEngine::set_level(const BlindLevel& level) {
+    if (state_.phase != GamePhase::BetweenHands) {
+        throw std::logic_error("GameEngine::set_level: not between hands");
+    }
+    validate_level(level);
+    level_ = level;
 }
 
 void GameEngine::new_game() {
@@ -145,6 +170,32 @@ void GameEngine::commit_chips(int seat, int street_total) {
     if (s.stack == 0) s.status = SeatStatus::AllIn;
 }
 
+// Antes touch only the stack: they are not part of any bet.
+void GameEngine::post_ante(int seat, int amount) {
+    Seat& s = state_.seats[seat];
+    const int paid = std::min(amount, s.stack);
+    s.stack -= paid;
+    s.ante_posted += paid;
+    if (s.stack == 0) s.status = SeatStatus::AllIn;
+}
+
+// What each seat has put in, for splitting pots. Per-player antes count, so a
+// player all in for less than the ante gets a side pot of the right size; a
+// big-blind ante is dead money for the main pot instead (see main_pot_dead_money).
+std::array<int, kMaxSeats> GameEngine::pot_contributions() const {
+    std::array<int, kMaxSeats> contributed{};
+    const bool antes_layer = state_.level.ante_type == AnteType::PerPlayer;
+    for (int seat = 0; seat < kMaxSeats; ++seat) {
+        const Seat& s = state_.seats[seat];
+        contributed[seat] = s.total_bet + (antes_layer ? s.ante_posted : 0);
+    }
+    return contributed;
+}
+
+int GameEngine::main_pot_dead_money() const {
+    return state_.level.ante_type == AnteType::BigBlind ? state_.total_antes() : 0;
+}
+
 void GameEngine::start_hand(const std::optional<ScriptedDeal>& script) {
     if (state_.phase != GamePhase::BetweenHands) {
         throw std::logic_error("GameEngine::start_hand: not between hands");
@@ -154,6 +205,7 @@ void GameEngine::start_hand(const std::optional<ScriptedDeal>& script) {
     for (Seat& s : state_.seats) {
         s.street_bet = 0;
         s.total_bet = 0;
+        s.ante_posted = 0;
         s.hole.reset();
         s.acted = false;
         s.level_acted_at = 0;
@@ -165,6 +217,7 @@ void GameEngine::start_hand(const std::optional<ScriptedDeal>& script) {
     state_.street_start_pot = {};
     state_.street = Street::Preflop;
     state_.phase = GamePhase::Betting;
+    state_.level = level_;
     ++state_.hand_number;
 
     // Button.
@@ -209,26 +262,31 @@ void GameEngine::start_hand(const std::optional<ScriptedDeal>& script) {
         for (Card& card : planned_board_) card = deck.deal();
     }
 
-    // Blinds, each capped at the poster's stack.
-    state_.small_blind_posted = std::min(config_.small_blind, state_.seats[state_.small_blind_seat].stack);
-    state_.big_blind_posted = std::min(config_.big_blind, state_.seats[state_.big_blind_seat].stack);
+    // Per-player antes come first, then the blinds, each capped at the poster's
+    // stack; a big-blind ante comes from what the blind leaves. The blind seats
+    // were chosen above, so a seat all in from its ante still posts (nothing).
+    const BlindLevel& level = state_.level;
+    if (level.has_ante() && level.ante_type == AnteType::PerPlayer) {
+        for (int seat = 0; seat < kMaxSeats; ++seat) {
+            if (state_.seats[seat].status != SeatStatus::Busted) post_ante(seat, level.ante);
+        }
+    }
+    state_.small_blind_posted = std::min(level.small_blind, state_.seats[state_.small_blind_seat].stack);
+    state_.big_blind_posted = std::min(level.big_blind, state_.seats[state_.big_blind_seat].stack);
     commit_chips(state_.small_blind_seat, state_.small_blind_posted);
     commit_chips(state_.big_blind_seat, state_.big_blind_posted);
-    state_.current_bet = config_.big_blind;
-    state_.last_raise_size = config_.big_blind;
+    if (level.has_ante() && level.ante_type == AnteType::BigBlind) post_ante(state_.big_blind_seat, level.ante);
+    state_.current_bet = level.big_blind;
+    state_.last_raise_size = level.big_blind;
     state_.street_start_pot[static_cast<std::size_t>(Street::Preflop)] = state_.total_pot();
 
     settle(state_.big_blind_seat);
 }
 
 LivePots GameEngine::live_pots() const {
-    std::array<int, kMaxSeats> contributed{};
     std::array<SeatStatus, kMaxSeats> statuses{};
-    for (int seat = 0; seat < kMaxSeats; ++seat) {
-        contributed[seat] = state_.seats[seat].total_bet;
-        statuses[seat] = state_.seats[seat].status;
-    }
-    return calculate_live_pots(contributed, statuses);
+    for (int seat = 0; seat < kMaxSeats; ++seat) statuses[seat] = state_.seats[seat].status;
+    return calculate_live_pots(pot_contributions(), statuses, main_pot_dead_money());
 }
 
 LegalActions GameEngine::legal_actions() const {
@@ -265,7 +323,7 @@ LegalActions GameEngine::legal_actions() const {
 }
 
 PlayerView GameEngine::player_view(int seat) const {
-    return make_player_view(state_, seat, config_.small_blind, config_.big_blind, legal_actions());
+    return make_player_view(state_, seat, legal_actions());
 }
 
 bool GameEngine::apply_action(const Action& action) {
@@ -333,7 +391,7 @@ void GameEngine::settle(int from_seat) {
             s.level_acted_at = 0;
         }
         state_.current_bet = 0;
-        state_.last_raise_size = config_.big_blind;
+        state_.last_raise_size = state_.level.big_blind;
         state_.street = static_cast<Street>(static_cast<int>(state_.street) + 1);
 
         if (state_.street == Street::Showdown) {
@@ -361,15 +419,13 @@ void GameEngine::deal_street_cards() {
 }
 
 void GameEngine::finish_hand(bool showdown) {
-    std::array<int, kMaxSeats> contributed{};
     std::array<bool, kMaxSeats> live{};
     for (int seat = 0; seat < kMaxSeats; ++seat) {
         const Seat& s = state_.seats[seat];
-        contributed[seat] = s.total_bet;
         live[seat] = s.status == SeatStatus::Active || s.status == SeatStatus::AllIn;
     }
 
-    PotBreakdown breakdown = calculate_pots(contributed, live);
+    PotBreakdown breakdown = calculate_pots(pot_contributions(), live, main_pot_dead_money());
 
     HandResult result;
     result.showdown = showdown;
@@ -436,7 +492,7 @@ SessionSummary GameEngine::session_summary() const {
     int last_live = -1;
     for (int seat = 0; seat < kMaxSeats; ++seat) {
         const Seat& s = state_.seats[seat];
-        summary.final_stacks[seat] = s.stack + s.total_bet * (state_.phase == GamePhase::Betting ? 1 : 0);
+        summary.final_stacks[seat] = s.stack + (s.total_bet + s.ante_posted) * (state_.phase == GamePhase::Betting ? 1 : 0);
         summary.busted_on_hand[seat] = s.busted_on_hand;
         if (s.status != SeatStatus::Busted) {
             ++players_left;

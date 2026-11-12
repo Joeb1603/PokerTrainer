@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <stdexcept>
 #include <utility>
 
 #include "bots/bots.h"
@@ -57,14 +58,24 @@ void annotate_showdown_payout(PayoutLine& line, int seat, const HandResult& resu
     }
 }
 
-GameConfig make_config(const ControllerOptions& options) {
+GameConfig make_config(const GameSetup& setup, std::uint64_t seed) {
+    if (const auto problem = validate(setup)) throw std::invalid_argument("GameSetup: " + *problem);
+    const BlindLevel first = setup.first_level();
     GameConfig config;
-    config.starting_stack = options.starting_stack;
-    config.small_blind = options.small_blind;
-    config.big_blind = options.big_blind;
-    config.seed = options.seed;
+    config.starting_stack = setup.starting_stack();
+    config.small_blind = first.small_blind;
+    config.big_blind = first.big_blind;
+    config.ante = first.ante;
+    config.ante_type = first.ante_type;
+    config.seed = seed;
     config.hero_seat = kHeroSeat;
     return config;
+}
+
+std::string level_text(const BlindLevel& level) {
+    std::string text = std::to_string(level.small_blind) + "/" + std::to_string(level.big_blind);
+    if (level.has_ante()) text += ", ante " + std::to_string(level.ante);
+    return text;
 }
 
 std::string seat_text(const GameState& state, const std::array<std::string, kMaxSeats>& names, int seat) {
@@ -114,10 +125,12 @@ int bet_pot_percent(const LegalActions& legal, int current_bet, int total_pot, i
 
 LocalGameController::LocalGameController(const ControllerOptions& options)
     : options_(options),
-      engine_(make_config(options)),
+      engine_(make_config(options.setup, options.seed)),
       advisor_(options.seed ^ 0xA5A5A5A5A5A5A5A5ull, options.advisor_rollouts),
       lineup_rng_(options.seed ^ kLineupStream),
       random_pending_(options.random_personalities),
+      active_setup_(options.setup),
+      pending_setup_(options.setup),
       bot_delay_ms_(options.bot_delay_ms),
       instant_play_(options.instant_play),
       hardware_(options.hardware_override ? *options.hardware_override : detect_hardware()),
@@ -132,6 +145,7 @@ LocalGameController::LocalGameController(const ControllerOptions& options)
     }
     build_bots(random_pending_);
     for (int seat = 0; seat < kMaxSeats; ++seat) starting_stacks_[at(seat)] = engine_.state().seats[at(seat)].stack;
+    reset_clock();
 
     try {
         hand_logger_.emplace(options.log_dir / "hand_history.jsonl");
@@ -172,6 +186,23 @@ void LocalGameController::set_random_personalities(bool enabled) {
     rebuild_snapshot();
 }
 
+bool LocalGameController::set_game_setup(const GameSetup& setup) {
+    if (validate(setup)) return false;
+    pending_setup_ = setup;
+    rebuild_snapshot();
+    return true;
+}
+
+void LocalGameController::set_clock_paused(bool paused) {
+    clock_.set_paused(paused);
+    rebuild_snapshot();
+}
+
+void LocalGameController::reset_clock() {
+    clock_ = tournament() ? TournamentClock(active_setup_.schedule(), active_setup_.unit, active_setup_.level_length)
+                          : TournamentClock();
+}
+
 void LocalGameController::note_log_failure(const std::exception& error) noexcept {
     try {
         log_error_ = error.what();
@@ -198,7 +229,11 @@ void LocalGameController::new_session() {
     // The classic bots carry their state into the next session, as they always have;
     // a random lineup is drawn afresh, and leaving one rebuilds the classic bots.
     if (random_pending_ || random_active_) build_bots(random_pending_);
-    engine_.new_game();
+    // The RNG runs on either way, so a new game never replays the last one's deals.
+    active_setup_ = pending_setup_;
+    engine_.new_game(make_config(active_setup_, options_.seed));
+    for (int seat = 0; seat < kMaxSeats; ++seat) starting_stacks_[at(seat)] = engine_.state().seats[at(seat)].stack;
+    reset_clock();
     open_session();
     begin_hand();
 }
@@ -224,6 +259,8 @@ bool LocalGameController::reveal_bot_hands() {
 }
 
 void LocalGameController::begin_hand() {
+    for (int seat = 0; seat < kMaxSeats; ++seat) hand_start_stacks_[at(seat)] = engine_.state().seats[at(seat)].stack;
+    if (tournament()) engine_.set_level(clock_.on_hand_started());
     engine_.start_hand();
     hand_handled_ = false;
     early_fold_armed_ = false;
@@ -278,6 +315,11 @@ void LocalGameController::poll_solver() {
 
 void LocalGameController::tick(double elapsed_ms) {
     poll_solver();  // First: Hero's turn returns early below
+    if (tournament() && active_setup_.unit == LevelUnit::Minutes && snapshot_.phase != ControllerPhase::SessionOver &&
+        !clock_.paused()) {
+        clock_.advance_ms(elapsed_ms);
+        if (snapshot_.tournament) snapshot_.tournament->seconds_until_next = clock_.ms_until_next_level() / 1000.0;
+    }
     if (instant_play_ || early_fold_armed_) {
         // An armed fold ends once action reaches Hero, so normal pacing resumes after it.
         while (snapshot_.phase == ControllerPhase::BotToAct && (instant_play_ || early_fold_armed_)) {
@@ -346,8 +388,21 @@ void LocalGameController::after_state_change() {
 HandLogContext LocalGameController::log_context(bool per_hand_labels) const {
     HandLogContext context;
     context.session_id = session_id_;
-    context.small_blind = options_.small_blind;
-    context.big_blind = options_.big_blind;
+    // A hand is logged with its own blinds; the session with the first level's.
+    const BlindLevel level = per_hand_labels ? engine_.state().level : active_setup_.first_level();
+    context.small_blind = level.small_blind;
+    context.big_blind = level.big_blind;
+    if (tournament()) {
+        context.level = clock_.level_index() + 1;
+        if (!per_hand_labels) {
+            TournamentLog log;
+            log.place = hero_place(engine_.session_summary());
+            log.unit = active_setup_.unit == LevelUnit::Minutes ? "min" : "hands";
+            log.level_length = active_setup_.level_length;
+            log.levels = active_setup_.schedule();
+            context.tournament = std::move(log);
+        }
+    }
     context.hero_seat = kHeroSeat;
     context.seat_labels = public_names_;
     for (int seat = 1; seat < kMaxSeats; ++seat) {
@@ -398,10 +453,28 @@ void LocalGameController::write_session_summary() noexcept {
 std::vector<std::string> LocalGameController::build_action_log() const {
     const GameState& state = engine_.state();
     std::vector<std::string> log;
+    if (tournament() && clock_.level_changed()) {
+        log.push_back("Blinds up: level " + std::to_string(clock_.level_index() + 1) + ", " + level_text(state.level));
+    }
+    if (state.level.has_ante() && state.level.ante_type == AnteType::PerPlayer) {
+        log.push_back("Everyone posts an ante of " + std::to_string(state.level.ante));
+        for (int seat = 0; seat < kMaxSeats; ++seat) {
+            const Seat& s = state.seats[at(seat)];
+            if (s.hole && s.ante_posted < state.level.ante) {
+                log.push_back(seat_text(state, public_names_, seat) + " posts an ante of " +
+                              std::to_string(s.ante_posted) + " (all-in)");
+            }
+        }
+    }
     log.push_back(seat_text(state, public_names_, state.small_blind_seat) + " posts " +
                   std::to_string(state.small_blind_posted));
     log.push_back(seat_text(state, public_names_, state.big_blind_seat) + " posts " +
                   std::to_string(state.big_blind_posted));
+    if (state.level.has_ante() && state.level.ante_type == AnteType::BigBlind) {
+        const int paid = state.seats[at(state.big_blind_seat)].ante_posted;
+        log.push_back(seat_text(state, public_names_, state.big_blind_seat) + " posts the ante, " + std::to_string(paid) +
+                      (paid < state.level.ante ? " (all-in)" : ""));
+    }
 
     const auto add_street_header = [&](Street street) {
         const std::size_t count = street == Street::Flop ? 3 : street == Street::Turn ? 4 : 5;
@@ -440,8 +513,25 @@ void LocalGameController::rebuild_snapshot() {
     TableSnapshot next;
     next.hand_number = state.hand_number;
     next.street = state.street;
-    next.small_blind = options_.small_blind;
-    next.big_blind = options_.big_blind;
+    next.small_blind = state.level.small_blind;
+    next.big_blind = state.level.big_blind;
+    next.ante = state.level.has_ante() ? state.level.ante : 0;
+    next.ante_type = state.level.has_ante() ? state.level.ante_type : AnteType::None;
+    next.mode = active_setup_.mode;
+    next.setup_pending = !(pending_setup_ == active_setup_);
+    if (tournament()) {
+        TournamentPanel panel;
+        panel.level = clock_.level_index() + 1;
+        panel.current = clock_.current_level();
+        panel.next = clock_.next_level();
+        panel.unit = active_setup_.unit;
+        panel.level_length = active_setup_.level_length;
+        panel.hands_until_next = clock_.hands_until_next_level();
+        panel.seconds_until_next = clock_.ms_until_next_level() / 1000.0;
+        panel.paused = clock_.paused();
+        panel.level_changed = clock_.level_changed();
+        next.tournament = panel;
+    }
     next.board = state.board;
     next.showdown = result && result->showdown;
     next.hand_mistakes = hand_mistakes_;
@@ -538,6 +628,9 @@ void LocalGameController::rebuild_snapshot() {
     if (summary.winner) next.session.winner = public_names_[at(*summary.winner)];
     next.session.mistakes = session_mistakes_ + (hand_handled_ ? 0 : static_cast<int>(hand_mistakes_.size()));
     next.session.ev_lost = session_ev_lost_;
+    next.session.mode = active_setup_.mode;
+    next.session.level_reached = tournament() ? clock_.level_index() + 1 : 1;
+    next.session.hero_place = hero_place(summary);
     if (!hand_handled_) {
         for (const HeroMistake& mistake : hand_mistakes_) next.session.ev_lost += mistake.ev_loss;
     }
@@ -550,6 +643,27 @@ void LocalGameController::rebuild_snapshot() {
     next.random_lineup_active = random_active_;
 
     snapshot_ = std::move(next);
+}
+
+std::optional<int> LocalGameController::hero_place(const SessionSummary& summary) const {
+    const GameState& state = engine_.state();
+    if (state.phase != GamePhase::SessionOver) return std::nullopt;
+    if (summary.winner == kHeroSeat) return 1;
+    const Seat& hero = state.seats[kHeroSeat];
+    if (hero.status != SeatStatus::Busted) return std::nullopt;
+    // Hero busted on the latest hand: behind everyone left and everyone who busted on
+    // the same hand from a bigger stack. A tie goes to Hero.
+    int place = 1;
+    for (int seat = 0; seat < kMaxSeats; ++seat) {
+        if (seat == kHeroSeat) continue;
+        const Seat& s = state.seats[at(seat)];
+        const bool same_hand = s.busted_on_hand && s.busted_on_hand == hero.busted_on_hand;
+        if (s.status != SeatStatus::Busted ||
+            (same_hand && hand_start_stacks_[at(seat)] > hand_start_stacks_[kHeroSeat])) {
+            ++place;
+        }
+    }
+    return place;
 }
 
 }  // namespace poker

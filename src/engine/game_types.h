@@ -16,7 +16,8 @@ enum class GamePhase : std::uint8_t { BetweenHands, Betting, SessionOver };
 struct Seat {
     int stack = 0;       // Chips behind, excluding anything already bet
     int street_bet = 0;  // Chips put in on the current street
-    int total_bet = 0;   // Chips put in over the whole hand
+    int total_bet = 0;   // Chips put in over the whole hand, antes excluded
+    int ante_posted = 0; // Ante paid this hand (dead money; not in total_bet)
     SeatStatus status = SeatStatus::Active;
     std::optional<std::array<Card, 2>> hole;
     bool acted = false;      // Has taken a voluntary action this street
@@ -57,18 +58,27 @@ struct GameState {
     int big_blind_seat = -1;
     int small_blind_posted = 0;
     int big_blind_posted = 0;
+    BlindLevel level;  // Blinds and ante of the current or latest hand
     std::optional<int> to_act;
     int current_bet = 0;      // Bet level to match; stays at the big blind if it is posted short
     int last_raise_size = 0;  // Size of the last full bet or raise
     std::array<Seat, kMaxSeats> seats{};
     std::vector<Card> board;
     std::vector<ActionRecord> actions;
-    std::array<int, 4> street_start_pot{};  // Pot entering each street (blinds for preflop)
+    std::array<int, 4> street_start_pot{};  // Pot entering each street (blinds and antes for preflop)
     std::optional<HandResult> last_result;
 
+    // Every chip in the middle, antes included.
     int total_pot() const {
         int total = 0;
-        for (const Seat& seat : seats) total += seat.total_bet;
+        for (const Seat& seat : seats) total += seat.total_bet + seat.ante_posted;
+        return total;
+    }
+
+    // Antes paid this hand.
+    int total_antes() const {
+        int total = 0;
+        for (const Seat& seat : seats) total += seat.ante_posted;
         return total;
     }
 
