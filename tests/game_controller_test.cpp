@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -874,6 +875,52 @@ TEST_F(Controller, NewSessionWritesSummaryResetsAndGetsANewId) {
     const auto lines = read_json_lines(sessions());
     ASSERT_EQ(lines.size(), 1u);
     EXPECT_EQ(lines[0]["session_id"], first);
+}
+
+// Pins the default lineup's logs across two sessions, so random personalities (off by
+// default) can be shown to leave the classic table byte-identical, RNG streams included:
+// a New Session must not rebuild the bots. The bots draw through library-defined
+// distributions, so the constant is pinned for libstdc++ only.
+TEST_F(Controller, OffModeLogsUnchanged) {
+    {
+        LocalGameController c(options(77));
+        for (int session = 0; session < 2; ++session) {
+            for (int hand = 0; hand < 25; ++hand) {
+                play_hand_out(c, [](const TableSnapshot& s) {
+                    // Calls once per street at most, so Hero sometimes folds and sometimes plays on.
+                    if (s.legal.allows(ActionType::Check)) return Action{ActionType::Check, 0};
+                    const bool cheap = s.legal.call_amount * 4 <= s.big_blind * 10;
+                    return Action{cheap ? ActionType::Call : ActionType::Fold, 0};
+                });
+                if (c.snapshot().phase == ControllerPhase::SessionOver) break;
+                ASSERT_TRUE(c.next_hand());
+            }
+            if (session == 0) c.new_session();
+        }
+    }
+    std::uint64_t hash = 0xCBF29CE484222325ULL;
+    const auto add = [&](const std::string& text) {
+        for (const char ch : text) {
+            hash ^= static_cast<unsigned char>(ch);
+            hash *= 0x100000001B3ULL;
+        }
+    };
+    std::size_t lines = 0;
+    for (const std::string& line : log_without_session_ids(hands())) {
+        add(line);
+        ++lines;
+    }
+    for (json line : read_json_lines(sessions())) {
+        line.erase("session_id");
+        line.erase("ts");
+        add(line.dump());
+    }
+    EXPECT_GE(lines, 30u);
+#if defined(__GLIBCXX__)
+    EXPECT_EQ(hash, 0xb90533e223a1e356ULL) << std::hex << "hash 0x" << hash;
+#else
+    GTEST_SKIP() << std::hex << "no pinned value for this standard library; hash 0x" << hash;
+#endif
 }
 
 TEST_F(Controller, MistakesAreRecordedFromThePreActionViewAndLogged) {

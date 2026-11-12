@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -1276,6 +1277,112 @@ TEST(LegalityFuzz, EveryBotIsLegalInRandomStates) {
     EXPECT_TRUE(saw_min_equals_max);
     EXPECT_TRUE(saw_raise);
     EXPECT_TRUE(saw_bet);
+}
+
+// --- Golden: the classic bots decide exactly as before ------------------------
+
+// FNV-1a over 64-bit words.
+struct Fnv1a {
+    std::uint64_t h = 0xCBF29CE484222325ULL;
+    void add(std::uint64_t v) {
+        for (int i = 0; i < 8; ++i) {
+            h ^= (v >> (8 * i)) & 0xFFU;
+            h *= 0x100000001B3ULL;
+        }
+    }
+    void add(const std::string& text) {
+        for (const char ch : text) add(static_cast<std::uint64_t>(static_cast<unsigned char>(ch)));
+        add(0xFFFFFFFFULL);
+    }
+};
+
+std::uint64_t classic_bots_hash(long* decisions) {
+    Fnv1a hash;
+    std::mt19937_64 rng(4242);
+
+    // Every classic bot answers every state of random play, as in the legality fuzz.
+    std::vector<std::unique_ptr<IBotStrategy>> bots;
+    for (const BotKind kind : kAllBotKinds) bots.push_back(make_bot(kind, rng(), 20));
+    for (int game = 0; game < 150; ++game) {
+        GameConfig config;
+        config.seed = rng();
+        config.hero_seat = std::nullopt;
+        config.stacks = random_stacks(rng);
+        GameEngine engine(config);
+        for (int hand = 0; hand < 12 && engine.state().phase == GamePhase::BetweenHands; ++hand) {
+            engine.start_hand();
+            for (auto& bot : bots) bot->begin_hand(engine.state().hand_number);
+            for (std::size_t k = 0; k < bots.size(); ++k) hash.add(bots[k]->hand_log_label());
+            while (engine.state().to_act) {
+                const PlayerView view = engine.player_view(*engine.state().to_act);
+                for (std::size_t k = 0; k < bots.size(); ++k) {
+                    const Action action = bots[k]->decide(view);
+                    hash.add(k);
+                    hash.add(static_cast<std::uint64_t>(action.type));
+                    hash.add(static_cast<std::uint64_t>(static_cast<std::int64_t>(action.amount)));
+                }
+                const LegalActions& legal = view.legal;
+                std::array<Action, 6> options{};
+                std::size_t count = 0;
+                for (const ActionType type : {ActionType::Check, ActionType::Call, ActionType::Fold, ActionType::AllIn}) {
+                    if (legal.allows(type)) options[count++] = {type, 0};
+                }
+                const bool aggress = legal.allows(ActionType::Raise) || legal.allows(ActionType::Bet);
+                const ActionType aggressive = legal.allows(ActionType::Bet) ? ActionType::Bet : ActionType::Raise;
+                if (aggress) {
+                    options[count++] = {aggressive, legal.min_raise_to};
+                    options[count++] = {aggressive, legal.max_raise_to};
+                }
+                ++*decisions;
+                if (count == 0 || !engine.apply_action(options[static_cast<std::size_t>(rng() % count)])) return 0;
+            }
+        }
+    }
+
+    // And whole freezeouts of bots playing bots, which carry RNG state across hands.
+    for (int game = 0; game < 12; ++game) {
+        GameConfig config;
+        config.seed = rng();
+        config.hero_seat = std::nullopt;
+        GameEngine engine(config);
+        std::array<std::unique_ptr<IBotStrategy>, kMaxSeats> table;
+        for (int seat = 0; seat < kMaxSeats; ++seat) {
+            const BotKind kind = kAllBotKinds[(static_cast<std::size_t>(game) + static_cast<std::size_t>(seat)) %
+                                              kAllBotKinds.size()];
+            table[static_cast<std::size_t>(seat)] = make_bot(kind, rng(), 20);
+        }
+        for (int hand = 0; hand < 40 && engine.state().phase == GamePhase::BetweenHands; ++hand) {
+            engine.start_hand();
+            for (auto& bot : table) bot->begin_hand(engine.state().hand_number);
+            for (auto& bot : table) hash.add(bot->hand_log_label());
+            while (engine.state().to_act) {
+                const int seat = *engine.state().to_act;
+                const Action action = table[static_cast<std::size_t>(seat)]->decide(engine.player_view(seat));
+                hash.add(static_cast<std::uint64_t>(seat));
+                hash.add(static_cast<std::uint64_t>(action.type));
+                hash.add(static_cast<std::uint64_t>(static_cast<std::int64_t>(action.amount)));
+                ++*decisions;
+                if (!engine.apply_action(action)) return 0;
+            }
+        }
+    }
+    return hash.h;
+}
+
+// Pins every decision of Nit, Loose, GTO, WildGTO and Shifter, so new personality
+// knobs can be shown to leave them alone. The standard distributions the classic bots
+// draw through are library-defined, so the constant is pinned for libstdc++ only;
+// elsewhere the test prints the hash and skips.
+TEST(Golden, ClassicBotsDecideAsBefore) {
+    long decisions = 0;
+    const std::uint64_t hash = classic_bots_hash(&decisions);
+    ASSERT_NE(hash, 0U) << "an action was refused";
+    EXPECT_GT(decisions, 3000);
+#if defined(__GLIBCXX__)
+    EXPECT_EQ(hash, 0x70ece03ffe4f3b2aULL) << std::hex << "hash 0x" << hash;
+#else
+    GTEST_SKIP() << std::hex << "no pinned value for this standard library; hash 0x" << hash;
+#endif
 }
 
 // Run by hand: chips won per hand by each personality, as a sanity check on how
