@@ -27,7 +27,7 @@ nlohmann::json setup_json(const GameSetup& setup) {
     if (!setup.levels.empty()) {
         nlohmann::json levels = nlohmann::json::array();
         for (const BlindLevel& level : setup.levels) {
-            levels.push_back(nlohmann::json::array({level.small_blind, level.big_blind, level.has_ante() ? level.ante : 0}));
+            levels.push_back(level_row(level));
         }
         out["levels"] = std::move(levels);
     }
@@ -83,8 +83,7 @@ std::optional<GameSetup> setup_from(const nlohmann::json& value) {
                 if (n < 0 || n > 1'000'000'000LL) return std::nullopt;
                 cells[i] = static_cast<int>(n);
             }
-            setup.levels.push_back(
-                BlindLevel{cells[0], cells[1], cells[2], cells[2] > 0 ? setup.ante_type : AnteType::None});
+            setup.levels.push_back(level_from_row(cells, setup.ante_type));
         }
     }
     if (validate(setup)) return std::nullopt;

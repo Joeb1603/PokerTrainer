@@ -167,6 +167,10 @@ std::vector<BlindLevel> scale_schedule(const std::vector<BlindLevel>& levels, do
     return out;
 }
 
+std::string blinds_text(const BlindLevel& level) {
+    return std::to_string(level.small_blind) + "/" + std::to_string(level.big_blind);
+}
+
 std::optional<std::string> validate(const GameSetup& setup) {
     if (setup.big_blind < kMinBigBlind || setup.big_blind > kMaxBigBlind) {
         return "Big blind must be " + std::to_string(kMinBigBlind) + " to " + std::to_string(kMaxBigBlind) + " chips.";
@@ -209,8 +213,8 @@ std::optional<std::string> validate(const GameSetup& setup) {
 
 std::string describe(const GameSetup& setup) {
     const BlindLevel first = setup.first_level();
-    std::string text = std::string(to_string(setup.mode)) + ": " + std::to_string(first.small_blind) + "/" +
-                       std::to_string(first.big_blind) + ", " + std::to_string(setup.starting_bb) + " BB";
+    std::string text = std::string(to_string(setup.mode)) + ": " + blinds_text(first) + ", " +
+                       std::to_string(setup.starting_bb) + " BB";
     if (setup.mode == GameMode::Freezeout) return text;
     text += ", " + std::string(setup.levels.empty() ? to_string(setup.preset) : "custom") + " levels of " +
             std::to_string(setup.level_length) + (setup.unit == LevelUnit::Hands ? " hands" : " min");

@@ -154,15 +154,9 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--stack-bb") {
             options.stack_bb = int_flag(arg, value, 2);
         } else if (arg == "--antes") {
-            if (value == "none") {
-                options.antes = AnteType::None;
-            } else if (value == "player") {
-                options.antes = AnteType::PerPlayer;
-            } else if (value == "bb") {
-                options.antes = AnteType::BigBlind;
-            } else {
-                usage_error("--antes needs none, player or bb");
-            }
+            const auto antes = parse_ante_type(value);  // The app's spellings too
+            if (!antes) usage_error("--antes needs none, player or bb");
+            options.antes = *antes;
         } else {
             usage_error("unknown flag: " + std::string(arg));
         }

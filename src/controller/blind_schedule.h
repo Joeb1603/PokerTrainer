@@ -91,6 +91,9 @@ std::vector<BlindLevel> with_antes(std::vector<BlindLevel> levels, AnteType type
 // strictly rising and each small blind at its old share of the big.
 std::vector<BlindLevel> scale_schedule(const std::vector<BlindLevel>& levels, double factor);
 
+// "10/20": a level's blinds, without the ante.
+std::string blinds_text(const BlindLevel& level);
+
 // Why the setup cannot start, or nullopt when it can.
 std::optional<std::string> validate(const GameSetup& setup);
 

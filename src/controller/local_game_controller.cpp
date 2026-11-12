@@ -73,7 +73,7 @@ GameConfig make_config(const GameSetup& setup, std::uint64_t seed) {
 }
 
 std::string level_text(const BlindLevel& level) {
-    std::string text = std::to_string(level.small_blind) + "/" + std::to_string(level.big_blind);
+    std::string text = blinds_text(level);
     if (level.has_ante()) text += ", ante " + std::to_string(level.ante);
     return text;
 }
@@ -450,31 +450,46 @@ void LocalGameController::write_session_summary() noexcept {
     }
 }
 
+std::vector<std::string> posting_lines(const GameState& state, const std::array<std::string, kMaxSeats>& names) {
+    std::vector<std::string> lines;
+    const BlindLevel& level = state.level;
+    // Only the amount posted is known here (stacks move on), so a post below the
+    // level's amount is the one that put the seat all in.
+    const auto post = [&](int seat, const std::string& what, int paid, int full) {
+        if (paid <= 0) return;  // All in already: nothing to post
+        lines.push_back(seat_text(state, names, seat) + what + std::to_string(paid) + (paid < full ? " (all-in)" : ""));
+    };
+    if (level.has_ante() && level.ante_type == AnteType::PerPlayer) {
+        lines.push_back("Everyone posts an ante of " + std::to_string(level.ante));
+        for (int seat = 0; seat < kMaxSeats; ++seat) {
+            const Seat& s = state.seats[at(seat)];
+            if (s.hole && s.ante_posted < level.ante) post(seat, " posts an ante of ", s.ante_posted, level.ante);
+        }
+    }
+    // A blind can be nothing only after a per-player ante took the whole stack.
+    const auto blind = [&](int seat, int paid, int full) {
+        if (paid > 0) {
+            post(seat, " posts ", paid, full);
+        } else {
+            lines.push_back(seat_text(state, names, seat) + " posts no blind (all in from the ante)");
+        }
+    };
+    blind(state.small_blind_seat, state.small_blind_posted, level.small_blind);
+    blind(state.big_blind_seat, state.big_blind_posted, level.big_blind);
+    if (level.has_ante() && level.ante_type == AnteType::BigBlind) {
+        post(state.big_blind_seat, " posts the ante, ", state.seats[at(state.big_blind_seat)].ante_posted, level.ante);
+    }
+    return lines;
+}
+
 std::vector<std::string> LocalGameController::build_action_log() const {
     const GameState& state = engine_.state();
     std::vector<std::string> log;
     if (tournament() && clock_.level_changed()) {
         log.push_back("Blinds up: level " + std::to_string(clock_.level_index() + 1) + ", " + level_text(state.level));
     }
-    if (state.level.has_ante() && state.level.ante_type == AnteType::PerPlayer) {
-        log.push_back("Everyone posts an ante of " + std::to_string(state.level.ante));
-        for (int seat = 0; seat < kMaxSeats; ++seat) {
-            const Seat& s = state.seats[at(seat)];
-            if (s.hole && s.ante_posted < state.level.ante) {
-                log.push_back(seat_text(state, public_names_, seat) + " posts an ante of " +
-                              std::to_string(s.ante_posted) + " (all-in)");
-            }
-        }
-    }
-    log.push_back(seat_text(state, public_names_, state.small_blind_seat) + " posts " +
-                  std::to_string(state.small_blind_posted));
-    log.push_back(seat_text(state, public_names_, state.big_blind_seat) + " posts " +
-                  std::to_string(state.big_blind_posted));
-    if (state.level.has_ante() && state.level.ante_type == AnteType::BigBlind) {
-        const int paid = state.seats[at(state.big_blind_seat)].ante_posted;
-        log.push_back(seat_text(state, public_names_, state.big_blind_seat) + " posts the ante, " + std::to_string(paid) +
-                      (paid < state.level.ante ? " (all-in)" : ""));
-    }
+    const std::vector<std::string> posts = posting_lines(state, public_names_);
+    log.insert(log.end(), posts.begin(), posts.end());
 
     const auto add_street_header = [&](Street street) {
         const std::size_t count = street == Street::Flop ? 3 : street == Street::Turn ? 4 : 5;
@@ -518,7 +533,6 @@ void LocalGameController::rebuild_snapshot() {
     next.ante = state.level.has_ante() ? state.level.ante : 0;
     next.ante_type = state.level.has_ante() ? state.level.ante_type : AnteType::None;
     next.mode = active_setup_.mode;
-    next.setup_pending = !(pending_setup_ == active_setup_);
     if (tournament()) {
         TournamentPanel panel;
         panel.level = clock_.level_index() + 1;

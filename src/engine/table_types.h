@@ -54,6 +54,16 @@ struct BlindLevel {
     friend bool operator==(const BlindLevel&, const BlindLevel&) = default;
 };
 
+// A level as the settings file and the session log store it: [small blind, big
+// blind, ante], the ante 0 when the level has none. The ante's type is the
+// schedule's, stored beside the rows.
+inline std::array<int, 3> level_row(const BlindLevel& level) {
+    return {level.small_blind, level.big_blind, level.has_ante() ? level.ante : 0};
+}
+inline BlindLevel level_from_row(const std::array<int, 3>& row, AnteType ante_type) {
+    return BlindLevel{row[0], row[1], row[2], row[2] > 0 ? ante_type : AnteType::None};
+}
+
 // A player's decision. `amount` is used only by Bet and Raise, and is the total
 // the player's street bet becomes ("raise to"), not the chips added.
 struct Action {

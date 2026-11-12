@@ -70,7 +70,9 @@ struct SessionStats {
     std::optional<int> hero_place;
 };
 
-// A tournament's clock as the front end shows it. Nothing here is hidden.
+// A tournament's clock as the front end shows it. Nothing here is hidden. Some
+// fields (level_length, level_changed) are not drawn by the ImGui UI; they are kept
+// for other front ends, such as a REST or WebSocket server, and for tests.
 struct TournamentPanel {
     int level = 1;  // 1-based, of the hand in play or just finished
     BlindLevel current;
@@ -101,10 +103,11 @@ struct TableSnapshot {
     int small_blind = 0;  // Of the hand in play, or the latest one
     int big_blind = 0;
     int ante = 0;
+    // Part of the public table for any front end (a REST or WebSocket server too), even
+    // where the ImGui UI reads the level from `tournament` instead.
     AnteType ante_type = AnteType::None;
-    GameMode mode = GameMode::Freezeout;
+    GameMode mode = GameMode::Freezeout;  // Of this session; game_setup() is the next one's
     std::optional<TournamentPanel> tournament;  // Tournament mode only
-    bool setup_pending = false;  // A different game setup applies from the next session
     std::array<SeatSnapshot, kMaxSeats> seats;
     std::vector<Card> board;
     std::optional<std::string> waiting_on;

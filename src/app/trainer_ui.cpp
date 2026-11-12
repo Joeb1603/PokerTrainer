@@ -253,10 +253,6 @@ std::string place_text(int place) {
     return "finished " + std::to_string(place) + suffix;
 }
 
-std::string blinds_text(const BlindLevel& level) {
-    return std::to_string(level.small_blind) + "/" + std::to_string(level.big_blind);
-}
-
 std::string ante_text(const BlindLevel& level) {
     return level.ante_type == AnteType::BigBlind ? "Big blind ante " + std::to_string(level.ante)
                                                  : "Ante " + std::to_string(level.ante) + " each";

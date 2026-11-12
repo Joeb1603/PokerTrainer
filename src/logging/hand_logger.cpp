@@ -301,7 +301,7 @@ void SessionLogger::write_session(const SessionSummary& summary, const HandLogCo
         Json levels = Json::array();
         std::optional<AnteType> ante_type;
         for (const BlindLevel& level : context.tournament->levels) {
-            levels.push_back(Json::array({level.small_blind, level.big_blind, level.has_ante() ? level.ante : 0}));
+            levels.push_back(level_row(level));
             if (level.has_ante() && !ante_type) ante_type = level.ante_type;
         }
         Json sched{{"unit", context.tournament->unit}, {"len", context.tournament->level_length}, {"lv", std::move(levels)}};

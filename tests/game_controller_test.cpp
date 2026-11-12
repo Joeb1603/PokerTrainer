@@ -1489,19 +1489,16 @@ TEST_F(Controller, AnInvalidSetupIsRefused) {
     bad.level_length = 0;
     EXPECT_FALSE(c.set_game_setup(bad));
     EXPECT_EQ(c.game_setup(), default_freezeout());
-    EXPECT_FALSE(c.snapshot().setup_pending);
 }
 
 TEST_F(Controller, TheSetupWaitsForTheNextSession) {
     LocalGameController c(options());
     ASSERT_TRUE(c.set_game_setup(default_tournament()));
-    EXPECT_TRUE(c.snapshot().setup_pending);
     EXPECT_EQ(c.snapshot().mode, GameMode::Freezeout);
     EXPECT_EQ(c.game_setup().mode, GameMode::Tournament);
 
     c.new_session();
     const TableSnapshot& s = c.snapshot();
-    EXPECT_FALSE(s.setup_pending);
     EXPECT_EQ(s.mode, GameMode::Tournament);
     ASSERT_TRUE(s.tournament);
     EXPECT_EQ(s.tournament->level, 1);
@@ -1635,6 +1632,55 @@ TEST_F(Controller, AShortAntesAllInIsLogged) {
         play_hand_out(c, check_or_fold);  // Hero's stack shrinks by the antes until one is short
     }
     EXPECT_TRUE(short_seen);
+}
+
+namespace {
+
+std::vector<std::string> posts_for(std::array<int, kMaxSeats> stacks, BlindLevel level) {
+    GameConfig config;
+    config.stacks = stacks;
+    config.first_button = 0;
+    config.hero_seat = std::nullopt;
+    config.small_blind = level.small_blind;
+    config.big_blind = level.big_blind;
+    config.ante = level.ante;
+    config.ante_type = level.ante_type;
+    GameEngine engine(config);
+    engine.start_hand();
+    return posting_lines(engine.state(), {"P0", "P1", "P2", "P3", "P4", "P5"});
+}
+
+}  // namespace
+
+TEST(PostingLines, TheClassicBlindsAreUnchanged) {
+    EXPECT_EQ(posts_for({1000, 1000, 1000, 0, 0, 0}, BlindLevel{}),
+              (std::vector<std::string>{"SB P1 posts 10", "BB P2 posts 20"}));
+}
+
+TEST(PostingLines, AShortBlindSaysAllIn) {
+    EXPECT_EQ(posts_for({1000, 1000, 15, 0, 0, 0}, BlindLevel{}),
+              (std::vector<std::string>{"SB P1 posts 10", "BB P2 posts 15 (all-in)"}));
+}
+
+TEST(PostingLines, ABlindSeatAllInFromItsAntePostsNoBlind) {
+    // Heads-up, an ante of 3 each: the big blind has 3, all of it the ante.
+    EXPECT_EQ(posts_for({1000, 3, 0, 0, 0, 0}, BlindLevel{10, 20, 3, AnteType::PerPlayer}),
+              (std::vector<std::string>{"Everyone posts an ante of 3", "BTN P0 posts 10",
+                                        "BB P1 posts no blind (all in from the ante)"}));
+    // Short of the ante itself: that line says all-in too.
+    EXPECT_EQ(posts_for({1000, 1000, 2, 0, 0, 0}, BlindLevel{10, 20, 3, AnteType::PerPlayer}),
+              (std::vector<std::string>{"Everyone posts an ante of 3", "BB P2 posts an ante of 2 (all-in)",
+                                        "SB P1 posts 10", "BB P2 posts no blind (all in from the ante)"}));
+}
+
+TEST(PostingLines, ABigBlindAllInOnItsBlindPostsNoAnte) {
+    EXPECT_EQ(posts_for({1000, 1000, 15, 0, 0, 0}, BlindLevel{10, 20, 20, AnteType::BigBlind}),
+              (std::vector<std::string>{"SB P1 posts 10", "BB P2 posts 15 (all-in)"}));
+    // Short of the ante only: the ante line says so.
+    EXPECT_EQ(posts_for({1000, 1000, 25, 0, 0, 0}, BlindLevel{10, 20, 20, AnteType::BigBlind}),
+              (std::vector<std::string>{"SB P1 posts 10", "BB P2 posts 20", "BB P2 posts the ante, 5 (all-in)"}));
+    EXPECT_EQ(posts_for({1000, 1000, 1000, 0, 0, 0}, BlindLevel{10, 20, 20, AnteType::BigBlind}),
+              (std::vector<std::string>{"SB P1 posts 10", "BB P2 posts 20", "BB P2 posts the ante, 20"}));
 }
 
 TEST_F(Controller, HeroFinishingPlaceIsReportedAndLogged) {

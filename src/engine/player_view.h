@@ -35,6 +35,8 @@ struct PlayerView {
     int button = -1;
     int small_blind = 0;
     int big_blind = 0;
+    // The hand's ante, as public as the blinds. Player code uses dead_money() (the
+    // antes actually posted); these describe the level, e.g. for a remote client.
     int ante = 0;  // Per seat for PerPlayer, for the table for BigBlind
     AnteType ante_type = AnteType::None;
 
