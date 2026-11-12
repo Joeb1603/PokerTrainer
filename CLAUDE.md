@@ -50,6 +50,8 @@ Implement an `IBotStrategy` interface driven by a shared `GtoHeuristicEngine` an
 
 5\. \*\*Bot 5 - "Shifter" (Random Chameleon):\*\* At the start of each hand, randomly selects one of `\[Nit, Loose, GTO, WildGTO]` as its active internal profile. Do not reveal the active sub-profile in the main table UI, but log it in the hand history as `"Shift:<SubProfile>"`.
 
+- *Note (random personalities):* these five are still the default table. An opt-in "Random personalities" mode draws five distinct styles from a pool of 13 (these five plus TAG, LAG, Station, Maniac, Rock, Trapper, Bully and Tilter), with random names and places; see section 8.
+
 
 
 \## 5. Real-Time GTO Training Hints Module
@@ -114,6 +116,15 @@ The advisor upgrade (range-based advice, player-type advice, solver mode) is don
 - **UI:** an "Advice:" selector (Baseline/Nit/Station/Maniac) with tooltips, a "Versus types" table, and a Solver mode checkbox with budget slider, progress and frequencies.
 - **Benches** (`tools/bench`): 36 river and 12 turn spots, scored against the solver. River regret fell from 1.946 to 0.694 BB per decision, and agreement with the solver's top action rose from 28% to 57%. On the turn holdout the tuned Baseline gives 0.543 BB and 33%, against 0.614 BB and 39% with the pre-tuning parameters.
 
+Random personalities (after `v1.2.0`, not yet released) is done. With the option off, the classic table is byte-identical. What it added:
+- **Knobs** in `PersonalityProfile` (`gto_heuristic_engine.h`): `preflop_sizing`, `bet_sizes`, `positional_width` (TopPercent cut-offs by position), `slowplay_freq` and `cbet_freq`. Defaults reproduce the classic behaviour, and a knob at 0 never draws from the generator.
+- **Archetypes:** `tag_profile`, `lag_profile`, `station_profile`, `maniac_profile`, `rock_profile`, `trapper_profile`, `bully_profile`, and `TiltBot` ("Tilter": TAG, then Maniac for `kTiltHands` hands after losing `kTiltLossBigBlinds`). `BotKind` gains them at the end; `kAllBotKinds` is still the classic lineup, `kExtraBotKinds` the new eight, `kRandomPoolKinds` all 13; `draw_random_lineup` picks five distinct kinds in seat order.
+- **Controller:** `ControllerOptions::random_personalities` and `IGameController::set_random_personalities`, applied at the next `new_session()`. Names come from `controller/bot_names`. The lineup has its own stream (`seed ^ kLineupStream`).
+- **Logs:** with the option on, `p` is `Name:Style` (`Marta:LAG`, `Marta:Shift:Nit`, `Marta:Tilt:On`); session summaries use the public style (`Marta:Shifter`). The schema is unchanged.
+- **UI:** a "Random personalities" checkbox under the Advice selector ("(next session)" until it applies), the lineup on the session-over console, and Hero's own folded cards kept on the table, dimmed, for the rest of the hand.
+- **App:** `poker_trainer_settings.json` beside `logs/` remembers the option (`src/app/app_settings`).
+- **Pins:** `Golden.ClassicBotsDecideAsBefore` and `Controller.OffModeLogsUnchanged` hash the classic bots' decisions and the default table's logs; `TableReport.DISABLED_PoolStats` prints VPIP, PFR and aggression per style.
+
 ## 9. Build and Test
 
 Uses the "Visual Studio 18 2026" generator, x64, in `build/`:
@@ -143,7 +154,8 @@ ctest --test-dir build -C Release --output-on-failure -j 8
   - To release: write and push the notes file first, then run once with "publish" off to check, then again with it on.
   - The GitHub tools available to Claude can't create a release directly, but they can trigger this workflow and read its logs.
 - Windowless UI tests are in `tests/trainer_ui_test.cpp`. They inject ImGui input at fixed coordinates, so layout changes mean updating those constants.
-- `main.cpp` has developer flags for reaching rare screens: `--seed`, `--log-dir`, `--exit-after-frames`, `--auto-shove`, `--stop-on live-side-pot|side-pot|showdown|flop|bust`, `--reveal`, `--bot-delay MS`, `--solver`, `--solver-budget MS`, `--solver-tier off|river|turn|flop`.
+- `main.cpp` has developer flags for reaching rare screens: `--seed`, `--log-dir`, `--exit-after-frames`, `--auto-shove`, `--stop-on live-side-pot|side-pot|showdown|flop|bust|folded`, `--reveal`, `--bot-delay MS`, `--solver`, `--solver-budget MS`, `--solver-tier off|river|turn|flop`. `folded` has Hero fold a hand that goes on, then pauses the bots.
+- User-facing flags: `--random-personalities on|off` (sets the option for one run without saving it) and `--settings PATH` (the settings file; default `poker_trainer_settings.json` in the working folder). Pass `--settings` when running the app from a tool, so a run never writes into the repo.
 - More developer flags for reviewing the UI: `--advice baseline|nit|station|maniac` (initial "Advice:" choice), `--hover X,Y` (holds the ImGui mouse there, for tooltips), `--size WxH` (window size, at least 1180x760), and `--screenshot PATH` (saves the last frame as a PNG, with `--exit-after-frames` or on close; works under `xvfb-run` on Linux).
 - To screenshot the app when other windows may cover it, capture the window itself with Win32 `PrintWindow` (flag 2). `CopyFromScreen` captures whatever is on top.
 - In PowerShell, double quotes inside a `git commit -m` here-string break the argument. Write the message to a file and use `git commit -F`.
@@ -155,8 +167,9 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - **Player-side code:** `src/range`, `src/solver` and `src/controller/solver_service.*` count as player-side, like `src/bots`, `src/advisor`, `src/strategy` and `src/equity`. The scan covers them all and forbids the word `Seat`, `.hole`, `last_result` and `showdown_ranks`, comments included. Their headers are also compiled in `tests/player_boundary_test.cpp`.
 - **Solver service:** it gets only a `PlayerView` and builds both ranges from it with the range model (every villain read as Baseline). Its advice covers Hero's own combo only.
 - **Player types are generic:** Baseline, Nit, Station and Maniac are applied to all opponents alike. No per-seat type, label or bot identity may reach the advisor, the solver or the UI, so `PlayerView` stays unchanged and the Shifter stays hidden.
+- **Random personalities:** bot names come from the controller and say nothing about style. A bot's style reaches only the hand log and, once the session is over, `SessionStats::lineup` (a deliberate exception the user asked for: the reveal at the end). The Shifter shows there as "Shifter", never its sub-profile. Nothing about the lineup reaches the advisor or the solver.
 - **Front end:** `TrainerUi` sees only `IGameController` and `TableSnapshot`. The snapshot has hidden information removed already, and new UI data should be added to it. The UI must not reach into engine state.
-- **Shifter:** its active profile appears only in the hand log, as `Shift:<SubProfile>`, never in the snapshot or UI.
+- **Shifter and Tilter:** the Shifter's active profile appears only in the hand log, as `Shift:<SubProfile>`, never in the snapshot or UI; so does the Tilter's state, as `Tilt:On` or `Tilt:Off`.
 - **Logging:** a change to the UI or advice must not change the JSONL schema unless that's the request. `describe_hand` keeps log text stable; `describe_made_hand` gives UI names.
 
 ## 11. Decisions to Preserve
@@ -181,7 +194,9 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - **GTO bot:** keeps 33%, 75% and 125% per section 4, so it intentionally differs from the advisor's ladder.
 - **Quick-bet buttons:** each one sets the slider, while the action buttons act. Percentage buttons are capped at what an opponent can match, but the All-In quick button still goes to the full stack.
 - **Fold Early:** the fold happens when action reaches Hero, through the normal action path, so bots can't react to it. A free check cancels it. Bots skip their delay only while armed.
-- **Reveal Bot Hands:** a display option for finished hands only. It doesn't change logs, `shown_hand` or payouts.
+- **Reveal Bot Hands:** a display option for finished hands only. It doesn't change logs, `shown_hand` or payouts. Hero's own folded cards don't wait for it: they stay on the table, dimmed (`revealed_after_fold`), for the rest of the hand.
+- **Random personalities off is the classic table, byte-identical:** the classic bots are seeded `seed + 1000 + seat` and kept across `new_session()`, as before; only a random lineup (or leaving one) rebuilds them. New knobs draw from the generator only when above 0, through raw bits (`unit_roll`, `uniform_below` in `core/random.h`). `Golden.ClassicBotsDecideAsBefore` and `Controller.OffModeLogsUnchanged` pin this.
+- **The lineup has its own stream** (`seed ^ kLineupStream`): five kinds, five names, then one seed per bot, in that order.
 
 ## 12. Known Limits
 
@@ -190,6 +205,7 @@ ctest --test-dir build -C Release --output-on-failure -j 8
 - Fold Early has effectively no cancel window, because bots finish acting within a frame of arming it.
 - The sizing distribution is measured only for heads-up spots with no bet to face.
 - New Session has no confirmation, and quitting mid-hand can make the summary's `hands` count one higher than the logged hands.
+- **Random personalities:** the archetypes' numbers are judgement, checked only for being distinct (`TableReport.DISABLED_PoolStats`), not tuned or benchmarked against the solver. The Tilter measures its loss between hands it acts in, so a walk in the big blind folds into the next comparison. The golden hashes are pinned for libstdc++ only (the classic bots draw through library-defined distributions), so on MSVC the tests print the hash and skip. Saving the setting from a real checkbox click has been checked only through the injected-input UI test and the settings tests, not end to end.
 - **Windows:** the release workflow builds the upgrade with MSVC `/W4` with zero warnings in project code, and passes all 495 tests in Release and Debug on `windows-latest`.
   - Those tests also call `GlobalMemoryStatusEx`, in `Hardware.DetectReturnsSomethingSane`.
   - Not yet checked: running the app on a real Windows PC, Windows fonts and DPI scales other than 1 for the new UI, and the solver tiers on real Windows hardware.

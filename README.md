@@ -28,6 +28,7 @@ The executable isn't code-signed, so Windows SmartScreen may warn you the first 
 - **Fold Early** button that skips the wait: bots act without their delay, and you fold when action reaches you, unless you could check for free
 - Adjustable bot speed or instant play, and a pause after each hand (press **Space** or click **Next Hand**)
 - **Reveal Bot Hands** button at the end of a hand, including bots that folded
+- Your own cards stay on the table, dimmed, after you fold, for the rest of the hand
 
 ### The poker engine
 - Fisher-Yates shuffle, implemented directly in the deck code
@@ -45,6 +46,22 @@ The executable isn't code-signed, so Windows SmartScreen may warn you the first 
 | **GTO** | The baseline: positional charts, Monte Carlo equity, Minimum Defense Frequency and board-based bet sizing |
 | **WildGTO** | Starts from the GTO move, then overrides it 20% of the time with an aggressive or loose play |
 | **Shifter** | Secretly becomes one of the other four at the start of each hand |
+
+#### Random personalities
+Tick **Random personalities** in the sidebar and, from the next session, the five bots get new first names, new places at the table and five different playing styles, drawn from a pool of 13: the five above plus these eight.
+
+| Style | How it plays |
+|---|---|
+| **TAG** | Tight and aggressive: plays about one hand in seven, tighter early and wider late, and continuation-bets often |
+| **LAG** | Loose and aggressive: plays about one hand in four, raises rather than calls, and bets bigger |
+| **Station** | Limps and calls with most hands and any pair or draw, and rarely bets without a strong hand |
+| **Maniac** | Raises big with most hands, bluffs more often than not, and re-raises light |
+| **Rock** | Even tighter than the Nit and never bluffs, but calls a big bet with a good one-pair hand |
+| **Trapper** | Checks and calls its strongest hands on the flop and turn, then springs a raise |
+| **Bully** | Opens to 3.5 BB, 3-bets big and overbets, up to twice the pot on the river |
+| **Tilter** | Plays like the TAG, until it loses 30 BB in a hand: then plays like the Maniac for eight hands |
+
+The table shows only their names, so working out who is who is part of the training. The styles are revealed when the session ends and in the hand log, where each bot is labelled `Name:Style` (for example `Marta:LAG`). The setting is remembered in `poker_trainer_settings.json`, next to the `logs` folder. With it off, the table is the classic five, exactly as before.
 
 Bots can't cheat. They decide using a sanitized view of the game that contains no opponent hole cards.
 
@@ -105,7 +122,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 This builds two programs:
 
-- `build\Release\poker_trainer.exe`: the desktop app, which accepts `--seed N` for a repeatable game and `--log-dir DIR` to choose where logs go
+- `build\Release\poker_trainer.exe`: the desktop app, which accepts `--seed N` for a repeatable game, `--log-dir DIR` to choose where logs go, `--random-personalities on|off` to set that option for one run, and `--settings PATH` to keep the settings file elsewhere
 - `build\Release\poker_cli.exe`: a headless test harness for the engine, with `--games N`, `--seed S` and `--verbose`
 
 It also builds developer tools: `advisor_bench` (scores the advisor against the solver on the spots in `tools/bench`), `advisor_matchup` (plays the player-type advice lines against the bots), `solver_cli` (runs a single solve), and the generators for the preflop equity and push/fold tables.

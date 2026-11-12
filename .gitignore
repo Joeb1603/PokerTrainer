@@ -21,3 +21,5 @@ CMakeUserPresets.json
 # Runtime output
 logs/
 imgui.ini
+poker_trainer_settings.json
+poker_trainer_settings.json.tmp

@@ -46,7 +46,9 @@ struct HandLogContext {
     std::string session_id;  // Joins hand lines to their session summary line
     int small_blind = 0;
     int big_blind = 0;
-    std::array<std::string, kMaxSeats> seat_labels;  // e.g. "Hero", "Nit", "Shift:GTO"
+    // e.g. "Hero", "Nit", "Shift:GTO"; with random personalities, "Name:Style", such as
+    // "Marta:LAG", "Marta:Shift:GTO" or "Marta:Tilt:On"
+    std::array<std::string, kMaxSeats> seat_labels;
     std::optional<int> hero_seat;
     std::vector<HeroMistake> hero_mistakes;
 };
@@ -120,8 +122,9 @@ public:
 
     void record_hand_mistakes(const std::vector<HeroMistake>& mistakes);
 
-    // Uses the context's blinds, labels and Hero seat; pass Bot 5's public name, as
-    // a per-hand "Shift:" label means nothing for a whole session. `timestamp`
+    // Uses the context's blinds, labels and Hero seat; pass each bot's public style
+    // ("Shifter", "Tilter", or "Marta:Shifter" with random personalities), as a
+    // per-hand "Shift:" or "Tilt:" label means nothing for a whole session. `timestamp`
     // overrides the clock, for reproducible output. Throws std::runtime_error if the
     // write fails.
     void write_session(const SessionSummary& summary, const HandLogContext& context,
