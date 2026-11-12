@@ -447,6 +447,130 @@ PersonalityProfile gto_profile(int rollouts) {
     return p;
 }
 
+PersonalityProfile tag_profile(int rollouts) {
+    PersonalityProfile p;
+    p.name = "TAG";
+    p.cutoffs = {.play = 20.0, .open_raise = 20.0, .three_bet = 6.0, .call_raise = 12.0, .four_bet = 2.5,
+                 .call_three_bet = 6.0, .commit = 4.0};
+    p.positional_width = 0.6;
+    p.call_margin = 0.05;
+    p.bluff_freq = 0.12;
+    p.bluff_raise_share = 0.15;
+    p.bet_pressure_discount = 0.05;
+    p.value_bet_strength = 0.30;
+    p.value_raise_strength = 0.55;
+    p.polarized_strength = 0.82;
+    p.bet_sizes = {.dry = 0.5, .wet = 0.75, .polarized = 1.25};
+    p.cbet_freq = 0.65;
+    p.rollouts = rollouts;
+    return p;
+}
+
+PersonalityProfile lag_profile(int rollouts) {
+    PersonalityProfile p;
+    p.name = "LAG";
+    p.cutoffs = {.play = 32.0, .open_raise = 32.0, .three_bet = 12.0, .call_raise = 20.0, .four_bet = 4.5,
+                 .call_three_bet = 12.0, .commit = 8.0};
+    p.positional_width = 0.8;
+    p.call_margin = -0.02;
+    p.bluff_freq = 0.25;
+    p.bluff_raise_share = 0.35;
+    p.bet_pressure_discount = 0.05;
+    p.value_bet_strength = 0.20;
+    p.value_raise_strength = 0.45;
+    p.polarized_strength = 0.78;
+    p.bet_sizes = {.dry = 0.5, .wet = 0.8, .polarized = 1.5};
+    p.cbet_freq = 0.75;
+    p.rollouts = rollouts;
+    return p;
+}
+
+PersonalityProfile station_profile(int rollouts) {
+    PersonalityProfile p;
+    p.name = "Station";
+    p.cutoffs = {.play = 60.0, .open_raise = 8.0, .three_bet = 3.0, .call_raise = 60.0, .four_bet = 2.0,
+                 .call_three_bet = 35.0, .commit = 20.0};
+    p.call_margin = -0.20;
+    p.bluff_freq = 0.05;
+    p.calls_any_pair_or_draw = true;
+    p.value_bet_strength = 0.35;
+    p.value_raise_strength = 0.75;
+    p.polarized_strength = 0.90;
+    p.bet_sizes = {.dry = 0.33, .wet = 0.5, .polarized = 0.75};
+    p.rollouts = rollouts;
+    return p;
+}
+
+PersonalityProfile maniac_profile(int rollouts) {
+    PersonalityProfile p;
+    p.name = "Maniac";
+    p.cutoffs = {.play = 70.0, .open_raise = 70.0, .three_bet = 25.0, .call_raise = 45.0, .four_bet = 12.0,
+                 .call_three_bet = 40.0, .commit = 25.0};
+    p.positional_width = 0.4;
+    p.preflop_sizing = {.open_bb = 4.0, .vs_raise_mult = 4.0, .vs_reraise_mult = 2.5};
+    p.call_margin = -0.08;
+    p.bluff_freq = 0.55;
+    p.bluff_raise_share = 0.45;
+    p.calls_any_pair_or_draw = true;
+    p.value_bet_strength = 0.15;
+    p.value_raise_strength = 0.35;
+    p.polarized_strength = 0.70;
+    p.bet_sizes = {.dry = 0.66, .wet = 1.0, .polarized = 1.5};
+    p.cbet_freq = 0.9;
+    p.rollouts = rollouts;
+    return p;
+}
+
+PersonalityProfile rock_profile(int rollouts) {
+    PersonalityProfile p;
+    p.name = "Rock";
+    p.cutoffs = {.play = 8.0, .open_raise = 8.0, .three_bet = 2.0, .call_raise = 5.0, .four_bet = 1.5,
+                 .call_three_bet = 2.5, .commit = 2.0};
+    p.positional_width = 0.3;
+    p.call_margin = 0.10;
+    p.value_bet_strength = 0.50;
+    p.value_raise_strength = 0.80;
+    p.polarized_strength = 0.90;
+    p.bet_sizes = {.dry = 0.5, .wet = 0.66, .polarized = 1.0};
+    p.rollouts = rollouts;
+    return p;
+}
+
+PersonalityProfile trapper_profile(int rollouts) {
+    PersonalityProfile p;
+    p.name = "Trapper";
+    p.cutoffs = {.play = 18.0, .open_raise = 15.0, .three_bet = 1.5, .call_raise = 18.0, .four_bet = 1.5,
+                 .call_three_bet = 6.0, .commit = 5.0};
+    p.positional_width = 0.3;
+    p.bluff_freq = 0.06;
+    p.value_bet_strength = 0.30;
+    p.value_raise_strength = 0.50;
+    p.polarized_strength = 0.75;
+    p.slowplay_freq = 0.6;
+    p.rollouts = rollouts;
+    return p;
+}
+
+PersonalityProfile bully_profile(int rollouts) {
+    PersonalityProfile p;
+    p.name = "Bully";
+    p.cutoffs = {.play = 28.0, .open_raise = 28.0, .three_bet = 10.0, .call_raise = 14.0, .four_bet = 4.0,
+                 .call_three_bet = 8.0, .commit = 6.0};
+    p.positional_width = 0.5;
+    p.preflop_sizing = {.open_bb = 3.5, .vs_raise_mult = 4.0, .vs_reraise_mult = 2.6};
+    p.call_margin = 0.05;
+    p.bluff_freq = 0.20;
+    p.bluff_raise_share = 0.20;
+    p.bet_pressure_discount = 0.05;
+    p.value_bet_strength = 0.30;
+    p.value_raise_strength = 0.55;
+    p.polarized_strength = 0.80;
+    p.bet_sizes = {.dry = 0.75, .wet = 1.25, .polarized = 2.0};
+    p.cbet_freq = 0.8;
+    p.rollouts = rollouts;
+    return p;
+}
+
 PreflopCutoffs cutoffs_at(const PersonalityProfile& profile, std::optional<Position> position) {
     PreflopCutoffs cut = profile.cutoffs;
     if (profile.positional_width == 0.0 || !position) return cut;

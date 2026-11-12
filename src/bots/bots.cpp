@@ -1,6 +1,9 @@
 #include "bots/bots.h"
 
 #include <stdexcept>
+#include <utility>
+
+#include "core/random.h"
 
 namespace poker {
 namespace {
@@ -70,6 +73,42 @@ void ShifterBot::begin_hand(int hand_number) {
     active_->begin_hand(hand_number);
 }
 
+TiltBot::TiltBot(std::uint64_t seed, int rollouts) {
+    std::mt19937_64 derive(seed);
+    calm_ = std::make_unique<ProfileBot>(tag_profile(rollouts), derive());
+    tilted_ = std::make_unique<ProfileBot>(maniac_profile(rollouts), derive());
+}
+
+void TiltBot::reset() {
+    baseline_.reset();
+    last_hand_ = 0;
+    tilt_until_hand_ = 0;
+}
+
+void TiltBot::begin_hand(int hand_number) {
+    if (hand_number <= last_begun_) reset();  // Hand numbers restarted: a new session
+    last_begun_ = hand_number;
+    // Set here too, so the label is right for a hand it never acts in.
+    tilted_now_ = hand_number <= tilt_until_hand_;
+    calm_->begin_hand(hand_number);
+    tilted_->begin_hand(hand_number);
+}
+
+Action TiltBot::decide(const PlayerView& view) {
+    if (view.hand_number != last_hand_) {
+        if (view.hand_number < last_hand_) reset();
+        const PublicSeat& me = view.seats[static_cast<std::size_t>(view.seat)];
+        const int start = me.stack + me.total_bet;
+        if (baseline_ && *baseline_ - start >= kTiltLossBigBlinds * view.big_blind) {
+            tilt_until_hand_ = view.hand_number + kTiltHands - 1;
+        }
+        tilted_now_ = view.hand_number <= tilt_until_hand_;
+        baseline_ = start;
+        last_hand_ = view.hand_number;
+    }
+    return tilted_now_ ? tilted_->decide(view) : calm_->decide(view);
+}
+
 std::unique_ptr<IBotStrategy> make_bot(BotKind kind, std::uint64_t seed, int rollouts) {
     switch (kind) {
         case BotKind::Nit: return std::make_unique<NitBot>(seed, rollouts);
@@ -77,8 +116,47 @@ std::unique_ptr<IBotStrategy> make_bot(BotKind kind, std::uint64_t seed, int rol
         case BotKind::Gto: return std::make_unique<GtoBot>(seed, rollouts);
         case BotKind::WildGto: return std::make_unique<WildGtoBot>(seed, rollouts);
         case BotKind::Shifter: return std::make_unique<ShifterBot>(seed, rollouts);
+        case BotKind::Tag: return std::make_unique<ProfileBot>(tag_profile(rollouts), seed);
+        case BotKind::Lag: return std::make_unique<ProfileBot>(lag_profile(rollouts), seed);
+        case BotKind::Station: return std::make_unique<ProfileBot>(station_profile(rollouts), seed);
+        case BotKind::Maniac: return std::make_unique<ProfileBot>(maniac_profile(rollouts), seed);
+        case BotKind::Rock: return std::make_unique<ProfileBot>(rock_profile(rollouts), seed);
+        case BotKind::Trapper: return std::make_unique<ProfileBot>(trapper_profile(rollouts), seed);
+        case BotKind::Bully: return std::make_unique<ProfileBot>(bully_profile(rollouts), seed);
+        case BotKind::Tilter: return std::make_unique<TiltBot>(seed, rollouts);
     }
     throw std::invalid_argument("make_bot: unknown kind");
+}
+
+std::string_view bot_kind_name(BotKind kind) {
+    switch (kind) {
+        case BotKind::Nit: return "Nit";
+        case BotKind::Loose: return "Loose";
+        case BotKind::Gto: return "GTO";
+        case BotKind::WildGto: return "WildGTO";
+        case BotKind::Shifter: return "Shifter";
+        case BotKind::Tag: return "TAG";
+        case BotKind::Lag: return "LAG";
+        case BotKind::Station: return "Station";
+        case BotKind::Maniac: return "Maniac";
+        case BotKind::Rock: return "Rock";
+        case BotKind::Trapper: return "Trapper";
+        case BotKind::Bully: return "Bully";
+        case BotKind::Tilter: return "Tilter";
+    }
+    throw std::invalid_argument("bot_kind_name: unknown kind");
+}
+
+std::array<BotKind, 5> draw_random_lineup(std::mt19937_64& rng) {
+    // A partial Fisher-Yates: the first five places of a shuffled pool.
+    std::array<BotKind, kRandomPoolKinds.size()> pool = kRandomPoolKinds;
+    std::array<BotKind, 5> lineup{};
+    for (std::size_t i = 0; i < lineup.size(); ++i) {
+        const std::size_t j = i + static_cast<std::size_t>(uniform_below(rng, pool.size() - i));
+        std::swap(pool[i], pool[j]);
+        lineup[i] = pool[i];
+    }
+    return lineup;
 }
 
 }  // namespace poker

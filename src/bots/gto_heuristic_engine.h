@@ -226,6 +226,16 @@ PersonalityProfile nit_profile(int rollouts = kDefaultRollouts);
 PersonalityProfile loose_profile(int rollouts = kDefaultRollouts);
 PersonalityProfile gto_profile(int rollouts = kDefaultRollouts);
 
+// The random-personalities pool's archetypes. All play TopPercent ranges, and their
+// numbers are judgement, not tuned: each is meant to feel distinct at the table.
+PersonalityProfile tag_profile(int rollouts = kDefaultRollouts);      // Tight-aggressive, c-bets
+PersonalityProfile lag_profile(int rollouts = kDefaultRollouts);      // Loose-aggressive, positional
+PersonalityProfile station_profile(int rollouts = kDefaultRollouts);  // Limps and calls almost anything
+PersonalityProfile maniac_profile(int rollouts = kDefaultRollouts);   // Raises and bluffs relentlessly
+PersonalityProfile rock_profile(int rollouts = kDefaultRollouts);     // Tighter than the Nit, never bluffs
+PersonalityProfile trapper_profile(int rollouts = kDefaultRollouts);  // Slowplays strong hands, rarely 3-bets
+PersonalityProfile bully_profile(int rollouts = kDefaultRollouts);    // Big preflop raises and overbets
+
 // Shared decision logic. It holds no RNG or per-hand state, so one bot's choices
 // depend only on its view and the generator it passes in.
 class GtoHeuristicEngine {

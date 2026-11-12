@@ -1,23 +1,12 @@
 #include "core/deck.h"
 
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <utility>
 
+#include "core/random.h"
+
 namespace poker {
-namespace {
-
-// Unbiased integer in [0, bound) using rejection sampling.
-std::uint64_t bounded(std::mt19937_64& rng, std::uint64_t bound) {
-    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
-    const std::uint64_t limit = kMax - (kMax % bound + 1) % bound;
-    std::uint64_t value = rng();
-    while (value > limit) value = rng();
-    return value % bound;
-}
-
-}  // namespace
 
 Deck::Deck() : Deck(std::span<const Card>{}) {}
 
@@ -32,7 +21,7 @@ Deck::Deck(std::span<const Card> excluded) {
 
 void Deck::shuffle(std::mt19937_64& rng) {
     for (std::size_t i = size_; i > next_ + 1; --i) {
-        const std::size_t j = next_ + static_cast<std::size_t>(bounded(rng, i - next_));
+        const std::size_t j = next_ + static_cast<std::size_t>(uniform_below(rng, i - next_));
         std::swap(cards_[i - 1], cards_[j]);
     }
 }
@@ -44,7 +33,7 @@ Card Deck::deal() {
 
 Card Deck::deal_random(std::mt19937_64& rng) {
     if (next_ == size_) throw std::out_of_range("Deck::deal_random: deck is empty");
-    const std::size_t j = next_ + static_cast<std::size_t>(bounded(rng, size_ - next_));
+    const std::size_t j = next_ + static_cast<std::size_t>(uniform_below(rng, size_ - next_));
     std::swap(cards_[next_], cards_[j]);
     return cards_[next_++];
 }

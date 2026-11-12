@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -229,6 +230,7 @@ TEST_P(AntiCheat, WholeHandDecisionsIgnoreOpponentCards) {
 }
 
 INSTANTIATE_TEST_SUITE_P(AllBots, AntiCheat, testing::ValuesIn(kAllBotKinds));
+INSTANTIATE_TEST_SUITE_P(PoolBots, AntiCheat, testing::ValuesIn(kExtraBotKinds));
 
 // --- Nit ---------------------------------------------------------------------
 
@@ -692,6 +694,189 @@ TEST(Knobs, NoContinuationBetIntoThreeOpponents) {
     EXPECT_NEAR(bluff_rate(bot, view, kDecisions), 0.1, tolerance(0.1, kDecisions));
 }
 
+// --- Pool archetypes ---------------------------------------------------------
+
+TEST(Archetypes, StationCallsAWeakDrawWhereTagDoesNot) {
+    // A gutshot and nothing else, facing a pot-sized bet.
+    const std::array<Card, 5> board = board_of("9d", "8s", "6c", "2h", "Kd");
+    GameEngine engine = heads_up_to_flop(hole("5h", "2d"), hole("Ac", "Ad"), board);
+    ASSERT_TRUE(engine.apply_action({ActionType::Bet, 200}));
+    const PlayerView view = engine.player_view(0);
+    ProfileBot station(station_profile(kScenarioRollouts), 70);
+    ProfileBot tag(tag_profile(kScenarioRollouts), 71);
+    for (int i = 0; i < 40; ++i) {
+        EXPECT_EQ(station.decide(view).type, ActionType::Call);
+        EXPECT_NE(tag.decide(view).type, ActionType::Call);  // Folds, bar the odd bluff raise
+    }
+}
+
+TEST(Archetypes, StationLimpsWhatItDoesNotRaise) {
+    ProfileBot station(station_profile(kFastRollouts), 72);
+    constexpr int kHands = 20000;
+    const double entry = HandRange::top_percent(60.0).percent() / 100.0;
+    EXPECT_NEAR(empirical_entry_rate(station, kHands), entry, tolerance(entry, kHands));
+    GameEngine engine = six_max(3, cards_of("Q8o"));
+    ASSERT_GT(strength_percentile(HandClass::parse("Q8o").value()), 8.0);
+    ASSERT_LE(strength_percentile(HandClass::parse("Q8o").value()), 60.0);
+    EXPECT_EQ(station.decide(engine.player_view(3)).type, ActionType::Call);
+}
+
+TEST(Archetypes, ManiacBluffsAndBluffRaisesOften) {
+    constexpr int kDecisions = 4000;
+    ProfileBot maniac(maniac_profile(kFastRollouts), 73);
+
+    GameEngine checked_to = heads_up_to_flop(hole("Tc", "Td"), hole("7c", "3d"), board_of("As", "Kh", "9d", "2c", "Js"));
+    EXPECT_NEAR(bluff_rate(maniac, checked_to.player_view(1), kDecisions), 0.55, tolerance(0.55, kDecisions));
+
+    GameEngine facing = heads_up_to_flop(hole("3c", "4d"), hole("Ac", "Ad"), board_of("Ks", "Qh", "Td", "2c", "8s"));
+    ASSERT_TRUE(facing.apply_action({ActionType::Bet, 400}));
+    const double raise = 0.55 * 0.45;
+    EXPECT_NEAR(bluff_rate(maniac, facing.player_view(0), kDecisions), raise, tolerance(raise, kDecisions));
+}
+
+TEST(Archetypes, RockNeverBluffsAndCallsTopPairWhereNitFolds) {
+    ProfileBot rock(rock_profile(kScenarioRollouts), 74);
+    GameEngine air = heads_up_to_flop(hole("Tc", "Td"), hole("7c", "3d"), board_of("As", "Kh", "9d", "2c", "Js"));
+    EXPECT_DOUBLE_EQ(bluff_rate(rock, air.player_view(1), 500), 0.0);
+
+    const std::array<Card, 5> board = board_of("Kd", "8s", "3c", "2h", "Jd");
+    GameEngine top_pair = heads_up_to_flop(hole("Ks", "Qh"), hole("9c", "9d"), board);
+    ASSERT_TRUE(top_pair.apply_action({ActionType::Bet, 250}));
+    NitBot nit(75, kScenarioRollouts);
+    EXPECT_EQ(nit.decide(top_pair.player_view(0)).type, ActionType::Fold);
+    EXPECT_NE(rock.decide(top_pair.player_view(0)).type, ActionType::Fold);
+}
+
+TEST(Archetypes, LagOpensMoreThanTagAndBothWidenOnTheButton) {
+    ProfileBot lag(lag_profile(kFastRollouts), 76);
+    ProfileBot tag(tag_profile(kFastRollouts), 77);
+    constexpr int kHands = 8000;
+    const double lag_btn = entry_rate_at(lag, 0, kHands);
+    const double tag_btn = entry_rate_at(tag, 0, kHands);
+    EXPECT_GT(lag_btn, tag_btn + 0.08);
+    EXPECT_GT(tag_btn, entry_rate_at(tag, 3, kHands) + 0.05);
+}
+
+TEST(Archetypes, TrapperSlowplaysAndBullyOverbets) {
+    constexpr int kDecisions = 2000;
+    GameEngine top_set = heads_up_to_flop(hole("Tc", "Td"), hole("Ac", "Ad"), board_of("As", "7h", "2d", "9c", "4s"));
+    ProfileBot trapper(trapper_profile(kFastRollouts), 78);
+    EXPECT_NEAR(bluff_rate(trapper, top_set.player_view(1), kDecisions), 0.4, tolerance(0.4, kDecisions));
+
+    ProfileBot bully(bully_profile(kScenarioRollouts), 79);
+    GameEngine river = heads_up_to_flop(hole("Tc", "Td"), hole("Ah", "Kh"), board_of("Qh", "Jh", "Th", "2c", "3d"));
+    check_street(river);
+    check_street(river);
+    EXPECT_TRUE(same(bully.decide(river.player_view(1)), {ActionType::Bet, 400}));  // Twice the pot
+}
+
+// --- Tilter ------------------------------------------------------------------
+
+// The UTG view with a chosen hand number and stack: K6o, which TAG folds there and
+// the Maniac opens.
+PlayerView tilt_view(int hand_number, int stack) {
+    GameEngine engine = six_max(3, cards_of("K6o"));
+    PlayerView view = engine.player_view(3);
+    view.hand_number = hand_number;
+    view.seats[3].stack = stack;
+    return view;
+}
+
+TEST(Tilter, TiltsAfterABigLossAndCoolsDown) {
+    const double k6o = strength_percentile(HandClass::parse("K6o").value());
+    ASSERT_GT(k6o, cutoffs_at(tag_profile(), Position::UTG).open_raise);
+    ASSERT_LE(k6o, cutoffs_at(maniac_profile(), Position::UTG).open_raise);
+
+    TiltBot bot(80, kFastRollouts);
+    bot.begin_hand(1);
+    EXPECT_EQ(bot.decide(tilt_view(1, 2000)).type, ActionType::Fold);
+    EXPECT_EQ(bot.hand_log_label(), "Tilt:Off");
+
+    bot.begin_hand(2);
+    EXPECT_EQ(bot.decide(tilt_view(2, 1300)).type, ActionType::Raise);  // 35 big blinds down
+    EXPECT_EQ(bot.hand_log_label(), "Tilt:On");
+    for (int hand = 3; hand <= 9; ++hand) {
+        bot.begin_hand(hand);
+        EXPECT_EQ(bot.decide(tilt_view(hand, 1300)).type, ActionType::Raise) << hand;
+        EXPECT_TRUE(bot.tilted()) << hand;
+    }
+    bot.begin_hand(10);
+    EXPECT_EQ(bot.decide(tilt_view(10, 1300)).type, ActionType::Fold);
+    EXPECT_EQ(bot.hand_log_label(), "Tilt:Off");
+}
+
+TEST(Tilter, ASmallerLossDoesNotTilt) {
+    TiltBot bot(81, kFastRollouts);
+    bot.begin_hand(1);
+    (void)bot.decide(tilt_view(1, 2000));
+    bot.begin_hand(2);
+    EXPECT_EQ(bot.decide(tilt_view(2, 1420)).type, ActionType::Fold);  // 29 big blinds down
+    EXPECT_FALSE(bot.tilted());
+}
+
+TEST(Tilter, ANewSessionResetsIt) {
+    TiltBot bot(82, kFastRollouts);
+    bot.begin_hand(1);
+    (void)bot.decide(tilt_view(1, 2000));
+    bot.begin_hand(2);
+    (void)bot.decide(tilt_view(2, 1300));
+    ASSERT_TRUE(bot.tilted());
+
+    bot.begin_hand(1);  // Hand numbers restart
+    EXPECT_FALSE(bot.tilted());
+    EXPECT_EQ(bot.decide(tilt_view(1, 2000)).type, ActionType::Fold);
+    EXPECT_FALSE(bot.tilted());
+}
+
+TEST(Tilter, TheLabelHoldsInAHandItNeverActsIn) {
+    TiltBot bot(83, kFastRollouts);
+    bot.begin_hand(1);
+    (void)bot.decide(tilt_view(1, 2000));
+    bot.begin_hand(2);
+    (void)bot.decide(tilt_view(2, 1300));
+    bot.begin_hand(3);  // A walk in the big blind: no decision
+    EXPECT_EQ(bot.hand_log_label(), "Tilt:On");
+}
+
+// --- Random lineup -----------------------------------------------------------
+
+TEST(RandomLineup, FiveDistinctKindsFromThePool) {
+    std::mt19937_64 rng(90);
+    for (int i = 0; i < 500; ++i) {
+        const std::array<BotKind, 5> lineup = draw_random_lineup(rng);
+        std::set<BotKind> seen(lineup.begin(), lineup.end());
+        EXPECT_EQ(seen.size(), 5u);
+        for (const BotKind kind : lineup) {
+            EXPECT_NE(std::find(kRandomPoolKinds.begin(), kRandomPoolKinds.end(), kind), kRandomPoolKinds.end());
+        }
+    }
+}
+
+TEST(RandomLineup, SameSeedSameLineup) {
+    std::mt19937_64 a(91);
+    std::mt19937_64 b(91);
+    for (int i = 0; i < 20; ++i) EXPECT_EQ(draw_random_lineup(a), draw_random_lineup(b));
+}
+
+TEST(RandomLineup, CoversThePoolUniformly) {
+    constexpr int kDraws = 13000;
+    std::mt19937_64 rng(92);
+    std::map<BotKind, int> anywhere;
+    std::map<BotKind, int> first_place;
+    for (int i = 0; i < kDraws; ++i) {
+        const std::array<BotKind, 5> lineup = draw_random_lineup(rng);
+        for (const BotKind kind : lineup) ++anywhere[kind];
+        ++first_place[lineup[0]];
+    }
+    const double in_lineup = 5.0 / 13.0;
+    const double in_place = 1.0 / 13.0;
+    for (const BotKind kind : kRandomPoolKinds) {
+        SCOPED_TRACE(std::string(bot_kind_name(kind)));
+        EXPECT_NEAR(anywhere[kind] / static_cast<double>(kDraws), in_lineup, tolerance(in_lineup, kDraws));
+        EXPECT_NEAR(first_place[kind] / static_cast<double>(kDraws), in_place, tolerance(in_place, kDraws));
+    }
+}
+
 // --- GTO ---------------------------------------------------------------------
 
 TEST(Gto, SameHandOpensButtonAndFoldsUtg) {
@@ -1082,6 +1267,20 @@ TEST(Factory, MakesEachBotWithItsPublicName) {
     }
 }
 
+TEST(Factory, MakesEachPoolBotWithItsPublicName) {
+    const std::map<BotKind, std::string> names{{BotKind::Tag, "TAG"},         {BotKind::Lag, "LAG"},
+                                               {BotKind::Station, "Station"}, {BotKind::Maniac, "Maniac"},
+                                               {BotKind::Rock, "Rock"},       {BotKind::Trapper, "Trapper"},
+                                               {BotKind::Bully, "Bully"},     {BotKind::Tilter, "Tilter"}};
+    ASSERT_EQ(names.size(), kExtraBotKinds.size());
+    for (const auto& [kind, name] : names) {
+        const auto bot = make_bot(kind, 1, kFastRollouts);
+        EXPECT_EQ(bot->name(), name);
+        EXPECT_EQ(bot->hand_log_label(), kind == BotKind::Tilter ? "Tilt:Off" : name);
+    }
+    for (const BotKind kind : kRandomPoolKinds) EXPECT_EQ(bot_kind_name(kind), make_bot(kind, 1, kFastRollouts)->name());
+}
+
 // --- Texture, draws and pot math ---------------------------------------------
 
 std::vector<Card> cards(std::initializer_list<const char*> names) {
@@ -1368,7 +1567,8 @@ std::array<int, kMaxSeats> random_stacks(std::mt19937_64& rng) {
 }
 
 // Bots playing bots, with every action required to be accepted by the engine.
-void play_freezeouts(std::uint64_t seed, int games, int max_hands, int rollouts) {
+void play_freezeouts(std::uint64_t seed, int games, int max_hands, int rollouts,
+                     std::span<const BotKind> kinds = kAllBotKinds) {
     std::mt19937_64 rng(seed);
     long decisions = 0;
     for (int game = 0; game < games; ++game) {
@@ -1380,7 +1580,7 @@ void play_freezeouts(std::uint64_t seed, int games, int max_hands, int rollouts)
 
         std::array<std::unique_ptr<IBotStrategy>, kMaxSeats> bots;
         for (int seat = 0; seat < kMaxSeats; ++seat) {
-            const BotKind kind = kAllBotKinds[(static_cast<std::size_t>(game) + seat) % kAllBotKinds.size()];
+            const BotKind kind = kinds[(static_cast<std::size_t>(game) + static_cast<std::size_t>(seat)) % kinds.size()];
             bots[static_cast<std::size_t>(seat)] = make_bot(kind, rng(), rollouts);
         }
 
@@ -1406,12 +1606,14 @@ TEST(LegalityFuzz, BotsPlayFullFreezeouts) { play_freezeouts(1001, 60, 120, 40);
 
 TEST(LegalityFuzz, DefaultRolloutsPath) { play_freezeouts(1002, 1, 12, kDefaultRollouts); }
 
+TEST(LegalityFuzz, PoolBotsPlayFullFreezeouts) { play_freezeouts(1004, 60, 120, 40, kRandomPoolKinds); }
+
 // Random players steer the hand into shapes bots rarely reach on their own (minimum
 // raises, short all-ins, closed betting), and every bot is asked what it would do.
-TEST(LegalityFuzz, EveryBotIsLegalInRandomStates) {
-    std::mt19937_64 rng(1003);
+void every_bot_is_legal_in_random_states(std::uint64_t seed, std::span<const BotKind> kinds) {
+    std::mt19937_64 rng(seed);
     std::vector<std::unique_ptr<IBotStrategy>> bots;
-    for (const BotKind kind : kAllBotKinds) bots.push_back(make_bot(kind, rng(), 20));
+    for (const BotKind kind : kinds) bots.push_back(make_bot(kind, rng(), 20));
 
     bool saw_no_raise = false;
     bool saw_min_equals_max = false;
@@ -1459,6 +1661,12 @@ TEST(LegalityFuzz, EveryBotIsLegalInRandomStates) {
     EXPECT_TRUE(saw_min_equals_max);
     EXPECT_TRUE(saw_raise);
     EXPECT_TRUE(saw_bet);
+}
+
+TEST(LegalityFuzz, EveryBotIsLegalInRandomStates) { every_bot_is_legal_in_random_states(1003, kAllBotKinds); }
+
+TEST(LegalityFuzz, EveryPoolBotIsLegalInRandomStates) {
+    every_bot_is_legal_in_random_states(1005, kRandomPoolKinds);
 }
 
 // --- Golden: the classic bots decide exactly as before ------------------------
@@ -1617,6 +1825,81 @@ TEST(TableReport, DISABLED_ChipsPerHandByPersonality) {
         std::printf("%-8s bb/100 %8.1f   fold %5.1f%%   aggressive %5.1f%%\n", std::string(bot->name()).c_str(),
                     net[k] / hands[k] / 20.0 * 100.0, 100.0 * folds[k] / decisions[k],
                     100.0 * aggressive[k] / decisions[k]);
+    }
+}
+
+// Run by hand: how each pool personality plays at mixed tables, as a check that the
+// archetypes really differ. VPIP and PFR are shares of hands; aggression is postflop
+// bets and raises over calls. Not asserted: the profiles are judgement, not targets.
+TEST(TableReport, DISABLED_PoolStats) {
+    constexpr std::size_t kKinds = kRandomPoolKinds.size();
+    std::array<double, kKinds> net{};
+    std::array<long, kKinds> hands{};
+    std::array<long, kKinds> vpip{};
+    std::array<long, kKinds> pfr{};
+    std::array<long, kKinds> post_aggr{};
+    std::array<long, kKinds> post_calls{};
+    std::array<long, kKinds> post_folds{};
+    std::array<long, kKinds> post_decisions{};
+    std::mt19937_64 rng(556);
+    constexpr int kHandsPerTable = 300;
+    for (int table = 0; table < 60; ++table) {
+        const std::array<BotKind, 5> five = draw_random_lineup(rng);
+        std::array<BotKind, kMaxSeats> kinds{};
+        for (std::size_t i = 0; i < 5; ++i) kinds[i] = five[i];
+        kinds[5] = kRandomPoolKinds[rng() % kKinds];  // A sixth, possibly a repeat
+        std::array<std::size_t, kMaxSeats> index{};
+        std::array<std::unique_ptr<IBotStrategy>, kMaxSeats> bots;
+        for (std::size_t seat = 0; seat < kMaxSeats; ++seat) {
+            index[seat] = static_cast<std::size_t>(
+                std::find(kRandomPoolKinds.begin(), kRandomPoolKinds.end(), kinds[seat]) - kRandomPoolKinds.begin());
+            bots[seat] = make_bot(kinds[seat], rng(), 300);
+        }
+        GameConfig config;
+        config.seed = rng();
+        config.hero_seat = std::nullopt;
+        config.first_button = table % kMaxSeats;
+        GameEngine engine(config);
+        for (int hand = 0; hand < kHandsPerTable; ++hand) {
+            engine.new_game();  // A fresh 100bb table each hand, so every hand is comparable
+            engine.start_hand();
+            for (auto& bot : bots) bot->begin_hand(hand + 1);
+            std::array<bool, kMaxSeats> entered{};
+            std::array<bool, kMaxSeats> raised{};
+            while (engine.state().to_act) {
+                const int seat = *engine.state().to_act;
+                const std::size_t k = index[static_cast<std::size_t>(seat)];
+                const Street street = engine.state().street;
+                const Action action = bots[static_cast<std::size_t>(seat)]->decide(engine.player_view(seat));
+                if (street == Street::Preflop) {
+                    if (action.type == ActionType::Call || is_aggressive(action)) entered[static_cast<std::size_t>(seat)] = true;
+                    if (is_aggressive(action)) raised[static_cast<std::size_t>(seat)] = true;
+                } else {
+                    ++post_decisions[k];
+                    if (is_aggressive(action)) ++post_aggr[k];
+                    if (action.type == ActionType::Call) ++post_calls[k];
+                    if (action.type == ActionType::Fold) ++post_folds[k];
+                }
+                ASSERT_TRUE(engine.apply_action(action));
+            }
+            for (std::size_t seat = 0; seat < kMaxSeats; ++seat) {
+                const std::size_t k = index[seat];
+                net[k] += engine.state().seats[seat].stack - config.starting_stack;
+                ++hands[k];
+                if (entered[seat]) ++vpip[k];
+                if (raised[seat]) ++pfr[k];
+            }
+        }
+    }
+    std::printf("%-8s %7s %6s %6s %6s %7s %8s\n", "style", "hands", "VPIP", "PFR", "AF", "fold%", "bb/100");
+    for (std::size_t k = 0; k < kKinds; ++k) {
+        const double n = static_cast<double>(hands[k]);
+        std::printf("%-8s %7ld %5.1f%% %5.1f%% %6.2f %6.1f%% %8.1f\n",
+                    std::string(bot_kind_name(kRandomPoolKinds[k])).c_str(), hands[k], 100.0 * static_cast<double>(vpip[k]) / n,
+                    100.0 * static_cast<double>(pfr[k]) / n,
+                    static_cast<double>(post_aggr[k]) / std::max(1.0, static_cast<double>(post_calls[k])),
+                    100.0 * static_cast<double>(post_folds[k]) / std::max(1.0, static_cast<double>(post_decisions[k])),
+                    net[k] / n / 20.0 * 100.0);
     }
 }
 
