@@ -124,3 +124,39 @@ TEST_F(AppSettingsTest, ABadGameSetupGivesTheDefaultAndKeepsTheRest) {
         EXPECT_TRUE(settings.random_personalities) << text;
     }
 }
+
+TEST_F(AppSettingsTest, AnUpdateKeepsAGameSetupItCannotRead) {
+    // A setup that validate() rejects (or a newer version wrote) stays in the file when
+    // only the checkbox is saved, along with any other key.
+    const nlohmann::json unreadable = {{"mode", "tournament"}, {"preset", "superturbo"}, {"levels", {{1, 2, 0}}}};
+    std::ofstream(file(), std::ios::binary)
+        << nlohmann::json{{"random_personalities", false}, {"game_setup", unreadable}, {"other", 7}}.dump();
+
+    ASSERT_TRUE(update_app_settings(file(), AppSettingsUpdate{.random_personalities = true}));
+    std::ifstream in(file(), std::ios::binary);
+    const nlohmann::json saved = nlohmann::json::parse(in);
+    EXPECT_EQ(saved["random_personalities"], true);
+    EXPECT_EQ(saved["game_setup"], unreadable);
+    EXPECT_EQ(saved["other"], 7);
+    EXPECT_EQ(load_app_settings(file()).game_setup, default_freezeout());  // Still unreadable, so the default
+}
+
+TEST_F(AppSettingsTest, AnUpdateOfTheSetupKeepsTheCheckbox) {
+    ASSERT_TRUE(update_app_settings(file(), AppSettingsUpdate{.random_personalities = true}));
+    EXPECT_EQ(load_app_settings(file()).game_setup, default_freezeout());
+
+    ASSERT_TRUE(update_app_settings(file(), AppSettingsUpdate{.game_setup = default_tournament()}));
+    const AppSettings settings = load_app_settings(file());
+    EXPECT_TRUE(settings.random_personalities);
+    EXPECT_EQ(settings.game_setup, default_tournament());
+
+    ASSERT_TRUE(update_app_settings(file(), AppSettingsUpdate{}));  // Nothing given: nothing changes
+    EXPECT_EQ(load_app_settings(file()).game_setup, default_tournament());
+}
+
+TEST_F(AppSettingsTest, AnUpdateToAMissingFileWritesOnlyWhatIsGiven) {
+    ASSERT_TRUE(update_app_settings(file(), AppSettingsUpdate{.random_personalities = true}));
+    std::ifstream in(file(), std::ios::binary);
+    const nlohmann::json saved = nlohmann::json::parse(in);
+    EXPECT_EQ(saved, (nlohmann::json{{"random_personalities", true}}));
+}

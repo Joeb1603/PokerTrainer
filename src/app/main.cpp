@@ -12,9 +12,10 @@
 // on their own they never save anything. In a game, the settings change only when
 // the player changes one: the game on the New Game screen, or the checkbox.
 //
-// Developer checks, for running it unattended (each but --show-setup skips the New
-// Game screen unless --show-setup is given too):
-//   --show-setup            Open the New Game screen even with the flags below
+// Developer checks, for running it unattended. --skip-setup, --exit-after-frames,
+// --auto-shove, --stop-on and --screenshot skip the New Game screen, unless
+// --show-setup is given too; the others leave it at launch.
+//   --show-setup            Open the New Game screen even with the flags that skip it
 //   --exit-after-frames N   Quit after N frames
 //   --auto-shove            Hero moves all-in at every decision, with bots instant and
 //                           hands and sessions advancing by themselves
@@ -417,12 +418,9 @@ int run(const Arguments& arguments) {
         glfwSwapBuffers(window);
         ++frames;
     };
-    // Saves the fields given, keeping the file's other values.
+    // Saves the fields given, leaving the file's other values exactly as they are.
     const auto save_settings = [&](const std::optional<poker::GameSetup>& setup, std::optional<bool> random) {
-        poker::AppSettings changed = poker::load_app_settings(arguments.settings);
-        if (setup) changed.game_setup = *setup;
-        if (random) changed.random_personalities = *random;
-        if (!poker::save_app_settings(arguments.settings, changed)) {
+        if (!poker::update_app_settings(arguments.settings, poker::AppSettingsUpdate{random, setup})) {
             std::fprintf(stderr, "Could not save %s\n", arguments.settings.string().c_str());
         }
     };
@@ -478,6 +476,9 @@ int run(const Arguments& arguments) {
                     controller.tick(static_cast<double>(io.DeltaTime) * 1000.0);
                     if (arguments.auto_shove) auto_play(controller, arguments);
                 }
+                frame([&] { ui.draw(); });
+                // Right after the frame that made the change, so a Start or a click on
+                // the last frame (the window closing) is saved too.
                 const bool started = ui.setups_started() != last_started;
                 const bool random_changed = controller.random_personalities() != last_random;
                 if (started || random_changed) {
@@ -486,7 +487,6 @@ int run(const Arguments& arguments) {
                     // Start saves the whole screen; the checkbox alone, only itself.
                     save_settings(started ? std::optional(controller.game_setup()) : std::nullopt, last_random);
                 }
-                frame([&] { ui.draw(); });
             }
         }
     } catch (const std::exception& error) {

@@ -115,11 +115,11 @@ AppSettings load_app_settings(const std::filesystem::path& path) noexcept {
     return settings;
 }
 
-bool save_app_settings(const std::filesystem::path& path, const AppSettings& settings) noexcept {
+bool update_app_settings(const std::filesystem::path& path, const AppSettingsUpdate& update) noexcept {
     try {
         nlohmann::json value = read_object(path);
-        value[kRandomPersonalities] = settings.random_personalities;
-        value[kGameSetup] = setup_json(settings.game_setup);
+        if (update.random_personalities) value[kRandomPersonalities] = *update.random_personalities;
+        if (update.game_setup) value[kGameSetup] = setup_json(*update.game_setup);
 
         // Written beside the file and renamed over it, so a failed write never
         // leaves half a file behind.
@@ -141,6 +141,10 @@ bool save_app_settings(const std::filesystem::path& path, const AppSettings& set
     } catch (...) {
         return false;
     }
+}
+
+bool save_app_settings(const std::filesystem::path& path, const AppSettings& settings) noexcept {
+    return update_app_settings(path, AppSettingsUpdate{settings.random_personalities, settings.game_setup});
 }
 
 }  // namespace poker
