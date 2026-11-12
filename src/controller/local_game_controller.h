@@ -11,6 +11,7 @@
 
 #include "advisor/training_advisor.h"
 #include "bots/bot_strategy.h"
+#include "bots/bots.h"
 #include "controller/game_controller.h"
 #include "controller/solver_service.h"
 #include "engine/game_engine.h"
@@ -39,12 +40,17 @@ struct ControllerOptions {
     std::optional<SolverTier> solver_tier_override;
     // Replaces detect_hardware(), for tests.
     std::optional<HardwareInfo> hardware_override;
+
+    // Five distinct styles from the 13-kind pool, with random names and places, drawn
+    // from a stream of their own. Off: the classic lineup, exactly as before.
+    bool random_personalities = false;
 };
 
 // Runs a local freezeout: Hero in seat 0 against Nit, Loose, GTO, WildGTO and Shifter
-// in seats 1 to 5. Bots act on the caller's thread, which is fine at about 2 ms a
-// decision. Each hand is logged as it ends; a session summary is written when the
-// freezeout ends, on new_session() and on destruction.
+// in seats 1 to 5, or, with random personalities, five bots drawn from the wider pool.
+// Bots act on the caller's thread, which is fine at about 2 ms a decision. Each hand is
+// logged as it ends; a session summary is written when the freezeout ends, on
+// new_session() and on destruction.
 class LocalGameController final : public IGameController {
 public:
     explicit LocalGameController(const ControllerOptions& options);
@@ -69,8 +75,12 @@ public:
     bool solver_enabled() const override { return solver_enabled_; }
     void set_solver_budget_ms(int budget_ms) override { solver_budget_ms_ = std::max(1, budget_ms); }
     int solver_budget_ms() const override { return solver_budget_ms_; }
+    void set_random_personalities(bool enabled) override;
+    bool random_personalities() const override { return random_pending_; }
 
 private:
+    // Builds the five bots: the classic lineup, or a random one from lineup_rng_.
+    void build_bots(bool random);
     void open_session();
     void begin_hand();
     void play_one_bot_action();
@@ -91,6 +101,10 @@ private:
     TrainingAdvisor advisor_;
     std::array<std::unique_ptr<IBotStrategy>, kMaxSeats> bots_;  // Seat 0 is Hero
     std::array<std::string, kMaxSeats> public_names_;
+    std::array<BotKind, kMaxSeats> kinds_{};  // Seat 0 unused
+    std::mt19937_64 lineup_rng_;
+    bool random_pending_ = false;  // The option as set; applies at the next session
+    bool random_active_ = false;   // This session's bots were drawn at random
     std::array<int, kMaxSeats> starting_stacks_{};
 
     std::optional<HandLogger> hand_logger_;

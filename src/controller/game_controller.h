@@ -57,6 +57,10 @@ struct SessionStats {
     std::optional<std::string> winner;
     int mistakes = 0;
     double ev_lost = 0.0;
+    // Random personalities only, and only once the freezeout is over: each bot's name
+    // and the style it played, e.g. "Marta: LAG". The Shifter is shown as "Shifter",
+    // never the profile it played in any one hand. Empty otherwise.
+    std::vector<std::string> lineup;
 };
 
 // Solver mode, as the front end shows it. The advice is for Hero's own cards only,
@@ -95,6 +99,11 @@ struct TableSnapshot {
     bool can_fold_early = false;           // A bot is to act and Hero could still fold
     bool early_fold_armed = false;
     bool bots_revealed = false;
+
+    // The random-personalities option as set (it applies from the next session), and
+    // whether the current session's bots were drawn at random.
+    bool random_personalities = false;
+    bool random_lineup_active = false;
 
     std::vector<std::string> action_log;       // This hand, oldest first
     std::vector<HeroMistake> hand_mistakes;    // Noted so far in this hand
@@ -156,6 +165,12 @@ public:
     // The time budget of each solve, from the next decision on.
     virtual void set_solver_budget_ms(int budget_ms) = 0;
     virtual int solver_budget_ms() const = 0;
+
+    // Random personalities: from the next new_session(), the five bots get styles drawn
+    // from a wider pool, random names and random places. The table shows only names;
+    // the styles appear in the hand log and in session.lineup once the session is over.
+    virtual void set_random_personalities(bool enabled) = 0;
+    virtual bool random_personalities() const = 0;
 };
 
 }  // namespace poker

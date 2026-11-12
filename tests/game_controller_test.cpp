@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <optional>
 #include <set>
@@ -14,6 +15,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "bots/bots.h"
+#include "controller/bot_names.h"
 #include "controller/local_game_controller.h"
 
 using namespace poker;
@@ -1215,4 +1218,216 @@ TEST_F(Controller, SolverIsCancelledWhenHeroActs) {
     EXPECT_EQ(c.solver_budget_ms(), 3000);
     c.set_solver_enabled(false);
     EXPECT_FALSE(c.solver_enabled());
+}
+
+// --- Random personalities -----------------------------------------------------
+
+namespace {
+
+std::vector<std::string> style_names() {
+    std::vector<std::string> styles;
+    for (const BotKind kind : kRandomPoolKinds) styles.emplace_back(bot_kind_name(kind));
+    return styles;
+}
+
+bool is_pool_name(const std::string& name) {
+    for (const std::string_view candidate : bot_name_pool()) {
+        if (candidate == name) return true;
+    }
+    return false;
+}
+
+// No style, and no Shift: or Tilt: label, anywhere the table shows text.
+void expect_no_styles(const TableSnapshot& s) {
+    std::vector<std::string> texts;
+    for (const SeatSnapshot& seat : s.seats) texts.push_back(seat.name);
+    for (const std::string& line : s.action_log) texts.push_back(line);
+    for (const PayoutLine& line : s.payouts) texts.push_back(line.name);
+    if (s.waiting_on) texts.push_back(*s.waiting_on);
+    if (s.refund_text) texts.push_back(*s.refund_text);
+    if (s.session.winner) texts.push_back(*s.session.winner);
+    std::vector<std::string> hidden = style_names();
+    hidden.emplace_back("Shift:");
+    hidden.emplace_back("Tilt:");
+    for (const std::string& text : texts) {
+        for (const std::string& style : hidden) EXPECT_EQ(text.find(style), std::string::npos) << text;
+    }
+}
+
+Action shove(const TableSnapshot& s) {
+    if (s.legal.allows(ActionType::AllIn)) return {ActionType::AllIn, 0};
+    return passive(s.legal);
+}
+
+// The style part of a "Name:Style" label.
+std::string style_of(const std::string& label) { return label.substr(label.find(':') + 1); }
+
+}  // namespace
+
+TEST_F(Controller, RandomLineupKeepsHeroAndDrawsFiveDistinctNamesAndStyles) {
+    ControllerOptions o = options(5);
+    o.random_personalities = true;
+    std::array<std::string, kMaxSeats> names;
+    {
+        LocalGameController c(o);
+        const TableSnapshot& s = c.snapshot();
+        EXPECT_TRUE(s.random_personalities);
+        EXPECT_TRUE(s.random_lineup_active);
+        EXPECT_EQ(s.seats[kHeroSeat].name, "Hero");
+        std::set<std::string> distinct;
+        names[kHeroSeat] = "Hero";
+        for (int seat = 1; seat < kMaxSeats; ++seat) {
+            names[static_cast<std::size_t>(seat)] = s.seats[static_cast<std::size_t>(seat)].name;
+            EXPECT_TRUE(is_pool_name(s.seats[static_cast<std::size_t>(seat)].name));
+            distinct.insert(s.seats[static_cast<std::size_t>(seat)].name);
+        }
+        EXPECT_EQ(distinct.size(), 5u);
+        EXPECT_TRUE(s.session.lineup.empty());  // Not before the session is over
+
+        // The same seed draws the same table.
+        LocalGameController again(o);
+        for (int seat = 0; seat < kMaxSeats; ++seat) {
+            EXPECT_EQ(again.snapshot().seats[static_cast<std::size_t>(seat)].name, names[static_cast<std::size_t>(seat)]);
+        }
+    }
+    // The summaries name each bot with its style, five distinct styles.
+    const auto lines = read_json_lines(sessions());
+    ASSERT_EQ(lines.size(), 2u);
+    std::set<std::string> styles;
+    for (const json& seat : lines[0]["seats"]) {
+        const std::string label = seat["p"];
+        const int index = seat["s"];
+        if (index == kHeroSeat) {
+            EXPECT_EQ(label, "Hero");
+            continue;
+        }
+        EXPECT_EQ(label.rfind(names[static_cast<std::size_t>(index)] + ":", 0), 0u) << label;
+        const std::vector<std::string> all = style_names();
+        EXPECT_NE(std::find(all.begin(), all.end(), style_of(label)), all.end()) << label;
+        styles.insert(style_of(label));
+    }
+    EXPECT_EQ(styles.size(), 5u);
+    EXPECT_EQ(lines[0]["seats"], lines[1]["seats"]);
+}
+
+TEST_F(Controller, RandomLineupsCoverEveryStyleInEveryPlace) {
+    ControllerOptions o = options(6);
+    o.random_personalities = true;
+    {
+        LocalGameController c(o);
+        for (int session = 0; session < 80; ++session) c.new_session();
+    }
+    std::map<std::string, std::set<int>> places;
+    std::set<std::string> lineups;
+    for (const json& line : read_json_lines(sessions())) {
+        std::string lineup;
+        for (const json& seat : line["seats"]) {
+            if (seat["s"] == kHeroSeat) continue;
+            places[style_of(seat["p"])].insert(seat["s"].get<int>());
+            lineup += seat["p"].get<std::string>() + " ";
+        }
+        lineups.insert(lineup);
+    }
+    EXPECT_EQ(places.size(), kRandomPoolKinds.size());
+    for (const auto& [style, seats] : places) EXPECT_EQ(seats.size(), 5u) << style;
+    EXPECT_GT(lineups.size(), 70u);  // Sessions really draw new tables
+}
+
+TEST_F(Controller, RandomStylesStayHiddenUntilTheSessionEndsAndAreLogged) {
+    ControllerOptions o = options(8);
+    o.random_personalities = true;
+    int finished_sessions = 0;
+    {
+        LocalGameController c(o);
+        for (int hand = 0; hand < 400 && finished_sessions < 3; ++hand) {
+            c.tick(0.0);
+            for (int guard = 0; guard < 500; ++guard) {
+                const TableSnapshot& s = c.snapshot();
+                expect_no_styles(s);
+                if (s.phase == ControllerPhase::HandComplete || s.phase == ControllerPhase::SessionOver) break;
+                EXPECT_TRUE(s.session.lineup.empty());
+                if (s.phase == ControllerPhase::HeroToAct) {
+                    ASSERT_TRUE(c.submit_hero_action(shove(s)));
+                }
+                c.tick(0.0);
+            }
+            const TableSnapshot& s = c.snapshot();
+            if (s.phase == ControllerPhase::SessionOver) {
+                ++finished_sessions;
+                ASSERT_EQ(s.session.lineup.size(), 5u);
+                for (int seat = 1; seat < kMaxSeats; ++seat) {
+                    const std::string& entry = s.session.lineup[static_cast<std::size_t>(seat - 1)];
+                    EXPECT_EQ(entry.rfind(s.seats[static_cast<std::size_t>(seat)].name + ": ", 0), 0u) << entry;
+                    EXPECT_EQ(entry.find("Shift:"), std::string::npos);
+                    EXPECT_EQ(entry.find("Tilt:"), std::string::npos);
+                }
+                c.new_session();
+                EXPECT_TRUE(c.snapshot().session.lineup.empty());
+            } else {
+                EXPECT_TRUE(s.session.lineup.empty());
+                ASSERT_TRUE(c.next_hand());
+            }
+        }
+    }
+    EXPECT_GT(finished_sessions, 0);
+
+    // Every bot's hand-log label is its name and the style it played that hand.
+    const std::vector<std::string> styles = style_names();
+    const auto valid_style = [&](const std::string& style) {
+        if (style.rfind("Shift:", 0) == 0) {
+            const std::string sub = style.substr(6);
+            return sub == "Nit" || sub == "Loose" || sub == "GTO" || sub == "WildGTO";
+        }
+        if (style == "Tilt:On" || style == "Tilt:Off") return true;
+        return std::find(styles.begin(), styles.end(), style) != styles.end() && style != "Shifter" && style != "Tilter";
+    };
+    int checked = 0;
+    for (const json& line : read_json_lines(hands())) {
+        for (const json& seat : line["seats"]) {
+            const std::string label = seat["p"];
+            if (seat["s"] == kHeroSeat) {
+                EXPECT_EQ(label, "Hero");
+                continue;
+            }
+            const std::size_t colon = label.find(':');
+            ASSERT_NE(colon, std::string::npos) << label;
+            EXPECT_TRUE(is_pool_name(label.substr(0, colon))) << label;
+            EXPECT_TRUE(valid_style(label.substr(colon + 1))) << label;
+            ++checked;
+        }
+    }
+    EXPECT_GT(checked, 0);
+}
+
+TEST_F(Controller, TheOptionWaitsForTheNextSessionAndTurningItOffRestoresTheClassicTable) {
+    LocalGameController c(options());
+    const std::array<std::string, kMaxSeats> classic{"Hero", "Nit", "Loose", "GTO", "WildGTO", "Shifter"};
+    const auto names = [&] {
+        std::array<std::string, kMaxSeats> out;
+        for (int seat = 0; seat < kMaxSeats; ++seat) {
+            out[static_cast<std::size_t>(seat)] = c.snapshot().seats[static_cast<std::size_t>(seat)].name;
+        }
+        return out;
+    };
+    EXPECT_EQ(names(), classic);
+    EXPECT_FALSE(c.random_personalities());
+
+    c.set_random_personalities(true);
+    EXPECT_TRUE(c.random_personalities());
+    EXPECT_TRUE(c.snapshot().random_personalities);
+    EXPECT_FALSE(c.snapshot().random_lineup_active);
+    EXPECT_EQ(names(), classic);  // Not until the next session
+
+    c.new_session();
+    EXPECT_TRUE(c.snapshot().random_lineup_active);
+    for (int seat = 1; seat < kMaxSeats; ++seat) EXPECT_TRUE(is_pool_name(names()[static_cast<std::size_t>(seat)]));
+
+    c.set_random_personalities(false);
+    EXPECT_TRUE(c.snapshot().random_lineup_active);  // Still this session's table
+    c.new_session();
+    EXPECT_FALSE(c.snapshot().random_lineup_active);
+    EXPECT_EQ(names(), classic);
+
+    c.new_session();  // Off to off keeps the classic bots
+    EXPECT_EQ(names(), classic);
 }

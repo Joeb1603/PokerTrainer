@@ -7,11 +7,15 @@
 
 #include "bots/bots.h"
 #include "bots/gto_heuristic_engine.h"
+#include "controller/bot_names.h"
 
 namespace poker {
 namespace {
 
 constexpr std::size_t at(int index) { return static_cast<std::size_t>(index); }
+
+// The random lineup's own stream, apart from the engine, advisor and bot seeds.
+constexpr std::uint64_t kLineupStream = 0x6A09E667F3BCC908ULL;
 
 // Marks a showdown payout as a split, and notes the kicker when it beat a hand with the
 // same name, using the pots the seat won and the five cards each shown hand plays.
@@ -112,6 +116,8 @@ LocalGameController::LocalGameController(const ControllerOptions& options)
     : options_(options),
       engine_(make_config(options)),
       advisor_(options.seed ^ 0xA5A5A5A5A5A5A5A5ull, options.advisor_rollouts),
+      lineup_rng_(options.seed ^ kLineupStream),
+      random_pending_(options.random_personalities),
       bot_delay_ms_(options.bot_delay_ms),
       instant_play_(options.instant_play),
       hardware_(options.hardware_override ? *options.hardware_override : detect_hardware()),
@@ -124,11 +130,7 @@ LocalGameController::LocalGameController(const ControllerOptions& options)
     if (options.solver_tier_override) {
         solver_panel_.hardware_summary += " (tier set to " + std::string(to_string(solver_tier_)) + ")";
     }
-    public_names_[kHeroSeat] = "Hero";
-    for (int seat = 1; seat < kMaxSeats; ++seat) {
-        bots_[at(seat)] = make_bot(kAllBotKinds[at(seat - 1)], options.seed + 1000 + static_cast<std::uint64_t>(seat), options.bot_rollouts);
-        public_names_[at(seat)] = std::string(bots_[at(seat)]->name());
-    }
+    build_bots(random_pending_);
     for (int seat = 0; seat < kMaxSeats; ++seat) starting_stacks_[at(seat)] = engine_.state().seats[at(seat)].stack;
 
     try {
@@ -141,6 +143,34 @@ LocalGameController::LocalGameController(const ControllerOptions& options)
 }
 
 LocalGameController::~LocalGameController() { write_session_summary(); }
+
+void LocalGameController::build_bots(bool random) {
+    public_names_[kHeroSeat] = "Hero";
+    random_active_ = random;
+    if (!random) {
+        // The classic lineup, seeded exactly as it always was.
+        for (int seat = 1; seat < kMaxSeats; ++seat) {
+            kinds_[at(seat)] = kAllBotKinds[at(seat - 1)];
+            bots_[at(seat)] = make_bot(kinds_[at(seat)], options_.seed + 1000 + static_cast<std::uint64_t>(seat),
+                                       options_.bot_rollouts);
+            public_names_[at(seat)] = std::string(bots_[at(seat)]->name());
+        }
+        return;
+    }
+    // The draw order is the seat order, so the places are random too.
+    const std::array<BotKind, 5> lineup = draw_random_lineup(lineup_rng_);
+    const std::array<std::string, 5> names = draw_bot_names(lineup_rng_);
+    for (int seat = 1; seat < kMaxSeats; ++seat) {
+        kinds_[at(seat)] = lineup[at(seat - 1)];
+        bots_[at(seat)] = make_bot(kinds_[at(seat)], lineup_rng_(), options_.bot_rollouts);
+        public_names_[at(seat)] = names[at(seat - 1)];
+    }
+}
+
+void LocalGameController::set_random_personalities(bool enabled) {
+    random_pending_ = enabled;
+    rebuild_snapshot();
+}
 
 void LocalGameController::note_log_failure(const std::exception& error) noexcept {
     try {
@@ -163,8 +193,11 @@ void LocalGameController::open_session() {
 }
 
 void LocalGameController::new_session() {
-    write_session_summary();
+    write_session_summary();  // Under the old names, before any new lineup
     if (hand_logger_) hand_logger_->discard_pending_mistakes();
+    // The classic bots carry their state into the next session, as they always have;
+    // a random lineup is drawn afresh, and leaving one rebuilds the classic bots.
+    if (random_pending_ || random_active_) build_bots(random_pending_);
     engine_.new_game();
     open_session();
     begin_hand();
@@ -317,8 +350,16 @@ HandLogContext LocalGameController::log_context(bool per_hand_labels) const {
     context.big_blind = options_.big_blind;
     context.hero_seat = kHeroSeat;
     context.seat_labels = public_names_;
-    if (per_hand_labels) {
-        for (int seat = 1; seat < kMaxSeats; ++seat) context.seat_labels[at(seat)] = bots_[at(seat)]->hand_log_label();
+    for (int seat = 1; seat < kMaxSeats; ++seat) {
+        // A random lineup logs "Name:Style", e.g. "Marta:LAG" or "Marta:Shift:Nit"; the
+        // session summary gives the public style, e.g. "Marta:Shifter".
+        std::string& label = context.seat_labels[at(seat)];
+        if (per_hand_labels) {
+            const std::string style = bots_[at(seat)]->hand_log_label();
+            label = random_active_ ? public_names_[at(seat)] + ":" + style : style;
+        } else if (random_active_) {
+            label = public_names_[at(seat)] + ":" + std::string(bot_kind_name(kinds_[at(seat)]));
+        }
     }
     return context;
 }
@@ -500,6 +541,13 @@ void LocalGameController::rebuild_snapshot() {
     if (!hand_handled_) {
         for (const HeroMistake& mistake : hand_mistakes_) next.session.ev_lost += mistake.ev_loss;
     }
+    if (random_active_ && next.phase == ControllerPhase::SessionOver) {
+        for (int seat = 1; seat < kMaxSeats; ++seat) {
+            next.session.lineup.push_back(public_names_[at(seat)] + ": " + std::string(bot_kind_name(kinds_[at(seat)])));
+        }
+    }
+    next.random_personalities = random_pending_;
+    next.random_lineup_active = random_active_;
 
     snapshot_ = std::move(next);
 }

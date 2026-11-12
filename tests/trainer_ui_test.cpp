@@ -92,9 +92,15 @@ public:
     bool solver_enabled() const override { return solver_on; }
     void set_solver_budget_ms(int budget_ms) override { solver_budget = budget_ms; }
     int solver_budget_ms() const override { return solver_budget; }
+    void set_random_personalities(bool enabled) override {
+        random_requests.push_back(enabled);
+        table.random_personalities = enabled;
+    }
+    bool random_personalities() const override { return table.random_personalities; }
 
     bool solver_on = false;
     int solver_budget = 8000;
+    std::vector<bool> random_requests;
 };
 
 class UiTest : public ::testing::Test {

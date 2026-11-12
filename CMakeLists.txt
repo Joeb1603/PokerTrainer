@@ -66,6 +66,7 @@ add_library(poker_core STATIC
     src/bots/gto_heuristic_engine.cpp
     src/core/card.cpp
     src/core/deck.cpp
+    src/controller/bot_names.cpp
     src/controller/local_game_controller.cpp
     src/controller/solver_service.cpp
     src/core/hand_evaluator.cpp
