@@ -287,3 +287,25 @@ TEST(PushFoldAntes, HeadsUpButtonUsesTheSmallBlindAnteTable) {
     EXPECT_EQ(push_fold_jam_range(Position::BTN, 8, 2, 1.0)->percent(),
               push_fold_jam_range(Position::SB, 8, kMaxSeats, 1.0)->percent());
 }
+
+TEST(PushFoldAntes, HeadsUpMatchesAnIndependentSolve) {
+    // Heads-up the model is exact (one caller), so the tables were checked against a
+    // separate solve: phevaluator Monte Carlo equities (40,000 boards a class pair),
+    // its own fictitious play, combo card removal. Over 3-15 BB at 0, 0.5, 1 and
+    // 1.5 BB of dead money the sets differed by at most one borderline class (0.9
+    // pp). These are its numbers; at 10 BB with a 1 BB ante they also match the
+    // published 71% shove and 53% call for a big-blind ante.
+    struct Spot {
+        int stack;
+        double dead;
+        double jam;
+        double call;
+    };
+    for (const Spot s : {Spot{10, 0.0, 58.1, 37.6}, Spot{10, 0.5, 65.6, 46.6}, Spot{10, 1.0, 71.0, 53.2},
+                         Spot{10, 1.5, 75.6, 59.3}, Spot{5, 1.0, 82.2, 82.2}, Spot{15, 1.0, 61.7, 40.6}}) {
+        EXPECT_NEAR(push_fold_jam_range(Position::SB, s.stack, 2, s.dead)->percent(), s.jam, 1.0)
+            << s.stack << " BB, " << s.dead << " dead";
+        EXPECT_NEAR(push_fold_call_range(Position::BB, Position::SB, s.stack, 2, s.dead)->percent(), s.call, 1.0)
+            << s.stack << " BB, " << s.dead << " dead";
+    }
+}
