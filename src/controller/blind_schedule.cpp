@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace poker {
@@ -18,9 +19,11 @@ int tidy_step(double amount) {
     return static_cast<int>(power / 4.0);
 }
 
-int next_tidy_above(int amount) { return amount + tidy_step(amount); }
-
-constexpr int kMaxLevelBigBlind = 100'000'000;
+// Saturates rather than overflow; validate() refuses anything above kMaxLevelBigBlind.
+int next_tidy_above(int amount) {
+    const long long next = static_cast<long long>(amount) + tidy_step(amount);
+    return static_cast<int>(std::min<long long>(next, std::numeric_limits<int>::max()));
+}
 
 }  // namespace
 
@@ -181,6 +184,7 @@ std::optional<std::string> validate(const GameSetup& setup) {
     }
     const std::vector<BlindLevel> levels = setup.schedule();
     if (levels.empty()) return "The tournament needs at least one level.";
+    if (levels.front().big_blind != setup.big_blind) return "Level 1's big blind must equal the big blind.";
     if (static_cast<long long>(setup.starting_bb) * std::max(0, levels.front().big_blind) > kMaxStartingChips) {
         return "Starting stacks above " + std::to_string(kMaxStartingChips) + " chips are not supported.";
     }

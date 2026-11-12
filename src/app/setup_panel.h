@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <string>
 
@@ -33,7 +34,12 @@ public:
     // Why Start is unavailable, or empty.
     const std::string& problem() const { return problem_; }
 
-    // Where named controls were drawn last frame, in display pixels (for tests).
+    // Where named controls were drawn last frame, in display pixels, for tests. Kept
+    // only while recording is on, so the app builds no names each frame.
+    void set_record_rects(bool on) {
+        record_rects_ = on;
+        if (!on) rects_.clear();
+    }
     struct Rect {
         float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
         float cx() const { return (x0 + x1) * 0.5f; }
@@ -47,7 +53,8 @@ private:
     void draw_levels(float scale);
     void rebuild_levels();  // From the preset, the big blind and the antes
     GameSetup normalized() const;  // The draft with levels cleared when they are the preset's
-    void note(const std::string& name);
+    void note(const char* name);                        // The last item's rect, while recording
+    void note_level(std::size_t index, const char* what);  // The same for "Level <index + 1> <what>"
 
     bool open_ = false;
     bool popup_opened_ = false;
@@ -56,6 +63,7 @@ private:
     GameSetup draft_;
     float factor_ = 1.5f;
     std::string problem_;
+    bool record_rects_ = false;
     std::map<std::string, Rect> rects_;
 };
 

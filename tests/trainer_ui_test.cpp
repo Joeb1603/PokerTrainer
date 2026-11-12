@@ -135,6 +135,7 @@ protected:
         set_facing_raise();
 
         ui_.emplace(fake_, UiFonts{font, font}, 1.0f);
+        ui_->setup_panel().set_record_rects(true);  // For click_setup
     }
 
     void TearDown() override { ImGui::DestroyContext(context_); }
@@ -997,6 +998,44 @@ TEST_F(UiTest, NewGameScreenKeepsTheBigBlindAndLevelOneTogether) {
     click_setup("Level 1 remove");
     EXPECT_EQ(ui_->setup_panel().setup().big_blind, ui_->setup_panel().setup().levels.front().big_blind);
     EXPECT_EQ(ui_->setup_panel().setup().big_blind, 150);
+}
+
+TEST_F(UiTest, NewGameScreenHoldsLevelsBelowTheCap) {
+    click(kNewSession);
+    click_setup("Tournament");
+    // Two levels, so every row is on screen.
+    while (ui_->setup_panel().setup().levels.size() > 2) click_setup("Level 2 remove");
+    const std::size_t count = ui_->setup_panel().setup().levels.size();
+    const std::string last = "Level 2 BB";
+
+    // Typed past the cap (and past what an int holds): held at the cap, where no
+    // level can be added above it.
+    type_into_setup(last, "2000000000");
+    EXPECT_EQ(ui_->setup_panel().setup().levels.back().big_blind, kMaxLevelBigBlind);
+    click_setup("Add level");
+    EXPECT_EQ(ui_->setup_panel().setup().levels.size(), count);
+
+    // Just below it, one more level fits, at the cap.
+    type_into_setup(last, std::to_string(kMaxLevelBigBlind - 1));
+    click_setup("Add level");
+    ASSERT_EQ(ui_->setup_panel().setup().levels.size(), count + 1);
+    EXPECT_EQ(ui_->setup_panel().setup().levels.back().big_blind, kMaxLevelBigBlind);
+    click_setup("Add level");
+    EXPECT_EQ(ui_->setup_panel().setup().levels.size(), count + 1);
+
+    type_into_setup("Level 1 ante", "-5");
+    EXPECT_EQ(ui_->setup_panel().setup().levels.front().ante, 0);
+}
+
+TEST_F(UiTest, NewGameScreenRecordsPositionsOnlyWhenAsked) {
+    ui_->setup_panel().set_record_rects(false);
+    click(kNewSession);
+    frame();
+    frame();
+    EXPECT_TRUE(ui_->setup_panel().rects().empty());
+    ui_->setup_panel().set_record_rects(true);
+    frame();
+    EXPECT_TRUE(ui_->setup_panel().rects().contains("Start"));
 }
 
 TEST_F(UiTest, NewGameScreenRefusesAnInvalidSetup) {

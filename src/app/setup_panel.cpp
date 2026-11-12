@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <string>
 
 #include <imgui.h>
 
@@ -57,10 +58,16 @@ void SetupPanel::open(const GameSetup& setup, bool random_personalities, bool ca
     problem_.clear();
 }
 
-void SetupPanel::note(const std::string& name) {
+void SetupPanel::note(const char* name) {
+    if (!record_rects_) return;
     const ImVec2 min = ImGui::GetItemRectMin();
     const ImVec2 max = ImGui::GetItemRectMax();
     rects_[name] = Rect{min.x, min.y, max.x, max.y};
+}
+
+void SetupPanel::note_level(std::size_t index, const char* what) {
+    if (!record_rects_) return;
+    note(("Level " + std::to_string(index + 1) + " " + what).c_str());
 }
 
 GameSetup SetupPanel::normalized() const {
@@ -295,24 +302,32 @@ void SetupPanel::draw_levels(float scale) {
             ImGui::AlignTextToFramePadding();
             ImGui::Text("%zu", i + 1);
             ImGui::TableNextColumn();
+            // Each field is held to 0..kMaxLevelBigBlind, so no arithmetic on it can
+            // overflow; validate() names anything still out of range.
             ImGui::SetNextItemWidth(-1.0f);
-            ImGui::InputInt("##sb", &level.small_blind, 0, 0);
+            if (ImGui::InputInt("##sb", &level.small_blind, 0, 0)) {
+                level.small_blind = std::clamp(level.small_blind, 0, kMaxLevelBigBlind);
+            }
+            note_level(i, "SB");
             ImGui::TableNextColumn();
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::InputInt("##bb", &level.big_blind, 0, 0) && i == 0) draft_.big_blind = level.big_blind;
-            note("Level " + std::to_string(i + 1) + " BB");
+            if (ImGui::InputInt("##bb", &level.big_blind, 0, 0)) {
+                level.big_blind = std::clamp(level.big_blind, 0, kMaxLevelBigBlind);
+                if (i == 0) draft_.big_blind = level.big_blind;
+            }
+            note_level(i, "BB");
             ImGui::TableNextColumn();
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::InputInt("##ante", &level.ante, 0, 0)) {
-                level.ante = std::max(0, level.ante);
+                level.ante = std::clamp(level.ante, 0, kMaxLevelBigBlind);
                 level.ante_type = level.ante > 0 ? draft_.ante_type : AnteType::None;
             }
-            note("Level " + std::to_string(i + 1) + " ante");
+            note_level(i, "ante");
             ImGui::TableNextColumn();
             ImGui::BeginDisabled(levels.size() <= 1);
             if (ImGui::Button("x")) remove = i;
             ImGui::EndDisabled();
-            note("Level " + std::to_string(i + 1) + " remove");
+            note_level(i, "remove");
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -322,12 +337,14 @@ void SetupPanel::draw_levels(float scale) {
         draft_.big_blind = levels.front().big_blind;  // Level 1 and the big blind stay one value
     }
 
-    ImGui::BeginDisabled(static_cast<int>(levels.size()) >= kMaxLevels);
+    // A level can be added only below the largest big blind allowed; the step is
+    // worked out in doubles, which no big blind can overflow.
+    const int last = levels.empty() ? draft_.big_blind : levels.back().big_blind;
+    ImGui::BeginDisabled(static_cast<int>(levels.size()) >= kMaxLevels || last >= kMaxLevelBigBlind);
     if (ImGui::Button("Add level")) {
-        const int last = levels.empty() ? draft_.big_blind : levels.back().big_blind;
         int bb = tidy_chips(last * 1.25);
-        if (bb <= last) bb = tidy_chips(last + std::max(1, last / 4) + 1);
-        if (bb <= last) bb = last + 1;
+        if (bb <= last) bb = tidy_chips(last + std::max(1.0, last / 4.0) + 1.0);
+        if (bb <= last) bb = last + 1;  // last < kMaxLevelBigBlind here
         // The new level's ante follows the rule; edited antes above it stay as they are.
         const int index = static_cast<int>(levels.size()) + 1;
         const std::vector<BlindLevel> one = with_antes({BlindLevel{small_blind_for(bb), bb, 0, AnteType::None}},

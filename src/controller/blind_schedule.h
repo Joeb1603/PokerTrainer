@@ -39,6 +39,7 @@ inline constexpr int kMaxLevelHands = 100;
 inline constexpr int kMaxLevelMinutes = 60;
 inline constexpr int kMaxLevels = 40;
 inline constexpr int kMaxAnteBigBlinds = 2;  // An ante above twice the big blind is refused
+inline constexpr int kMaxLevelBigBlind = 100'000'000;  // Any level's big blind; tidy_chips never goes above it
 inline constexpr long long kMaxStartingChips = 100'000'000;  // Six stacks stay well inside an int
 
 struct GameSetup {
@@ -52,7 +53,8 @@ struct GameSetup {
     BlindPreset preset = BlindPreset::Standard;
     AnteType ante_type = AnteType::BigBlind;
     int ante_from_level = 4;          // 1-based; the presets' antes start here
-    std::vector<BlindLevel> levels;   // Editable; empty means "the preset as is"
+    std::vector<BlindLevel> levels;   // Editable; empty means "the preset as is". Level 1's
+                                      // big blind must equal big_blind (validate checks)
 
     int starting_stack() const { return starting_bb * first_level().big_blind; }
     BlindLevel first_level() const;

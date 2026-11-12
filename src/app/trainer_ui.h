@@ -44,6 +44,7 @@ public:
     // Counts presses of Start on the New Game screen, so the app can save the choice.
     int setups_started() const { return setups_started_; }
     const SetupPanel& setup_panel() const { return setup_panel_; }
+    SetupPanel& setup_panel() { return setup_panel_; }  // For tests (SetupPanel::set_record_rects)
 
 private:
     void draw_table(float x, float y, float w, float h);

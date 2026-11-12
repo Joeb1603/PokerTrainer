@@ -116,6 +116,10 @@ TEST_F(AppSettingsTest, ABadGameSetupGivesTheDefaultAndKeepsTheRest) {
             "levels": [[10, 20, 0], [5, 10, 0]]}})",
         R"({"random_personalities": true, "game_setup": {"mode": "tournament", "big_blind": 20.5, "starting_bb": 100,
             "unit": "hands", "level_length": 10, "preset": "standard", "ante": "bb", "ante_from_level": 4}})",
+        // Level 1 disagrees with the big blind.
+        R"({"random_personalities": true, "game_setup": {"mode": "tournament", "big_blind": 20, "starting_bb": 100,
+            "unit": "hands", "level_length": 10, "preset": "standard", "ante": "bb", "ante_from_level": 4,
+            "levels": [[25, 50, 0], [50, 100, 0]]}})",
     };
     for (const char* text : bad) {
         write(text);

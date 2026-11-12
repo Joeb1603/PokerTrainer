@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <vector>
 
 #include "controller/blind_schedule.h"
@@ -175,12 +176,55 @@ TEST(BlindSchedule, ValidationNamesTheProblem) {
 }
 
 TEST(BlindSchedule, StartingStacksThatCouldOverflowAreRefused) {
+    // Level 1 must equal the big blind, which is at most kMaxBigBlind, so the largest
+    // stack is kMaxStartingBb * kMaxBigBlind; a huge level 1 is refused before that.
+    static_assert(static_cast<long long>(kMaxStartingBb) * kMaxBigBlind <= kMaxStartingChips);
     GameSetup setup = default_tournament();
     setup.starting_bb = 500;
     setup.levels = {{2'500'000, 5'000'000, 0, AnteType::None}};  // 2.5e9 chips each
-    EXPECT_NE(validate(setup)->find("Starting stacks"), std::string::npos);
-    setup.starting_bb = 20;  // 1e8: the limit itself is fine
+    EXPECT_TRUE(validate(setup));
+    setup.big_blind = 5'000'000;
+    EXPECT_NE(validate(setup)->find("Big blind must be"), std::string::npos);
+
+    setup.big_blind = kMaxBigBlind;
+    setup.levels = {{kMaxBigBlind / 2, kMaxBigBlind, 0, AnteType::None}};
     EXPECT_FALSE(validate(setup));
+}
+
+TEST(BlindSchedule, LevelOneMustBeTheBigBlind) {
+    GameSetup setup = default_tournament();  // Big blind 20
+    setup.levels = {{25, 50, 0, AnteType::None}, {50, 100, 0, AnteType::None}};
+    EXPECT_EQ(validate(setup), "Level 1's big blind must equal the big blind.");
+    setup.big_blind = 50;
+    EXPECT_FALSE(validate(setup));
+
+    // A freezeout ignores leftover levels; a preset is always in step.
+    setup.mode = GameMode::Freezeout;
+    setup.big_blind = 20;
+    EXPECT_FALSE(validate(setup));
+    setup.mode = GameMode::Tournament;
+    setup.levels.clear();
+    EXPECT_FALSE(validate(setup));
+}
+
+TEST(BlindSchedule, ScalingHugeLevelsSaturatesWithoutOverflow) {
+    // Sixty levels at the cap, times ten: kept strictly rising (and refused), with no
+    // int overflow on the way (run under UBSan in the sanitizer build).
+    const std::vector<BlindLevel> huge(60, BlindLevel{kMaxLevelBigBlind / 2, kMaxLevelBigBlind, 0, AnteType::None});
+    const std::vector<BlindLevel> scaled = scale_schedule(huge, 10.0);
+    ASSERT_EQ(scaled.size(), 60u);
+    EXPECT_EQ(scaled.front().big_blind, kMaxLevelBigBlind);
+    for (std::size_t i = 1; i < scaled.size(); ++i) {
+        EXPECT_GE(scaled[i].big_blind, scaled[i - 1].big_blind) << i;
+        EXPECT_GE(scaled[i].small_blind, 1) << i;
+        EXPECT_LE(scaled[i].small_blind, scaled[i].big_blind) << i;
+    }
+    EXPECT_EQ(scaled.back().big_blind, std::numeric_limits<int>::max());
+
+    GameSetup setup = default_tournament();
+    setup.levels.assign(scaled.begin(), scaled.begin() + 5);
+    setup.big_blind = setup.levels.front().big_blind;
+    EXPECT_TRUE(validate(setup));
 }
 
 TEST(BlindSchedule, FirstLevelMatchesTheSchedulesFirst) {
