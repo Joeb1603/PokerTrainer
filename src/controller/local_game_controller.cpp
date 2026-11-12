@@ -453,8 +453,8 @@ void LocalGameController::write_session_summary() noexcept {
 std::vector<std::string> posting_lines(const GameState& state, const std::array<std::string, kMaxSeats>& names) {
     std::vector<std::string> lines;
     const BlindLevel& level = state.level;
-    // Only the amount posted is known here (stacks move on), so a post below the
-    // level's amount is the one that put the seat all in.
+    // Only the amount posted is known here (stacks move on), so "(all-in)" marks a
+    // post below the level's amount; a post that used up a stack exactly is unmarked.
     const auto post = [&](int seat, const std::string& what, int paid, int full) {
         if (paid <= 0) return;  // All in already: nothing to post
         lines.push_back(seat_text(state, names, seat) + what + std::to_string(paid) + (paid < full ? " (all-in)" : ""));

@@ -175,7 +175,7 @@ TEST(BlindSchedule, ValidationNamesTheProblem) {
     EXPECT_TRUE(validate(t));
 }
 
-TEST(BlindSchedule, StartingStacksThatCouldOverflowAreRefused) {
+TEST(BlindSchedule, HugeStartingStacksAreRefusedByTheBlindLimits) {
     // Level 1 must equal the big blind, which is at most kMaxBigBlind, so the largest
     // stack is kMaxStartingBb * kMaxBigBlind; a huge level 1 is refused before that.
     static_assert(static_cast<long long>(kMaxStartingBb) * kMaxBigBlind <= kMaxStartingChips);

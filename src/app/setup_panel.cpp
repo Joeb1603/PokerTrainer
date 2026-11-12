@@ -302,8 +302,9 @@ void SetupPanel::draw_levels(float scale) {
             ImGui::AlignTextToFramePadding();
             ImGui::Text("%zu", i + 1);
             ImGui::TableNextColumn();
-            // Each field is held to 0..kMaxLevelBigBlind, so no arithmetic on it can
-            // overflow; validate() names anything still out of range.
+            // Typed values are held to 0..kMaxLevelBigBlind. "Apply" can still scale
+            // rows above it (up to INT_MAX); validate() refuses those, and "Add level"
+            // is disabled once the last big blind reaches the cap.
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::InputInt("##sb", &level.small_blind, 0, 0)) {
                 level.small_blind = std::clamp(level.small_blind, 0, kMaxLevelBigBlind);

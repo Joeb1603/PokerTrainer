@@ -48,9 +48,10 @@ struct ControllerOptions {
 };
 
 // The lines a hand's action log opens with: the antes and blinds as posted, each
-// seat named by its position and `names`. A post that left the seat all in says so.
-// No line ever posts 0: a blind seat all in from its ante "posts no blind", and a big
-// blind all in from its blind gets no ante line. Public table state only.
+// seat named by its position and `names`. A post short of the level's amount says
+// "(all-in)"; one that used up a stack exactly does not, since only the amounts
+// posted are known here. No line ever posts 0: a blind seat all in from its ante
+// "posts no blind", and a big blind all in from its blind gets no ante line.
 std::vector<std::string> posting_lines(const GameState& state, const std::array<std::string, kMaxSeats>& names);
 
 // Runs a local freezeout or tournament: Hero in seat 0 against Nit, Loose, GTO, WildGTO and Shifter

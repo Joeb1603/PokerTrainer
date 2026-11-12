@@ -189,6 +189,8 @@ std::optional<std::string> validate(const GameSetup& setup) {
     const std::vector<BlindLevel> levels = setup.schedule();
     if (levels.empty()) return "The tournament needs at least one level.";
     if (levels.front().big_blind != setup.big_blind) return "Level 1's big blind must equal the big blind.";
+    // Unreachable while level 1 equals a big blind of at most kMaxBigBlind (500 x
+    // 10,000 = 5e6 chips); kept as a guard should those limits change.
     if (static_cast<long long>(setup.starting_bb) * std::max(0, levels.front().big_blind) > kMaxStartingChips) {
         return "Starting stacks above " + std::to_string(kMaxStartingChips) + " chips are not supported.";
     }
@@ -200,6 +202,8 @@ std::optional<std::string> validate(const GameSetup& setup) {
         if (level.small_blind < 1 || level.small_blind > level.big_blind) {
             return name + "the small blind must be 1 to the big blind.";
         }
+        // Before the ante check: it multiplies the big blind, which only fits an int
+        // once it is known to be at most kMaxLevelBigBlind.
         if (level.big_blind > kMaxLevelBigBlind) return name + "the big blind is too large.";
         if (level.big_blind < previous) return name + "blinds cannot go down.";
         if (level.ante < 0 || level.ante > kMaxAnteBigBlinds * level.big_blind) {

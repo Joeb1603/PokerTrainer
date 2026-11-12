@@ -88,7 +88,9 @@ std::vector<BlindLevel> preset_schedule(BlindPreset preset, int big_blind, AnteT
 std::vector<BlindLevel> with_antes(std::vector<BlindLevel> levels, AnteType type, int from_level);
 
 // Every level's blinds and ante times `factor`, tidied, keeping the big blinds
-// strictly rising and each small blind at its old share of the big.
+// strictly rising and each small blind at its old share of the big. Past
+// kMaxLevelBigBlind (which validate refuses) the big blinds saturate at INT_MAX
+// instead of overflowing, so there they may only stay level.
 std::vector<BlindLevel> scale_schedule(const std::vector<BlindLevel>& levels, double factor);
 
 // "10/20": a level's blinds, without the ante.
