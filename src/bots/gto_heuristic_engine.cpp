@@ -92,17 +92,18 @@ Action preflop_raise(const PlayerView& view, int to) {
     return {ActionType::Raise, to};
 }
 
-// 2.5 big blinds plus one per limper, 3x against a raise plus one bet per cold
-// caller, 2.3x against a re-raise, then all in.
-int preflop_size(const PlayerView& view, int raises) {
+// By default 2.5 big blinds plus one per limper, 3x against a raise plus one bet per
+// cold caller, 2.3x against a re-raise, then all in. Chip counts are far below 2^53,
+// so the whole-number multiples give exactly the integer products they replaced.
+int preflop_size(const PlayerView& view, int raises, const PreflopSizing& sizing) {
     const int callers = count_preflop(view, ActionType::Call);
     switch (raises) {
         case 0:
-            return static_cast<int>(std::lround(view.big_blind * (2.5 + callers)));
+            return static_cast<int>(std::lround(view.big_blind * (sizing.open_bb + callers)));
         case 1:
-            return view.current_bet * (3 + callers);
+            return static_cast<int>(std::lround(view.current_bet * (sizing.vs_raise_mult + callers)));
         case 2:
-            return static_cast<int>(std::lround(view.current_bet * 2.3));
+            return static_cast<int>(std::lround(view.current_bet * sizing.vs_reraise_mult));
         default:
             return view.seats[view.seat].street_bet + view.seats[view.seat].stack;
     }
@@ -115,6 +116,22 @@ Position first_raiser_position(const PlayerView& view) {
         }
     }
     return Position::BTN;
+}
+
+// A uniform draw in [0, 1) from the raw generator bits, so it is the same on every
+// standard library. Only the later knobs use it, and only when they are on.
+double unit_roll(std::mt19937_64& rng) { return static_cast<double>(rng() >> 11) * 0x1.0p-53; }
+
+// True when this player made the last bet or raise of the street before this one.
+bool led_previous_street(const PlayerView& view) {
+    if (view.street == Street::Preflop) return false;
+    const Street previous = static_cast<Street>(static_cast<int>(view.street) - 1);
+    for (auto it = view.actions.rbegin(); it != view.actions.rend(); ++it) {
+        if (it->street != previous) continue;
+        // The record holds the resolved type: an all-in shows as the bet, raise or call it was.
+        if (it->type == ActionType::Bet || it->type == ActionType::Raise) return it->seat == view.seat;
+    }
+    return false;
 }
 
 double value_bar(int opponents, double strength) {
@@ -430,6 +447,22 @@ PersonalityProfile gto_profile(int rollouts) {
     return p;
 }
 
+PreflopCutoffs cutoffs_at(const PersonalityProfile& profile, std::optional<Position> position) {
+    PreflopCutoffs cut = profile.cutoffs;
+    if (profile.positional_width == 0.0 || !position) return cut;
+    const double weight = kPositionalWidthWeights[static_cast<std::size_t>(*position)];
+    const double scale = std::max(0.2, 1.0 + profile.positional_width * weight);
+    for (double* share : {&cut.play, &cut.open_raise, &cut.three_bet, &cut.call_raise}) {
+        *share = std::min(100.0, *share * scale);
+    }
+    return cut;
+}
+
+double GtoHeuristicEngine::bet_size(const BoardTexture& texture, bool polarized) const {
+    if (polarized) return profile_.bet_sizes.polarized;
+    return texture.wet ? profile_.bet_sizes.wet : profile_.bet_sizes.dry;
+}
+
 Action GtoHeuristicEngine::decide(const PlayerView& view, std::mt19937_64& rng) const {
     if (!view.own_hole || view.legal.mask == 0) return {ActionType::Fold, 0};
 
@@ -447,10 +480,10 @@ Action GtoHeuristicEngine::decide(const PlayerView& view, std::mt19937_64& rng) 
 Action GtoHeuristicEngine::preflop_by_percent(const PlayerView& view) const {
     const HandClass hand = HandClass::from_cards((*view.own_hole)[0], (*view.own_hole)[1]);
     const double percentile = strength_percentile(hand);
-    const PreflopCutoffs& cut = profile_.cutoffs;
+    const PreflopCutoffs cut = cutoffs_at(profile_, view.position);
     const int raises = count_preflop(view, ActionType::Raise);
     const Action call{ActionType::Call, 0};
-    const Action raise = preflop_raise(view, preflop_size(view, raises));
+    const Action raise = preflop_raise(view, preflop_size(view, raises, profile_.preflop_sizing));
 
     if (raises == 0) {
         if (percentile <= cut.open_raise) return raise;
@@ -504,7 +537,8 @@ PreflopResponse chart_response(const PlayerView& view) {
 Action GtoHeuristicEngine::preflop_by_chart(const PlayerView& view) const {
     switch (chart_response(view)) {
         case PreflopResponse::Raise:
-            return preflop_raise(view, preflop_size(view, count_preflop(view, ActionType::Raise)));
+            return preflop_raise(view,
+                                 preflop_size(view, count_preflop(view, ActionType::Raise), profile_.preflop_sizing));
         case PreflopResponse::Call: return {ActionType::Call, 0};
         case PreflopResponse::Fold: break;
     }
@@ -519,7 +553,7 @@ double GtoHeuristicEngine::bluff_probability(const HandRead& read, Street street
     // Bluffs that make a bet of size s break even for the caller: s / (1 + 2s) of
     // the betting range. Draws fill that share first because they can still win
     // when called; on the river, with no draws left, air fills half of it.
-    const double s = bet_fraction_for(texture, street == Street::River);
+    const double s = bet_size(texture, street == Street::River);
     const double balanced_share = s / (1.0 + 2.0 * s);
     if (street == Street::River) return 0.5 * balanced_share;
     if (read.strong_draw()) return std::min(1.0, 2.0 * balanced_share);
@@ -545,12 +579,20 @@ Action GtoHeuristicEngine::postflop(const PlayerView& view, std::mt19937_64& rng
     const bool very_strong = equity >= value_bar(opponents, profile_.polarized_strength);
     const bool bluff_candidate = !read.holds_pair || read.has_draw();
 
+    // Later knobs draw only when they are on, so the classic profiles' streams stay as they were.
+    const bool slowplay = very_strong && !river && profile_.slowplay_freq > 0.0;
+
     if (math.to_call == 0) {
         if (equity >= value_bar(opponents, profile_.value_bet_strength)) {
-            return aggressive(view, bet_fraction_for(texture, river && very_strong));
+            if (slowplay && unit_roll(rng) < profile_.slowplay_freq) return {ActionType::Check, 0};
+            return aggressive(view, bet_size(texture, river && very_strong));
+        }
+        if (profile_.cbet_freq > 0.0 && opponents <= 2 && led_previous_street(view) &&
+            unit_roll(rng) < profile_.cbet_freq) {
+            return aggressive(view, bet_size(texture, river));
         }
         if (bluff_candidate && roll(rng) < bluff_probability(read, view.street, texture, opponents)) {
-            return aggressive(view, bet_fraction_for(texture, river));
+            return aggressive(view, bet_size(texture, river));
         }
         return {ActionType::Check, 0};
     }
@@ -562,13 +604,16 @@ Action GtoHeuristicEngine::postflop(const PlayerView& view, std::mt19937_64& rng
     // A value raise is what the street bars are for; Nits also keep theirs to real hands.
     const bool can_value_raise = equity >= value_bar(opponents, profile_.value_raise_strength) &&
                                  (!profile_.folds_non_nuts_to_large_bets || nutted);
-    if (can_value_raise) return aggressive(view, bet_fraction_for(texture, river && very_strong));
+    if (can_value_raise) {
+        if (slowplay && unit_roll(rng) < profile_.slowplay_freq) return {ActionType::Call, 0};
+        return aggressive(view, bet_size(texture, river && very_strong));
+    }
 
     const double raise_bluff = profile_.balanced ? (read.strong_draw() && opponents <= 2 ? 0.15 : 0.0)
                                                  : profile_.bluff_freq * profile_.bluff_raise_share;
     // Where no raise is legal a bluff has nothing to do: it must not turn into a call.
     if (raise_bluff > 0.0 && can_raise(view) && bluff_candidate && roll(rng) < raise_bluff) {
-        return aggressive(view, bet_fraction_for(texture, river));
+        return aggressive(view, bet_size(texture, river));
     }
 
     // Measured layer by layer, as a short all-in cannot win the side pot.

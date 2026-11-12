@@ -510,6 +510,188 @@ TEST(BluffFrequency, ABluffRaiseThatCannotBeMadeIsNotACall) {
     EXPECT_DOUBLE_EQ(answer_rates(gto, gto_spot.player_view(0), 1000).folds, 1.0);
 }
 
+// --- Later knobs: sizing, position, slowplay, continuation bets -------------
+
+TEST(Profiles, ClassicProfilesKeepDefaultKnobs) {
+    for (const PersonalityProfile& p : {nit_profile(), loose_profile(), gto_profile()}) {
+        SCOPED_TRACE(std::string(p.name));
+        EXPECT_EQ(p.positional_width, 0.0);
+        EXPECT_EQ(p.slowplay_freq, 0.0);
+        EXPECT_EQ(p.cbet_freq, 0.0);
+        EXPECT_EQ(p.preflop_sizing.open_bb, 2.5);
+        EXPECT_EQ(p.preflop_sizing.vs_raise_mult, 3.0);
+        EXPECT_EQ(p.preflop_sizing.vs_reraise_mult, 2.3);
+        EXPECT_EQ(p.bet_sizes.dry, kDryBetFraction);
+        EXPECT_EQ(p.bet_sizes.wet, kWetBetFraction);
+        EXPECT_EQ(p.bet_sizes.polarized, kPolarizedBetFraction);
+    }
+}
+
+TEST(Knobs, PositionalWidthScalesTheEntryCutoffs) {
+    PersonalityProfile p = loose_profile();
+    EXPECT_EQ(cutoffs_at(p, Position::UTG).play, p.cutoffs.play);  // Off: the same everywhere
+
+    p.positional_width = 0.6;
+    EXPECT_DOUBLE_EQ(cutoffs_at(p, Position::UTG).play, kLoosePlayPercent * 0.7);
+    EXPECT_DOUBLE_EQ(cutoffs_at(p, Position::CO).play, kLoosePlayPercent);
+    EXPECT_DOUBLE_EQ(cutoffs_at(p, Position::BTN).play, kLoosePlayPercent * 1.36);
+    EXPECT_DOUBLE_EQ(cutoffs_at(p, Position::BTN).open_raise, 20.0 * 1.36);
+    EXPECT_DOUBLE_EQ(cutoffs_at(p, Position::BTN).four_bet, p.cutoffs.four_bet);  // Not scaled
+    EXPECT_DOUBLE_EQ(cutoffs_at(p, std::nullopt).play, kLoosePlayPercent);
+
+    p.positional_width = 3.0;  // Capped at 100, and never below a fifth
+    EXPECT_DOUBLE_EQ(cutoffs_at(p, Position::BTN).play, 100.0);
+    EXPECT_DOUBLE_EQ(cutoffs_at(p, Position::UTG).play, kLoosePlayPercent * 0.2);
+}
+
+// First-in entry rate from UTG (seat 3) or, with the three before it folding, the button (seat 0).
+double entry_rate_at(IBotStrategy& bot, int seat, int hands) {
+    GameConfig config;
+    config.seed = 2025;
+    config.first_button = 0;
+    config.hero_seat = std::nullopt;
+    GameEngine engine(config);
+    int entered = 0;
+    for (int i = 0; i < hands; ++i) {
+        engine.new_game();
+        engine.start_hand();
+        while (engine.state().to_act != seat) {
+            if (!engine.apply_action({ActionType::Fold, 0})) return -1.0;
+        }
+        if (bot.decide(engine.player_view(seat)).type != ActionType::Fold) ++entered;
+    }
+    return static_cast<double>(entered) / hands;
+}
+
+TEST(Knobs, PositionalWidthPlaysWiderOnTheButton) {
+    PersonalityProfile p = loose_profile(kFastRollouts);
+    p.positional_width = 0.6;
+    ProfileBot bot(p, 60);
+    constexpr int kHands = 20000;
+    const double utg = HandRange::top_percent(kLoosePlayPercent * 0.7).percent() / 100.0;
+    const double btn = HandRange::top_percent(kLoosePlayPercent * 1.36).percent() / 100.0;
+    EXPECT_NEAR(entry_rate_at(bot, 3, kHands), utg, tolerance(utg, kHands));
+    EXPECT_NEAR(entry_rate_at(bot, 0, kHands), btn, tolerance(btn, kHands));
+}
+
+TEST(Knobs, PreflopSizing) {
+    PersonalityProfile p = loose_profile(kFastRollouts);
+    p.preflop_sizing = {.open_bb = 3.5, .vs_raise_mult = 4.0, .vs_reraise_mult = 2.6};
+    ProfileBot bot(p, 61);
+
+    GameEngine open = six_max(3, hole("Ac", "Ad"));
+    EXPECT_TRUE(same(bot.decide(open.player_view(3)), {ActionType::Raise, 70}));
+
+    GameEngine three_bet = six_max(4, hole("Ac", "Ad"));
+    ASSERT_TRUE(three_bet.apply_action({ActionType::Raise, 50}));  // UTG opens
+    EXPECT_TRUE(same(bot.decide(three_bet.player_view(4)), {ActionType::Raise, 200}));
+
+    GameEngine four_bet = six_max(3, hole("Ac", "Ad"));
+    ASSERT_TRUE(four_bet.apply_action({ActionType::Raise, 50}));
+    ASSERT_TRUE(four_bet.apply_action({ActionType::Raise, 150}));  // HJ 3-bets
+    fold_until(four_bet, 3);
+    EXPECT_TRUE(same(bot.decide(four_bet.player_view(3)), {ActionType::Raise, 390}));  // 2.6 x 150
+}
+
+TEST(Knobs, BetSizesByTexture) {
+    // Pot 200, seat 1 first to act: dry 75% = 150, wet 125% = 250, river polarized 200% = 400.
+    PersonalityProfile p = gto_profile(kScenarioRollouts);
+    p.bet_sizes = {.dry = 0.75, .wet = 1.25, .polarized = 2.0};
+    ProfileBot bot(p, 62);
+
+    GameEngine dry = heads_up_to_flop(hole("Tc", "Td"), hole("Ac", "Ad"), board_of("As", "7h", "2d", "9c", "4s"));
+    EXPECT_TRUE(same(bot.decide(dry.player_view(1)), {ActionType::Bet, 150}));
+
+    GameEngine wet = heads_up_to_flop(hole("Ac", "Ad"), hole("9s", "9d"), board_of("9h", "8h", "6c", "2d", "3s"));
+    EXPECT_TRUE(same(bot.decide(wet.player_view(1)), {ActionType::Bet, 250}));
+
+    GameEngine river = heads_up_to_flop(hole("Tc", "Td"), hole("Ah", "Kh"), board_of("Qh", "Jh", "Th", "2c", "3d"));
+    check_street(river);
+    check_street(river);
+    EXPECT_TRUE(same(bot.decide(river.player_view(1)), {ActionType::Bet, 400}));
+}
+
+TEST(Knobs, SlowplayChecksAVeryStrongHandAtItsRate) {
+    PersonalityProfile p = loose_profile(kFastRollouts);
+    p.slowplay_freq = 0.4;
+    ProfileBot bot(p, 63);
+    constexpr int kDecisions = 4000;
+    // Top set, checked to on the flop: far above the polarized bar.
+    GameEngine flop = heads_up_to_flop(hole("Tc", "Td"), hole("Ac", "Ad"), board_of("As", "7h", "2d", "9c", "4s"));
+    const double bets = bluff_rate(bot, flop.player_view(1), kDecisions);
+    EXPECT_NEAR(bets, 0.6, tolerance(0.6, kDecisions));
+
+    // Never on the river, where there is no later street to raise on.
+    GameEngine river = heads_up_to_flop(hole("Tc", "Td"), hole("Ac", "Ad"), board_of("As", "7h", "2d", "9c", "4s"));
+    check_street(river);
+    check_street(river);
+    EXPECT_DOUBLE_EQ(bluff_rate(bot, river.player_view(1), 500), 1.0);
+}
+
+TEST(Knobs, SlowplayFlatsInsteadOfRaising) {
+    PersonalityProfile p = loose_profile(kFastRollouts);
+    p.slowplay_freq = 0.4;
+    ProfileBot bot(p, 64);
+    constexpr int kDecisions = 4000;
+    GameEngine engine = heads_up_to_flop(hole("Ac", "Ad"), hole("Tc", "Td"), board_of("As", "7h", "2d", "9c", "4s"));
+    ASSERT_TRUE(engine.apply_action({ActionType::Bet, 100}));
+    const Answers rates = answer_rates(bot, engine.player_view(0), kDecisions);
+    EXPECT_NEAR(rates.calls, 0.4, tolerance(0.4, kDecisions));
+    EXPECT_NEAR(rates.raises, 0.6, tolerance(0.6, kDecisions));
+}
+
+TEST(Knobs, ContinuationBetsAfterLeadingThePreviousStreet) {
+    PersonalityProfile p = loose_profile(kFastRollouts);
+    p.bluff_freq = 0.1;
+    p.cbet_freq = 0.6;
+    constexpr int kDecisions = 4000;
+    const std::array<Card, 5> board = board_of("Ks", "Qh", "9d", "2c", "5s");
+
+    // Seat 0 raised preflop and is checked to on the flop with air.
+    {
+        ProfileBot bot(p, 65);
+        GameEngine engine = heads_up_to_flop(hole("7c", "3d"), hole("Tc", "Td"), board);
+        ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        const double expected = 0.6 + 0.4 * 0.1;
+        EXPECT_NEAR(bluff_rate(bot, engine.player_view(0), kDecisions), expected, tolerance(expected, kDecisions));
+    }
+    // A limped pot has no aggressor: only the bluff frequency is left.
+    {
+        ProfileBot bot(p, 66);
+        GameEngine engine = heads_up_to_flop(hole("7c", "3d"), hole("Tc", "Td"), board, 0);
+        ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        EXPECT_NEAR(bluff_rate(bot, engine.player_view(0), kDecisions), 0.1, tolerance(0.1, kDecisions));
+    }
+    // A checked-through flop ends the lead: no continuation bet on the turn.
+    {
+        ProfileBot bot(p, 67);
+        GameEngine engine = heads_up_to_flop(hole("7c", "3d"), hole("Tc", "Td"), board);
+        check_street(engine);
+        ASSERT_TRUE(engine.apply_action({ActionType::Check, 0}));
+        ASSERT_EQ(engine.state().street, Street::Turn);
+        EXPECT_NEAR(bluff_rate(bot, engine.player_view(0), kDecisions), 0.1, tolerance(0.1, kDecisions));
+    }
+}
+
+TEST(Knobs, NoContinuationBetIntoThreeOpponents) {
+    PersonalityProfile p = loose_profile(kFastRollouts);
+    p.bluff_freq = 0.1;
+    p.cbet_freq = 0.6;
+    ProfileBot bot(p, 68);
+    GameEngine engine = six_max(3, hole("Kc", "3d"));
+    ASSERT_TRUE(engine.apply_action({ActionType::Raise, 50}));  // UTG
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(engine.apply_action({ActionType::Call, 0}));  // HJ, CO, BTN
+    ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));  // SB
+    ASSERT_TRUE(engine.apply_action({ActionType::Fold, 0}));  // BB
+    ASSERT_EQ(engine.state().street, Street::Flop);
+    ASSERT_EQ(engine.state().to_act, 3);
+    const PlayerView view = engine.player_view(3);
+    ASSERT_EQ(view.opponents_in_hand(), 3);
+    ASSERT_FALSE(read_hand(*view.own_hole, view.board).holds_pair);
+    constexpr int kDecisions = 4000;
+    EXPECT_NEAR(bluff_rate(bot, view, kDecisions), 0.1, tolerance(0.1, kDecisions));
+}
+
 // --- GTO ---------------------------------------------------------------------
 
 TEST(Gto, SameHandOpensButtonAndFoldsUtg) {

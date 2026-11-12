@@ -153,6 +153,21 @@ struct PreflopCutoffs {
     double commit = 0.0;            // Facing a bet taking a big share of the stack
 };
 
+// Preflop raise sizes. The defaults are the classic ones: 2.5 big blinds plus one per
+// limper, 3x a raise plus one bet per cold caller, and 2.3x a re-raise.
+struct PreflopSizing {
+    double open_bb = 2.5;
+    double vs_raise_mult = 3.0;
+    double vs_reraise_mult = 2.3;
+};
+
+// Postflop bet sizes, as fractions of the pot after calling.
+struct BetSizes {
+    double dry = kDryBetFraction;
+    double wet = kWetBetFraction;
+    double polarized = kPolarizedBetFraction;
+};
+
 struct PersonalityProfile {
     std::string_view name;
     PreflopStyle preflop_style = PreflopStyle::TopPercent;
@@ -175,8 +190,29 @@ struct PersonalityProfile {
     double value_raise_strength = 0.50;
     double polarized_strength = 0.80;
 
+    // Later knobs. Every default reproduces the classic behaviour, and a knob left at
+    // 0 never draws from the generator, so the classic profiles' streams are unchanged.
+    PreflopSizing preflop_sizing;
+    BetSizes bet_sizes;
+    // TopPercent only: scales the entry cut-offs by position, wider late and tighter
+    // early (see kPositionalWidthWeights). 0 plays the same range everywhere.
+    double positional_width = 0.0;
+    // A very strong hand on the flop or turn checks instead of betting, or calls
+    // instead of raising, this often. A later raise makes it a check-raise.
+    double slowplay_freq = 0.0;
+    // Checked to after making the last bet or raise of the previous street, against at
+    // most two opponents: bets below the value bar this often (a continuation bet).
+    double cbet_freq = 0.0;
+
     int rollouts = kDefaultRollouts;
 };
+
+// How positional_width moves each position's entry cut-offs: a cut-off is scaled by
+// max(0.2, 1 + width * weight), capped at 100. UTG, HJ, CO, BTN, SB, BB.
+inline constexpr std::array<double, 6> kPositionalWidthWeights{-0.5, -0.3, 0.0, 0.6, 0.3, 0.3};
+
+// The cut-offs a TopPercent profile uses in `position`, with positional_width applied.
+PreflopCutoffs cutoffs_at(const PersonalityProfile& profile, std::optional<Position> position);
 
 inline constexpr double kNitCallMargin = 0.15;
 inline constexpr double kNitBluffFreq = 0.03;
@@ -207,6 +243,7 @@ private:
     Action postflop(const PlayerView& view, std::mt19937_64& rng) const;
     double bluff_probability(const HandRead& read, Street street, const BoardTexture& texture,
                              int opponents) const;
+    double bet_size(const BoardTexture& texture, bool polarized) const;
 
     PersonalityProfile profile_;
 };
