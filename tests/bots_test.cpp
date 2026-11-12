@@ -1798,14 +1798,17 @@ std::uint64_t classic_bots_hash(long* decisions) {
 // Pins every decision of Nit, Loose, GTO, WildGTO and Shifter, so new personality
 // knobs can be shown to leave them alone. The standard distributions the classic bots
 // draw through are library-defined, so the constant is pinned for libstdc++ only;
-// elsewhere the test prints the hash and skips.
+// elsewhere the test prints the hash and skips. Re-pinned once for an engine rule fix
+// (a lone small blind that already covers a short all-in big blind has no decision),
+// which changes the random-stack states only from the first such hand on; the
+// freezeouts below were checked unchanged on their own seed.
 TEST(Golden, ClassicBotsDecideAsBefore) {
     long decisions = 0;
     const std::uint64_t hash = classic_bots_hash(&decisions);
     ASSERT_NE(hash, 0U) << "an action was refused";
     EXPECT_GT(decisions, 3000);
 #if defined(__GLIBCXX__)
-    EXPECT_EQ(hash, 0x70ece03ffe4f3b2aULL) << std::hex << "hash 0x" << hash;
+    EXPECT_EQ(hash, 0xedf9f03a0af54f68ULL) << std::hex << "hash 0x" << hash;
 #else
     GTEST_SKIP() << std::hex << "no pinned value for this standard library; hash 0x" << hash;
 #endif

@@ -46,7 +46,10 @@ struct ScriptedDeal {
 // - The button moves to the next seat with chips each hand (no dead button).
 // - Heads-up, the button posts the small blind, acts first preflop and last after.
 // - A short big blind still sets the amount to call at the full big blind; any
-//   excess a caller puts in comes back as an uncalled refund.
+//   excess a caller puts in comes back as an uncalled refund. A lone player who can
+//   still act, facing only all-in players, acts only if one of them has put in more
+//   on the street than they have (heads-up, a small blind that already covers a
+//   short big blind has no decision: the board runs out).
 // - An all-in below a full raise does not reopen betting for players who have
 //   already acted, unless short all-ins add up to a full raise (TDA Rule 47).
 // - Once at most one player can still act, remaining streets deal out automatically.
@@ -60,7 +63,8 @@ public:
     // Throws std::invalid_argument for an unusable config.
     explicit GameEngine(GameConfig config);
 
-    // Resets stacks and seats for a fresh freezeout. The RNG keeps advancing.
+    // Resets stacks, seats and the blinds (back to the config's, undoing set_level)
+    // for a fresh game. The RNG keeps advancing.
     void new_game();
 
     // The same with a new config (stacks, blinds, ante, hero, first button). The

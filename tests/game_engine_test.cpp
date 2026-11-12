@@ -513,20 +513,52 @@ TEST(GameEngine, BlindAllInWithBigBlindCoveringRunsOutWithoutAction) {
     EXPECT_EQ(s.seats[1].stack, 95);
 }
 
-TEST(GameEngine, ShortBigBlindHeadsUpSmallBlindMustStillDecide) {
+TEST(GameEngine, ShortBigBlindHeadsUpSmallBlindThatCoversHasNoDecision) {
+    // The big blind is all in for 5, below the small blind's 10: nobody can bet
+    // against the small blind and it owes nothing, so the board runs out.
     GameEngine e(config_with({1000, 5, 0, 0, 0, 0}, 0));
     e.start_hand(strength_order_deal({0, 1, 2, 3, 4, 5}));
     const GameState& s = e.state();
 
-    ASSERT_EQ(s.to_act, 0);
-    const LegalActions legal = e.legal_actions();
-    EXPECT_TRUE(legal.allows(ActionType::Call));
-    EXPECT_FALSE(legal.allows(ActionType::Raise));
-    call(e, 0);
-
+    EXPECT_FALSE(s.to_act);
+    EXPECT_EQ(s.phase, GamePhase::SessionOver);  // The big blind busts
+    ASSERT_TRUE(s.last_result);
+    EXPECT_TRUE(s.last_result->showdown);
     EXPECT_EQ(s.board.size(), 5u);
+    ASSERT_EQ(s.last_result->pots.size(), 1u);
+    EXPECT_EQ(s.last_result->pots[0].amount, 10);  // 5 from each
+    ASSERT_TRUE(s.last_result->refund);
+    EXPECT_EQ(s.last_result->refund->seat, 0);
+    EXPECT_EQ(s.last_result->refund->amount, 5);
     EXPECT_EQ(s.seats[0].stack, 1005);
     EXPECT_EQ(s.seats[1].status, SeatStatus::Busted);
+}
+
+TEST(GameEngine, LoneSmallBlindStillAnswersAShortBigBlindAboveIt) {
+    // Three-handed: the button folds and the big blind is all in for 15, more than
+    // the small blind's 10, so the small blind must still call or fold. The bet to
+    // call stays the full big blind; the 5 above the all-in comes back.
+    GameEngine e(config_with({1000, 1000, 15, 0, 0, 0}, 0));
+    e.start_hand(strength_order_deal({2, 0, 1, 3, 4, 5}));
+    const GameState& s = e.state();
+    fold(e, 0);
+
+    ASSERT_EQ(s.to_act, 1);
+    const LegalActions legal = e.legal_actions();
+    EXPECT_TRUE(legal.allows(ActionType::Fold));
+    EXPECT_TRUE(legal.allows(ActionType::Call));
+    EXPECT_FALSE(legal.allows(ActionType::Raise));
+    EXPECT_EQ(legal.call_amount, 10);
+    call(e, 1);
+
+    ASSERT_TRUE(s.last_result);
+    EXPECT_TRUE(s.last_result->showdown);
+    ASSERT_TRUE(s.last_result->refund);
+    EXPECT_EQ(s.last_result->refund->seat, 1);
+    EXPECT_EQ(s.last_result->refund->amount, 5);
+    EXPECT_EQ(s.seats[1].stack, 1000 - 20 + 5 + 30);
+    EXPECT_EQ(s.seats[2].status, SeatStatus::Busted);
+    EXPECT_EQ(stack_total(e), 2015);
 }
 
 TEST(GameEngine, AllInCallRunsOutRemainingStreets) {
@@ -884,6 +916,22 @@ TEST(GameEngineLevels, MinimumBetPostflopIsTheHandsBigBlind) {
     EXPECT_EQ(e.legal_actions().min_raise_to, 100);
 }
 
+TEST(GameEngineLevels, NewGameGoesBackToTheConfigsBlinds) {
+    GameEngine e(config_with(kThreeHanded));
+    e.set_level({500, 1000, 1000, AnteType::BigBlind});
+    e.new_game();
+    EXPECT_EQ(e.next_level(), (BlindLevel{10, 20, 0, AnteType::None}));
+
+    e.start_hand();
+    const GameState& s = e.state();
+    EXPECT_EQ(s.level.small_blind, 10);
+    EXPECT_EQ(s.level.big_blind, 20);
+    EXPECT_FALSE(s.level.has_ante());
+    EXPECT_EQ(s.small_blind_posted, 10);
+    EXPECT_EQ(s.big_blind_posted, 20);
+    EXPECT_EQ(s.total_antes(), 0);
+}
+
 TEST(GameEngineLevels, NewGameWithConfigKeepsTheRandomStream) {
     GameConfig config = config_with(kThreeHanded);
     config.seed = 99;
@@ -985,6 +1033,30 @@ TEST(GameEngineAntes, ShortBigBlindPostsTheBlindBeforeTheAnte) {
     EXPECT_EQ(s.last_result->pots[0].amount, 55);
     EXPECT_EQ(s.seats[2].stack, 55);
     EXPECT_EQ(stack_total(e), 2025);
+}
+
+TEST(GameEngineAntes, BigBlindAllInFromItsAnteLeavesTheSmallBlindNoDecision) {
+    // Heads-up, a per-player ante of 3 at 10/20, and the big blind has only 3: it is
+    // all in from the ante and posts no blind. The small blind's 10 is unmatched, so
+    // it has nothing to decide: the board runs out for the 6 in antes and the 10
+    // comes back. (It must not be able to fold and hand the big blind 16.)
+    GameEngine e(with_level(config_with({1000, 3, 0, 0, 0, 0}), 10, 20, 3, AnteType::PerPlayer));
+    e.start_hand(strength_order_deal({1, 0, 2, 3, 4, 5}));
+    const GameState& s = e.state();
+
+    EXPECT_EQ(s.big_blind_posted, 0);
+    EXPECT_EQ(s.seats[1].ante_posted, 3);
+    EXPECT_FALSE(s.to_act);
+    ASSERT_TRUE(s.last_result);
+    EXPECT_TRUE(s.last_result->showdown);
+    ASSERT_EQ(s.last_result->pots.size(), 1u);
+    EXPECT_EQ(s.last_result->pots[0].amount, 6);
+    ASSERT_TRUE(s.last_result->refund);
+    EXPECT_EQ(s.last_result->refund->seat, 0);
+    EXPECT_EQ(s.last_result->refund->amount, 10);
+    EXPECT_EQ(s.seats[1].stack, 6);  // Aces win the antes only
+    EXPECT_EQ(s.seats[0].stack, 997);
+    EXPECT_EQ(stack_total(e), 1003);
 }
 
 TEST(GameEngineAntes, PlayerAllInForLessThanTheAnteGetsASidePotOfTheRightSize) {

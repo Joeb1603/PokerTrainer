@@ -101,14 +101,12 @@ std::optional<Position> GameState::position_of(int seat) const {
 
 GameEngine::GameEngine(GameConfig config) : config_(std::move(config)), rng_(config_.seed) {
     validate_config(config_);
-    level_ = level_of(config_);
     new_game();
 }
 
 void GameEngine::new_game(GameConfig config) {
     validate_config(config);
     config_ = std::move(config);
-    level_ = level_of(config_);
     new_game();
 }
 
@@ -121,6 +119,7 @@ void GameEngine::set_level(const BlindLevel& level) {
 }
 
 void GameEngine::new_game() {
+    level_ = level_of(config_);  // A level set for the last game does not carry over
     state_ = GameState{};
     for (int seat = 0; seat < kMaxSeats; ++seat) {
         Seat& s = state_.seats[seat];
@@ -149,10 +148,15 @@ int GameEngine::count_with_status(SeatStatus status) const {
 
 bool GameEngine::betting_round_complete() const {
     if (count_with_status(SeatStatus::Active) <= 1) {
-        // A lone player with chips has nobody to bet against, so acts only if
-        // they still have to match a bet.
-        return std::none_of(state_.seats.begin(), state_.seats.end(), [this](const Seat& s) {
-            return s.status == SeatStatus::Active && s.street_bet < state_.current_bet;
+        // A lone player with chips has nobody to bet against, so acts only if an
+        // all-in player has put in more than they have. The bet to call is not
+        // enough: a short big blind leaves it above what anyone has put in.
+        int highest_all_in = 0;
+        for (const Seat& s : state_.seats) {
+            if (s.status == SeatStatus::AllIn) highest_all_in = std::max(highest_all_in, s.street_bet);
+        }
+        return std::none_of(state_.seats.begin(), state_.seats.end(), [highest_all_in](const Seat& s) {
+            return s.status == SeatStatus::Active && s.street_bet < highest_all_in;
         });
     }
     for (int seat = 0; seat < kMaxSeats; ++seat) {
