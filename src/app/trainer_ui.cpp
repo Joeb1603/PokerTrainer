@@ -210,6 +210,11 @@ void wrapped_tooltip(const char* text) {
     }
 }
 
+constexpr const char* kRandomPersonalitiesHelp =
+    "From the next session, the five bots get new names, new places at the table and playing styles drawn from a "
+    "wider pool (tight, loose, aggressive, sticky, tricky and more), all different. The table shows only their "
+    "names: work out how each one plays. Their styles are revealed when the session ends, and in the hand log.";
+
 // Hero mistakes stay on the heuristic model's base_ev (CLAUDE.md section 11).
 constexpr const char* kSolverMistakesNote =
     "Mistakes are judged against the heuristic Baseline, so following the solver can still be flagged.";
@@ -496,6 +501,15 @@ void TrainerUi::draw_console(float x, float y, float w, float h) {
         ImGui::PopFont();
         ImGui::Text("Hands %d   |   Net %+d chips   |   Flagged mistakes %d (about %.0f chips of estimated EV)",
                     s.session.hands_played, s.session.hero_net, s.session.mistakes, s.session.ev_lost);
+        if (!s.session.lineup.empty()) {
+            // Random personalities: the styles are revealed once the freezeout is over.
+            std::string lineup = "Lineup: ";
+            for (std::size_t i = 0; i < s.session.lineup.size(); ++i) {
+                if (i > 0) lineup += "   |   ";
+                lineup += s.session.lineup[i];
+            }
+            ImGui::TextColored(kMutedText, "%s", lineup.c_str());
+        }
         // The last hand stays on the table, so its result is still worth reading.
         draw_payout_lines(s);
     } else if (s.phase == ControllerPhase::HandComplete) {
@@ -648,6 +662,7 @@ void TrainerUi::draw_sidebar(float x, float y, float w, float h) {
     ImGui::Checkbox("Training Advisor", &show_advisor_);
     draw_solver_toggle();
     draw_advice_selector();
+    draw_random_personalities_toggle();
     ImGui::Separator();
 
     if (show_advisor_) draw_advisor();
@@ -678,6 +693,20 @@ void TrainerUi::draw_advice_selector() {
         }
         if (ImGui::RadioButton(choice.label, advice_focus_ == choice.type)) advice_focus_ = choice.type;
         wrapped_tooltip(choice.tip);
+    }
+}
+
+void TrainerUi::draw_random_personalities_toggle() {
+    // Below the advice selector, so the rows above stay where they were.
+    const TableSnapshot& s = controller_.snapshot();
+    bool random = controller_.random_personalities();
+    if (ImGui::Checkbox("Random personalities", &random)) controller_.set_random_personalities(random);
+    wrapped_tooltip(kRandomPersonalitiesHelp);
+    if (s.random_personalities != s.random_lineup_active) {
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(kMutedText, "(next session)");
+        wrapped_tooltip("Takes effect when the next session starts: New Session, or Start New Game after this one.");
     }
 }
 

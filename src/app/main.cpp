@@ -1,6 +1,10 @@
 // poker_trainer: the Dear ImGui desktop front end.
 //
-//   poker_trainer [--seed N] [--log-dir DIR]
+//   poker_trainer [--seed N] [--log-dir DIR] [--random-personalities on|off] [--settings PATH]
+//
+// --random-personalities sets the option for this run without saving it; the
+// checkbox saves it to the settings file (poker_trainer_settings.json, beside logs/,
+// unless --settings names another).
 //
 // Developer checks, for running it unattended:
 //   --exit-after-frames N   Quit after N frames
@@ -8,7 +12,8 @@
 //                           hands and sessions advancing by themselves
 //   --stop-on WHAT          With --auto-shove, hold the screen at: live-side-pot (Hero
 //                           to act with side pots), side-pot (showdown with side
-//                           pots), showdown, flop (Hero to act with a board), or bust
+//                           pots), showdown, flop (Hero to act with a board), bust,
+//                           or folded (Hero folds a hand that goes on; bots then pause)
 //   --reveal                With --auto-shove, reveal the bots' hands at the held screen
 //   --bot-delay MS          Start with this bot delay, to hold a "waiting" screen
 //   --advice TYPE           Start the "Advice:" selector on baseline, nit, station or maniac
@@ -45,6 +50,7 @@
 #include <windows.h>
 #endif
 
+#include "app/app_settings.h"
 #include "app/screenshot.h"
 #include "app/trainer_ui.h"
 #include "controller/local_game_controller.h"
@@ -120,6 +126,8 @@ struct Arguments {
     bool solver = false;
     std::optional<int> solver_budget_ms;
     std::optional<poker::SolverTier> solver_tier;
+    std::optional<bool> random_personalities;
+    std::filesystem::path settings = poker::kDefaultSettingsFile;
 };
 
 std::optional<poker::SolverTier> parse_tier(std::string_view text) {
@@ -186,6 +194,15 @@ void auto_play(poker::IGameController& controller, const Arguments& arguments) {
         case ControllerPhase::BotToAct:
             break;
         case ControllerPhase::HeroToAct: {
+            if (arguments.stop_on == "folded" && s.legal.allows(poker::ActionType::Fold)) {
+                // Pause the bots once Hero is out, so the rest of the hand holds still.
+                (void)controller.submit_hero_action({poker::ActionType::Fold});
+                if (controller.snapshot().phase == ControllerPhase::BotToAct) {
+                    controller.set_instant_play(false);
+                    controller.set_bot_delay_ms(1e12);
+                }
+                return;
+            }
             if (arguments.stop_on == "live-side-pot" && side_pots) return;
             if (arguments.stop_on == "flop" && !s.board.empty()) return;
             // Calling keeps Hero in the hand with chips behind while bots go all-in.
@@ -259,6 +276,12 @@ std::optional<Arguments> parse_arguments(int argc, char** argv) {
         } else if (arg == "--solver-tier" && i + 1 < argc) {
             arguments.solver_tier = parse_tier(argv[++i]);
             if (!arguments.solver_tier) return std::nullopt;
+        } else if (arg == "--random-personalities" && i + 1 < argc) {
+            const std::string_view value = argv[++i];
+            if (value != "on" && value != "off") return std::nullopt;
+            arguments.random_personalities = value == "on";
+        } else if (arg == "--settings" && i + 1 < argc) {
+            arguments.settings = argv[++i];
         } else {
             return std::nullopt;
         }
@@ -313,6 +336,10 @@ int run(const Arguments& arguments) {
         options.solver_enabled = arguments.solver;
         if (arguments.solver_budget_ms) options.solver_budget_ms = *arguments.solver_budget_ms;
         options.solver_tier_override = arguments.solver_tier;
+        const poker::AppSettings settings = poker::load_app_settings(arguments.settings);
+        options.random_personalities = arguments.random_personalities.value_or(settings.random_personalities);
+        // Saved only when the checkbox changes it, so the flag alone never saves.
+        bool saved_random = options.random_personalities;
         poker::LocalGameController controller(options);
         poker::TrainerUi ui(controller, fonts, scale);
         ui.set_advice_focus(arguments.advice);
@@ -326,6 +353,14 @@ int run(const Arguments& arguments) {
             controller.tick(static_cast<double>(io.DeltaTime) * 1000.0);
 
             if (arguments.auto_shove) auto_play(controller, arguments);
+            if (controller.random_personalities() != saved_random) {
+                saved_random = controller.random_personalities();
+                poker::AppSettings changed = poker::load_app_settings(arguments.settings);
+                changed.random_personalities = saved_random;
+                if (!poker::save_app_settings(arguments.settings, changed)) {
+                    std::fprintf(stderr, "Could not save %s\n", arguments.settings.string().c_str());
+                }
+            }
 
             ImGui_ImplOpenGL3_NewFrame();
             ImGui_ImplGlfw_NewFrame();
@@ -365,7 +400,7 @@ int run(const Arguments& arguments) {
 int main(int argc, char** argv) {
     const auto arguments = parse_arguments(argc, argv);
     if (!arguments) {
-        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT] [--reveal] [--bot-delay MS] [--advice TYPE] [--hover X,Y] [--size WxH] [--screenshot PATH] [--solver] [--solver-budget MS] [--solver-tier off|river|turn|flop]");
+        report_fatal("Usage: poker_trainer [--seed N] [--log-dir DIR] [--exit-after-frames N] [--auto-shove] [--stop-on WHAT] [--reveal] [--bot-delay MS] [--advice TYPE] [--hover X,Y] [--size WxH] [--screenshot PATH] [--solver] [--solver-budget MS] [--solver-tier off|river|turn|flop] [--random-personalities on|off] [--settings PATH]");
         return 2;
     }
     return run(*arguments);

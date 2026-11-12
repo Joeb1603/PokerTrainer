@@ -40,15 +40,17 @@ constexpr ImVec2 kAdvisorToggle{1037.0f, 97.0f};
 constexpr ImVec2 kSolverToggle{1200.0f, 97.0f};
 // The solver budget slider's two ends (150 px from the sidebar's left), with set_lines()'s
 // hint and the solve running (its rationale moves into a tooltip).
-constexpr ImVec2 kSolverBudgetMin{1030.0f, 341.0f};
-constexpr ImVec2 kSolverBudgetMax{1176.0f, 341.0f};
+constexpr ImVec2 kSolverBudgetMin{1030.0f, 364.0f};
+constexpr ImVec2 kSolverBudgetMax{1176.0f, 364.0f};
 // The "Advice:" selector under the advisor toggle: two rows of two radio buttons.
 constexpr ImVec2 kAdviceBaseline{1095.0f, 120.0f};
 constexpr ImVec2 kAdviceNit{1182.0f, 120.0f};
 constexpr ImVec2 kAdviceStation{1095.0f, 143.0f};
 constexpr ImVec2 kAdviceManiac{1182.0f, 143.0f};
+// The "Random personalities" checkbox, on its own row under the selector.
+constexpr ImVec2 kRandomPersonalities{1060.0f, 166.0f};
 // The "Versus types" Station row, with set_lines()'s hint (its one-line rationale).
-constexpr ImVec2 kVersusStation{1040.0f, 314.0f};
+constexpr ImVec2 kVersusStation{1040.0f, 337.0f};
 
 std::uint8_t mask_of(std::initializer_list<ActionType> types) {
     std::uint8_t mask = 0;
@@ -670,6 +672,7 @@ TEST_F(UiTest, ExistingSidebarButtonsDidNotMove) {
     EXPECT_TRUE(sidebar_item_is(kAdviceNit, "Nit"));
     EXPECT_TRUE(sidebar_item_is(kAdviceStation, "Station"));
     EXPECT_TRUE(sidebar_item_is(kAdviceManiac, "Maniac"));
+    EXPECT_TRUE(sidebar_item_is(kRandomPersonalities, "Random personalities"));
 
     // Solver mode adds its checkbox beside the toggle and a section under the panel.
     for (const SolverState state : {SolverState::Running, SolverState::Done}) {
@@ -850,4 +853,38 @@ TEST(TrainerUiText, ActionCodesReadAsAdvice) {
     EXPECT_EQ(action_code_text("Q5"), "Q5");
     EXPECT_EQ(action_code_text("C"), "C");
     EXPECT_EQ(action_code_text("R1x"), "R1x");
+}
+
+// --- Random personalities -----------------------------------------------------
+
+TEST_F(UiTest, RandomPersonalitiesCheckboxSetsTheOptionForTheNextSession) {
+    EXPECT_EQ(drawn_text().find("(next session)"), std::string::npos);
+    click(kRandomPersonalities);
+    ASSERT_EQ(fake_.random_requests, std::vector<bool>{true});
+    EXPECT_TRUE(fake_.random_personalities());
+    // Set but not yet in play: the table says when it applies.
+    EXPECT_NE(drawn_text().find("(next session)"), std::string::npos);
+
+    fake_.table.random_lineup_active = true;  // The next session started with it
+    EXPECT_EQ(drawn_text().find("(next session)"), std::string::npos);
+
+    click(kRandomPersonalities);
+    EXPECT_EQ(fake_.random_requests, (std::vector<bool>{true, false}));
+    EXPECT_NE(drawn_text().find("(next session)"), std::string::npos);  // Turning it off waits too
+}
+
+TEST_F(UiTest, TheLineupIsShownOnlyWhenTheSessionIsOver) {
+    fake_.table.random_lineup_active = true;
+    fake_.table.random_personalities = true;
+    fake_.table.session.lineup = {"Marta: LAG", "Jonas: Nit", "Priya: Shifter", "Diego: Tilter", "Aiko: Rock"};
+    // The controller fills it only at SessionOver; the console draws it only there too.
+    fake_.table.phase = ControllerPhase::HandComplete;
+    EXPECT_EQ(drawn_text().find("Lineup:"), std::string::npos);
+
+    fake_.table.phase = ControllerPhase::SessionOver;
+    const std::string text = drawn_text();
+    EXPECT_NE(text.find("Lineup: Marta: LAG   |   Jonas: Nit   |   Priya: Shifter   |   Diego: Tilter   |   Aiko: Rock"),
+              std::string::npos)
+        << text;
+    EXPECT_TRUE(console_button_is(kNextHand, "Start New Game"));  // The buttons stay put
 }

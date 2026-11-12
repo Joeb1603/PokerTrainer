@@ -161,9 +161,9 @@ if(POKER_BUILD_APP)
     target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 
     # Separate from main.cpp so tests can drive the UI without a window.
-    add_library(trainer_ui STATIC src/app/trainer_ui.cpp src/app/screenshot.cpp)
+    add_library(trainer_ui STATIC src/app/trainer_ui.cpp src/app/screenshot.cpp src/app/app_settings.cpp)
     target_include_directories(trainer_ui PUBLIC src)
-    target_link_libraries(trainer_ui PUBLIC poker_core imgui_lib)
+    target_link_libraries(trainer_ui PUBLIC poker_core imgui_lib PRIVATE nlohmann_json::nlohmann_json)
     target_compile_options(trainer_ui PRIVATE ${POKER_WARNINGS})
 
     add_executable(poker_trainer src/app/main.cpp)
@@ -217,7 +217,7 @@ if(POKER_BUILD_TESTS)
     # The Bench tests read tools/bench/river_spots.json and turn_spots.json.
     target_compile_definitions(core_tests PRIVATE POKER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     if(POKER_BUILD_APP)
-        target_sources(core_tests PRIVATE tests/trainer_ui_test.cpp tests/screenshot_test.cpp)
+        target_sources(core_tests PRIVATE tests/trainer_ui_test.cpp tests/screenshot_test.cpp tests/app_settings_test.cpp)
         target_link_libraries(core_tests PRIVATE trainer_ui)
     endif()
 

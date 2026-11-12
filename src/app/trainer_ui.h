@@ -42,6 +42,8 @@ private:
     void draw_console(float x, float y, float w, float h);
     void draw_sidebar(float x, float y, float w, float h);
     void draw_advice_selector();
+    // The "Random personalities" checkbox, which applies from the next session.
+    void draw_random_personalities_toggle();
     void draw_advisor();
     // compact: the reasoning goes into the heading's tooltip (solver mode, to make room).
     void draw_advisor_body(bool compact);
