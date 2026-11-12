@@ -439,8 +439,9 @@ void LocalGameController::rebuild_snapshot() {
             std::copy(state.board.begin(), state.board.end(), board.begin());
             out.shown_five = best_five(*s.hole, board);
         }
-        // Revealing also brings back Hero's own folded cards, which were never hidden from Hero.
-        if (bots_revealed_ && s.hole) {
+        // Hero's own folded cards were never hidden from Hero, so they stay on the table,
+        // dimmed, for the rest of the hand. Bots' folded cards wait for Reveal.
+        if (s.hole && (bots_revealed_ || seat == kHeroSeat)) {
             out.visible_hole = s.hole;
             out.revealed_after_fold = s.status == SeatStatus::Folded;
         }

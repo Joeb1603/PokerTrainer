@@ -615,7 +615,9 @@ TEST_F(Controller, RevealShowsHerosOwnFoldedCards) {
         if (hero_before.status == SeatStatus::Folded && dealt) {
             ++folded_hands;
             EXPECT_FALSE(hero_before.holds_cards);
-            EXPECT_FALSE(hero_before.revealed_after_fold);  // Not drawn until revealed
+            EXPECT_TRUE(hero_before.revealed_after_fold);  // Hero's own cards never leave the table
+            ASSERT_TRUE(hero_before.visible_hole);
+            EXPECT_EQ(*hero_before.visible_hole, *dealt);
 
             ASSERT_TRUE(c.reveal_bot_hands());
             const SeatSnapshot& hero = c.snapshot().seats[kHeroSeat];
@@ -633,6 +635,54 @@ TEST_F(Controller, RevealShowsHerosOwnFoldedCards) {
         EXPECT_FALSE(c.snapshot().seats[kHeroSeat].revealed_after_fold);
     }
     EXPECT_GT(folded_hands, 0);
+}
+
+TEST_F(Controller, HerosFoldedCardsStayVisibleMidHandWhileBotsStayHidden) {
+    // Paced bots, one per tick, so the hand can be seen going on after Hero's fold.
+    ControllerOptions o = options();
+    o.instant_play = false;
+    o.bot_delay_ms = 400.0;
+    LocalGameController c(o);
+    int checked = 0;
+    for (int hand = 0; hand < 30 && checked < 5; ++hand) {
+        std::optional<std::array<Card, 2>> dealt;
+        bool folded = false;
+        for (int guard = 0; guard < 500; ++guard) {
+            const TableSnapshot& s = c.snapshot();
+            if (s.phase == ControllerPhase::HandComplete || s.phase == ControllerPhase::SessionOver) break;
+            const SeatSnapshot& hero = s.seats[kHeroSeat];
+            if (folded) {
+                // The hand is still being played after Hero's fold.
+                EXPECT_TRUE(hero.revealed_after_fold);
+                ASSERT_TRUE(hero.visible_hole);
+                EXPECT_EQ(*hero.visible_hole, *dealt);
+                EXPECT_FALSE(s.bots_revealed);
+                for (int seat = 1; seat < kMaxSeats; ++seat) {
+                    EXPECT_FALSE(s.seats[seat].visible_hole.has_value()) << "seat " << seat;
+                    EXPECT_FALSE(s.seats[seat].revealed_after_fold) << "seat " << seat;
+                }
+                ++checked;
+            } else {
+                EXPECT_FALSE(hero.revealed_after_fold);
+            }
+            if (s.phase == ControllerPhase::HeroToAct) {
+                dealt = hero.visible_hole;
+                if (s.legal.allows(ActionType::Fold)) {
+                    ASSERT_TRUE(c.submit_hero_action({ActionType::Fold, 0}));
+                    folded = true;
+                } else {
+                    ASSERT_TRUE(c.submit_hero_action(passive(s.legal)));
+                }
+            }
+            c.tick(400.0);
+        }
+        if (c.snapshot().phase == ControllerPhase::SessionOver) {
+            c.new_session();
+        } else {
+            ASSERT_TRUE(c.next_hand());
+        }
+    }
+    EXPECT_GT(checked, 0);
 }
 
 TEST_F(Controller, RevealIsRefusedDuringAHandAndShowsEveryBotAfterIt) {

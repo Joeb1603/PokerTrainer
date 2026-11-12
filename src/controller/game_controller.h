@@ -33,7 +33,7 @@ struct SeatSnapshot {
     std::optional<std::string> shown_hand;  // Hand name, once shown at showdown
     std::optional<std::array<Card, 5>> shown_five;  // Its best five cards, most significant first
     int won = 0;                            // Chips won from pots in the finished hand
-    bool revealed_after_fold = false;       // visible_hole is a folded bot's, shown on request
+    bool revealed_after_fold = false;       // visible_hole is folded cards: Hero's always, a bot's on request
 };
 
 struct PayoutLine {
